@@ -736,6 +736,188 @@ private:
     }
 };
 
+class LiRPABackwardOnly {
+public:
+    std::tuple<AffineBound, Vec, Vec, std::vector<LayerBound>> bound(
+        const FullyConnectedNetwork& network,
+        const Vec& x0,
+        double eps,
+        const Mat* output_lower_M = nullptr,
+        const Vec* output_lower_p = nullptr,
+        const Mat* output_upper_M = nullptr,
+        const Vec* output_upper_p = nullptr
+    ) const {
+        if (static_cast<int>(x0.size()) != network.input_dim()) {
+            throw std::invalid_argument("x0 dimension does not match network input dimension.");
+        }
+
+        const auto& weights = network.weights();
+        const auto& biases = network.biases();
+
+        std::vector<LayerBound> layer_bounds;
+        layer_bounds.reserve(weights.size());
+        for (std::size_t layer = 0; layer < weights.size(); ++layer) {
+            layer_bounds.push_back(build_one_layer_relaxation(network, layer, x0, eps, layer_bounds));
+        }
+
+        const int output_dim = static_cast<int>(weights.back().size());
+        Mat lower_M = output_lower_M ? *output_lower_M : eye(output_dim);
+        Mat upper_M = output_upper_M ? *output_upper_M : eye(output_dim);
+
+        if (lower_M.empty() || upper_M.empty()) {
+            throw std::invalid_argument("Output specification matrices must be non-empty.");
+        }
+        if (static_cast<int>(lower_M[0].size()) != output_dim || static_cast<int>(upper_M[0].size()) != output_dim) {
+            throw std::invalid_argument("Output specification matrices must have one column per network output.");
+        }
+        if (lower_M.size() != upper_M.size()) {
+            throw std::invalid_argument("Lower and upper output specifications must have same row count.");
+        }
+
+        const int spec_dim = static_cast<int>(lower_M.size());
+        Vec lower_p = output_lower_p ? *output_lower_p : Vec(spec_dim, 0.0);
+        Vec upper_p = output_upper_p ? *output_upper_p : Vec(spec_dim, 0.0);
+
+        if (lower_p.size() != lower_M.size() || upper_p.size() != upper_M.size()) {
+            throw std::invalid_argument("Output specification vectors must match matrix rows.");
+        }
+
+        for (int i = static_cast<int>(weights.size()) - 1; i >= 0; --i) {
+            std::tie(lower_M, lower_p, upper_M, upper_p) = backward_one_layer(
+                lower_M, lower_p, upper_M, upper_p,
+                weights[i], biases[i],
+                layer_bounds[i].alpha_lower,
+                layer_bounds[i].beta_lower,
+                layer_bounds[i].alpha_upper,
+                layer_bounds[i].beta_upper
+            );
+        }
+
+        AffineBound final{lower_M, lower_p, upper_M, upper_p};
+        Vec final_lower = affine_min(final.lower_A, final.lower_c, x0, eps);
+        Vec final_upper = affine_max(final.upper_A, final.upper_c, x0, eps);
+        return {final, final_lower, final_upper, layer_bounds};
+    }
+
+private:
+    static void relax_activation(
+        const std::string& act_name,
+        const Vec& pre_lower,
+        const Vec& pre_upper,
+        Vec& alpha_l,
+        Vec& beta_l,
+        Vec& alpha_u,
+        Vec& beta_u
+    ) {
+        if (act_name == "linear") {
+            const int n = static_cast<int>(pre_lower.size());
+            alpha_l.assign(n, 1.0);
+            alpha_u.assign(n, 1.0);
+            beta_l.assign(n, 0.0);
+            beta_u.assign(n, 0.0);
+        } else if (act_name == "relu") {
+            ReLURelaxation::relax(pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u);
+        } else if (act_name == "sigmoid") {
+            SigmoidRelaxation().relax(pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u);
+        } else {
+            throw std::invalid_argument("No relaxation for activation: " + act_name);
+        }
+    }
+
+    static std::tuple<Mat, Vec, Mat, Vec> backward_one_layer(
+        const Mat& lower_M,
+        const Vec& lower_p,
+        const Mat& upper_M,
+        const Vec& upper_p,
+        const Mat& W,
+        const Vec& b,
+        const Vec& alpha_l,
+        const Vec& beta_l,
+        const Vec& alpha_u,
+        const Vec& beta_u
+    ) {
+        Mat lower_M_pos = positive_part(lower_M);
+        Mat lower_M_neg = negative_part(lower_M);
+        Mat upper_M_pos = positive_part(upper_M);
+        Mat upper_M_neg = negative_part(upper_M);
+
+        Mat lower_s_coeff = lower_M;
+        Mat upper_s_coeff = upper_M;
+        for (std::size_t i = 0; i < lower_s_coeff.size(); ++i) {
+            for (std::size_t j = 0; j < lower_s_coeff[i].size(); ++j) {
+                lower_s_coeff[i][j] = lower_M_pos[i][j] * alpha_l[j] + lower_M_neg[i][j] * alpha_u[j];
+                upper_s_coeff[i][j] = upper_M_pos[i][j] * alpha_u[j] + upper_M_neg[i][j] * alpha_l[j];
+            }
+        }
+
+        Mat new_lower_M = matmul(lower_s_coeff, W);
+        Mat new_upper_M = matmul(upper_s_coeff, W);
+
+        Vec term_l_pos = vec_add(vec_mul(alpha_l, b), beta_l);
+        Vec term_l_neg = vec_add(vec_mul(alpha_u, b), beta_u);
+        Vec new_lower_p = vec_add(vec_add(matvec(lower_M_pos, term_l_pos), matvec(lower_M_neg, term_l_neg)), lower_p);
+
+        Vec term_u_pos = vec_add(vec_mul(alpha_u, b), beta_u);
+        Vec term_u_neg = vec_add(vec_mul(alpha_l, b), beta_l);
+        Vec new_upper_p = vec_add(vec_add(matvec(upper_M_pos, term_u_pos), matvec(upper_M_neg, term_u_neg)), upper_p);
+
+        return {new_lower_M, new_lower_p, new_upper_M, new_upper_p};
+    }
+
+    static LayerBound build_one_layer_relaxation(
+        const FullyConnectedNetwork& network,
+        std::size_t layer,
+        const Vec& x0,
+        double eps,
+        const std::vector<LayerBound>& previous_layer_bounds
+    ) {
+        if (previous_layer_bounds.size() != layer) {
+            throw std::invalid_argument("Backward-only relaxations must be built consecutively.");
+        }
+
+        const auto& weights = network.weights();
+        const auto& biases = network.biases();
+        const auto& acts = network.activations();
+
+        Mat lower_M = weights[layer];
+        Mat upper_M = weights[layer];
+        Vec lower_p = biases[layer];
+        Vec upper_p = biases[layer];
+
+        for (int prev = static_cast<int>(layer) - 1; prev >= 0; --prev) {
+            const LayerBound& lb = previous_layer_bounds[prev];
+            std::tie(lower_M, lower_p, upper_M, upper_p) = backward_one_layer(
+                lower_M, lower_p, upper_M, upper_p,
+                weights[prev], biases[prev],
+                lb.alpha_lower, lb.beta_lower,
+                lb.alpha_upper, lb.beta_upper
+            );
+        }
+
+        AffineBound pre{lower_M, lower_p, upper_M, upper_p};
+        Vec pre_lower = affine_min(pre.lower_A, pre.lower_c, x0, eps);
+        Vec pre_upper = affine_max(pre.upper_A, pre.upper_c, x0, eps);
+
+        Vec alpha_l, beta_l, alpha_u, beta_u;
+        relax_activation(acts[layer], pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u);
+
+        AffineBound post;
+        post.lower_A = rowwise_scale(pre.lower_A, alpha_l);
+        post.lower_c = vec_add(vec_mul(alpha_l, pre.lower_c), beta_l);
+        post.upper_A = rowwise_scale(pre.upper_A, alpha_u);
+        post.upper_c = vec_add(vec_mul(alpha_u, pre.upper_c), beta_u);
+
+        Vec post_lower = affine_min(post.lower_A, post.lower_c, x0, eps);
+        Vec post_upper = affine_max(post.upper_A, post.upper_c, x0, eps);
+
+        return LayerBound{
+            pre, pre_lower, pre_upper,
+            alpha_l, beta_l, alpha_u, beta_u,
+            post, post_lower, post_upper
+        };
+    }
+};
+
 static FullyConnectedNetwork make_xor_network_from_note() {
     Mat W1 = {
         {2.1247, 2.1267},
@@ -809,6 +991,7 @@ static void run_xor_demo(double eps = 0.02) {
     FullyConnectedNetwork network = make_xor_network_from_note();
     LiRPAForward forward_verifier;
     LiRPABackward backward_verifier(&forward_verifier);
+    LiRPABackwardOnly backward_only_verifier;
 
     std::vector<Vec> points = {
         {0.0, 0.0},
@@ -822,6 +1005,7 @@ static void run_xor_demo(double eps = 0.02) {
 
     bool all_certified_forward = true;
     bool all_certified_backward = true;
+    bool all_certified_backward_only = true;
 
     std::cout << std::fixed << std::setprecision(6);
 
@@ -836,23 +1020,31 @@ static void run_xor_demo(double eps = 0.02) {
         (void)bwd_affine;
         (void)bwd_layers;
 
+        auto [bwd_only_affine, bwd_only_lb, bwd_only_ub, bwd_only_layers] = backward_only_verifier.bound(network, x0, eps);
+        (void)bwd_only_affine;
+        (void)bwd_only_layers;
+
         int expected = xor_expected_label(x0);
         bool fwd_certified;
         bool bwd_certified;
+        bool bwd_only_certified;
         std::string condition;
 
         if (expected == 1) {
             fwd_certified = (fwd_lb[0] > 0.5);
             bwd_certified = (bwd_lb[0] > 0.5);
+            bwd_only_certified = (bwd_only_lb[0] > 0.5);
             condition = "lower bound > 0.5";
         } else {
             fwd_certified = (fwd_ub[0] < 0.5);
             bwd_certified = (bwd_ub[0] < 0.5);
+            bwd_only_certified = (bwd_only_ub[0] < 0.5);
             condition = "upper bound < 0.5";
         }
 
         all_certified_forward = all_certified_forward && fwd_certified;
         all_certified_backward = all_certified_backward && bwd_certified;
+        all_certified_backward_only = all_certified_backward_only && bwd_only_certified;
 
         std::cout << "x0=[" << x0[0] << ", " << x0[1] << "], expected=" << expected
                   << ", network_output=" << y[0] << "\n";
@@ -860,6 +1052,8 @@ static void run_xor_demo(double eps = 0.02) {
                   << (fwd_certified ? "True" : "False") << " (" << condition << ")\n";
         std::cout << "  backward bound=[" << bwd_lb[0] << ", " << bwd_ub[0] << "], certified="
                   << (bwd_certified ? "True" : "False") << " (" << condition << ")\n";
+        std::cout << "  backward-only bound=[" << bwd_only_lb[0] << ", " << bwd_only_ub[0] << "], certified="
+              << (bwd_only_certified ? "True" : "False") << " (" << condition << ")\n";
     }
 
     std::cout << "\n";
@@ -873,6 +1067,12 @@ static void run_xor_demo(double eps = 0.02) {
         std::cout << "Backward mode certifies all four XOR corner classifications for this epsilon.\n";
     } else {
         std::cout << "Backward mode does not certify at least one XOR corner classification for this epsilon.\n";
+    }
+
+    if (all_certified_backward_only) {
+        std::cout << "Backward-only mode certifies all four XOR corner classifications for this epsilon.\n";
+    } else {
+        std::cout << "Backward-only mode does not certify at least one XOR corner classification for this epsilon.\n";
     }
 }
 

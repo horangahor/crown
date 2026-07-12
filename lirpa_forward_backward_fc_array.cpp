@@ -707,6 +707,136 @@ BackwardBoundResult lirpa_backward_bound(
     return out;
 }
 
+class LiRPABackwardOnly {
+public:
+    BackwardBoundResult bound(
+        const FullyConnectedNetwork& net,
+        const Vector& x0,
+        double eps,
+        const Matrix* output_lower_M = nullptr,
+        const Vector* output_lower_p = nullptr,
+        const Matrix* output_upper_M = nullptr,
+        const Vector* output_upper_p = nullptr
+    ) const {
+        require(x0.n == network_input_dim(net), "LiRPABackwardOnly input dimension mismatch.");
+
+        LayerBound layer_bounds[MAX_LAYERS]{};
+        for (int l = 0; l < net.num_layers; ++l) {
+            layer_bounds[l] = build_one_layer_relaxation(net, l, x0, eps, layer_bounds);
+        }
+
+        const int output_dim = network_output_dim(net);
+        Matrix lower_M = output_lower_M ? *output_lower_M : make_eye(output_dim);
+        Matrix upper_M = output_upper_M ? *output_upper_M : make_eye(output_dim);
+        Vector lower_p = output_lower_p ? *output_lower_p : make_zero_vector(lower_M.rows);
+        Vector upper_p = output_upper_p ? *output_upper_p : make_zero_vector(upper_M.rows);
+
+        require(lower_M.cols == output_dim && upper_M.cols == output_dim, "Output spec matrix column mismatch.");
+        require(lower_M.rows == upper_M.rows, "Output spec lower/upper row mismatch.");
+        require(lower_p.n == lower_M.rows && upper_p.n == upper_M.rows, "Output spec vector row mismatch.");
+
+        for (int l = net.num_layers - 1; l >= 0; --l) {
+            const LayerBound& lb = layer_bounds[l];
+            backward_one_layer(
+                lower_M,
+                lower_p,
+                upper_M,
+                upper_p,
+                net.W[l],
+                net.b[l],
+                lb.alpha_lower,
+                lb.beta_lower,
+                lb.alpha_upper,
+                lb.beta_upper
+            );
+        }
+
+        BackwardBoundResult out;
+        out.final_affine.lower_A = lower_M;
+        out.final_affine.lower_c = lower_p;
+        out.final_affine.upper_A = upper_M;
+        out.final_affine.upper_c = upper_p;
+        out.final_lower = affine_min(lower_M, lower_p, x0, eps);
+        out.final_upper = affine_max(upper_M, upper_p, x0, eps);
+        out.num_layer_bounds = net.num_layers;
+        for (int l = 0; l < net.num_layers; ++l) {
+            out.layer_bounds[l] = layer_bounds[l];
+        }
+        return out;
+    }
+
+private:
+    static void relax_activation(
+        ActivationType act,
+        const Vector& pre_lower,
+        const Vector& pre_upper,
+        Vector& alpha_l,
+        Vector& beta_l,
+        Vector& alpha_u,
+        Vector& beta_u
+    ) {
+        if (act == ActivationType::Linear) {
+            alpha_l = make_zero_vector(pre_lower.n);
+            alpha_u = make_zero_vector(pre_lower.n);
+            beta_l = make_zero_vector(pre_lower.n);
+            beta_u = make_zero_vector(pre_lower.n);
+            for (int i = 0; i < pre_lower.n; ++i) {
+                alpha_l.v[i] = 1.0;
+                alpha_u.v[i] = 1.0;
+            }
+        } else if (act == ActivationType::Relu) {
+            relu_relax(pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u);
+        } else if (act == ActivationType::Sigmoid) {
+            sigmoid_relax(pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u);
+        } else {
+            throw std::invalid_argument("No relaxation for activation.");
+        }
+    }
+
+    static LayerBound build_one_layer_relaxation(
+        const FullyConnectedNetwork& net,
+        int layer,
+        const Vector& x0,
+        double eps,
+        const LayerBound* previous_layer_bounds
+    ) {
+        Matrix lower_M = net.W[layer];
+        Matrix upper_M = net.W[layer];
+        Vector lower_p = net.b[layer];
+        Vector upper_p = net.b[layer];
+
+        for (int prev = layer - 1; prev >= 0; --prev) {
+            const LayerBound& lb = previous_layer_bounds[prev];
+            backward_one_layer(
+                lower_M,
+                lower_p,
+                upper_M,
+                upper_p,
+                net.W[prev],
+                net.b[prev],
+                lb.alpha_lower,
+                lb.beta_lower,
+                lb.alpha_upper,
+                lb.beta_upper
+            );
+        }
+
+        const Vector pre_lower = affine_min(lower_M, lower_p, x0, eps);
+        const Vector pre_upper = affine_max(upper_M, upper_p, x0, eps);
+
+        Vector alpha_l, beta_l, alpha_u, beta_u;
+        relax_activation(net.act[layer], pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u);
+
+        LayerBound out;
+        out.dim = alpha_l.n;
+        out.alpha_lower = alpha_l;
+        out.beta_lower = beta_l;
+        out.alpha_upper = alpha_u;
+        out.beta_upper = beta_u;
+        return out;
+    }
+};
+
 void self_test_relaxations() {
     std::mt19937_64 rng(0);
     std::uniform_real_distribution<double> dist(-5.0, 5.0);
@@ -791,6 +921,7 @@ int xor_expected_label(const Vector& x) {
 
 void run_xor_demo(double eps) {
     const FullyConnectedNetwork network = make_xor_network();
+    const LiRPABackwardOnly backward_only_verifier;
 
     Vector points[4];
     for (int i = 0; i < 4; ++i) {
@@ -806,6 +937,7 @@ void run_xor_demo(double eps) {
 
     bool all_certified_forward = true;
     bool all_certified_backward = true;
+    bool all_certified_backward_only = true;
 
     std::cout << std::fixed << std::setprecision(6);
 
@@ -813,24 +945,29 @@ void run_xor_demo(double eps) {
         const Vector y = network_forward(network, x0);
         const ForwardBoundResult fwd = lirpa_forward_bound(network, x0, eps);
         const BackwardBoundResult bwd = lirpa_backward_bound(network, x0, eps);
+        const BackwardBoundResult bwd_only = backward_only_verifier.bound(network, x0, eps);
         const int expected = xor_expected_label(x0);
 
         bool fwd_certified;
         bool bwd_certified;
+        bool bwd_only_certified;
         std::string condition;
 
         if (expected == 1) {
             fwd_certified = (fwd.final_lower.v[0] > 0.5);
             bwd_certified = (bwd.final_lower.v[0] > 0.5);
+            bwd_only_certified = (bwd_only.final_lower.v[0] > 0.5);
             condition = "lower bound > 0.5";
         } else {
             fwd_certified = (fwd.final_upper.v[0] < 0.5);
             bwd_certified = (bwd.final_upper.v[0] < 0.5);
+            bwd_only_certified = (bwd_only.final_upper.v[0] < 0.5);
             condition = "upper bound < 0.5";
         }
 
         all_certified_forward = all_certified_forward && fwd_certified;
         all_certified_backward = all_certified_backward && bwd_certified;
+        all_certified_backward_only = all_certified_backward_only && bwd_only_certified;
 
         std::cout << "x0=[" << x0.v[0] << ", " << x0.v[1] << "], expected=" << expected
                   << ", network_output=" << y.v[0] << "\n";
@@ -838,6 +975,8 @@ void run_xor_demo(double eps) {
                   << (fwd_certified ? "True" : "False") << " (" << condition << ")\n";
         std::cout << "  backward bound=[" << bwd.final_lower.v[0] << ", " << bwd.final_upper.v[0] << "], certified="
                   << (bwd_certified ? "True" : "False") << " (" << condition << ")\n";
+        std::cout << "  backward-only bound=[" << bwd_only.final_lower.v[0] << ", " << bwd_only.final_upper.v[0] << "], certified="
+              << (bwd_only_certified ? "True" : "False") << " (" << condition << ")\n";
     }
 
     std::cout << "\n";
@@ -851,6 +990,12 @@ void run_xor_demo(double eps) {
         std::cout << "Backward mode certifies all four XOR corner classifications for this epsilon.\n";
     } else {
         std::cout << "Backward mode does not certify at least one XOR corner classification for this epsilon.\n";
+    }
+
+    if (all_certified_backward_only) {
+        std::cout << "Backward-only mode certifies all four XOR corner classifications for this epsilon.\n";
+    } else {
+        std::cout << "Backward-only mode does not certify at least one XOR corner classification for this epsilon.\n";
     }
 }
 
