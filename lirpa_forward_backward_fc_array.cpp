@@ -125,6 +125,8 @@ Matrix make_eye(int n) {
     return out;
 }
 
+// 여기까지 cuda 변환 끝 , 그 이후부터는 배열 연산이 들어가는 것을 보아 CUDA 로 포팅할 여지가 있지 않나
+
 Matrix mat_add(const Matrix& A, const Matrix& B) {
     require(A.rows == B.rows && A.cols == B.cols, "mat_add shape mismatch.");
     Matrix C = make_zero_matrix(A.rows, A.cols);
