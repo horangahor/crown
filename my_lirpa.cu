@@ -282,8 +282,8 @@ Vector vec_sub(const Vector &a, const Vector &b) {
   return c;
 }
 
-// ==================== matmul (행렬 곱셈) ====================
-// 각 스레드가 결과 행렬의 원소 하나를 담당, 내적(dot product)을 계산
+// matmul, 행렬 곱셈
+// 각 스레드가 결과 행렬의 원소 하나를 담당, 내적 계산
 __global__ void matmul_gpu(const Matrix *A, const Matrix *B, Matrix *C) {
   int tid = blockDim.x * blockIdx.x + threadIdx.x;
   int total_elements = A->rows * B->cols;
@@ -332,7 +332,7 @@ Matrix matmul(const Matrix &A, const Matrix &B) {
   return C;
 }
 
-// ==================== matvec (행렬-벡터 곱) ====================
+// matvec, 행렬-벡터 곱
 // 각 스레드가 결과 벡터의 원소 하나를 담당
 __global__ void matvec_gpu(const Matrix *A, const Vector *x, Vector *y) {
   int tid = blockDim.x * blockIdx.x + threadIdx.x;
@@ -376,7 +376,7 @@ Vector matvec(const Matrix &A, const Vector &x) {
   return y;
 }
 
-// ==================== positive_part (양수부 추출) ====================
+// positive_part, 양수부 추출
 __global__ void positive_part_gpu(const Matrix *A, Matrix *out) {
   int tid = blockDim.x * blockIdx.x + threadIdx.x;
   int total_elements = A->rows * A->cols;
@@ -414,7 +414,7 @@ Matrix positive_part(const Matrix &A) {
   return out;
 }
 
-// ==================== negative_part (음수부 추출) ====================
+// negative_part, 음수부 추출
 __global__ void negative_part_gpu(const Matrix *A, Matrix *out) {
   int tid = blockDim.x * blockIdx.x + threadIdx.x;
   int total_elements = A->rows * A->cols;
@@ -452,7 +452,7 @@ Matrix negative_part(const Matrix &A) {
   return out;
 }
 
-// ==================== rowwise_scale (행별 스칼라 곱) ====================
+// rowwise_scale, 행별 스칼라 곱
 // A의 i번째 행 전체에 s[i]를 곱함
 __global__ void rowwise_scale_gpu(const Matrix *A, const Vector *s,
                                   Matrix *out) {
@@ -497,7 +497,7 @@ Matrix rowwise_scale(const Matrix &A, const Vector &s) {
   return out;
 }
 
-// ==================== elemwise_mul (벡터 원소별 곱) ====================
+// elemwise_mul, 벡터 원소별 곱
 __global__ void elemwise_mul_gpu(const Vector *A, const Vector *B, Vector *C) {
   int tid = blockDim.x * blockIdx.x + threadIdx.x;
 
@@ -544,8 +544,7 @@ Vector make_eps_vec(int n, double eps) {
   return out;
 }
 
-// ==================== affine_min / affine_max ====================
-// min_{x in [x0-eps, x0+eps]} (Ax + c)
+// affine_min
 __global__ void affine_min_gpu(const Matrix *A, const Vector *c,
                                const Vector *xl, const Vector *xu,
                                Vector *out) {
@@ -602,7 +601,7 @@ Vector affine_min(const Matrix &A, const Vector &c, const Vector &x0,
   return out;
 }
 
-// max_{x in [x0-eps, x0+eps]} (Ax + c)
+// affine_max
 __global__ void affine_max_gpu(const Matrix *A, const Vector *c,
                                const Vector *xl, const Vector *xu,
                                Vector *out) {
@@ -658,7 +657,8 @@ Vector affine_max(const Matrix &A, const Vector &c, const Vector &x0,
 
   return out;
 }
-// ==================== relu_relax (GPU) ====================
+
+// relu_relax
 __global__ void relu_relax_gpu(const Vector *lower, const Vector *upper,
                                Vector *alpha_l, Vector *beta_l, Vector *alpha_u,
                                Vector *beta_u) {
@@ -739,12 +739,6 @@ void relu_relax(const Vector &lower, const Vector &upper, Vector &alpha_l,
   cudaMemcpy(&alpha_u, d_alpha_u, sizeof(Vector), cudaMemcpyDeviceToHost);
   cudaMemcpy(&beta_u, d_beta_u, sizeof(Vector), cudaMemcpyDeviceToHost);
 
-  // Debug
-  // std::cerr << "DEBUG RELU_RELAX: lower=" << lower.v[0] << ", upper=" <<
-  // upper.v[0]
-  //           << " | alpha_u=" << alpha_u.v[0] << ", beta_u=" << beta_u.v[0] <<
-  //           "\n";
-
   cudaFree(d_lower);
   cudaFree(d_upper);
   cudaFree(d_alpha_l);
@@ -753,7 +747,6 @@ void relu_relax(const Vector &lower, const Vector &upper, Vector &alpha_l,
   cudaFree(d_beta_u);
 }
 
-// ==================== bisection (CPU) ====================
 double bisect_root(double lo, double hi,
                    const std::function<double(double)> &fn, int max_iter = 80,
                    double tol = 1e-12) {
