@@ -119,7 +119,7 @@ void require(bool cond, const std::string &msg) {
   }
 }
 
-// 인자를 입력받아 크기를 지정한 2차원 0 행렬 만들기
+// 인자를 입력받아 크기를 지정한 2차원 0 행렬 만들기 (최적화 때 CUDA로 포팅하는 게 좋다는 말이 있음, memcpy 비용 고려)
 Matrix make_zero_matrix(int rows, int cols) {
   require(rows >= 0 && rows <= MAX_DIM && cols >= 0 && cols <= MAX_DIM,
           "Matrix shape out of bounds.");
@@ -129,7 +129,7 @@ Matrix make_zero_matrix(int rows, int cols) {
   return out;
 }
 
-// 인자를 입력받아 1차원 0 벡터 배열 만들기
+// 인자를 입력받아 1차원 0 벡터 배열 만들기 (최적화 때 CUDA로 포팅하는 게 좋다는 말이 있음, memcpy 비용 고려)
 Vector make_zero_vector(int n) {
   require(n >= 0 && n <= MAX_DIM, "Vector length out of bounds.");
   Vector out;
@@ -137,7 +137,7 @@ Vector make_zero_vector(int n) {
   return out;
 }
 
-// 크기가 n * n 인 단위행렬 생성
+// 크기가 n * n 인 단위행렬 생성 (최적화 때 CUDA로 포팅하는 게 좋다는 말이 있음, memcpy 비용 고려)
 Matrix make_eye(int n) {
   Matrix out = make_zero_matrix(n, n);
   for (int i = 0; i < n; ++i) {
@@ -535,7 +535,8 @@ Vector elemwise_mul(const Vector &a, const Vector &b) {
   return c;
 }
 
-// 엡실론 벡터 만들기 (n 크기의) , 단순히 eps 로 채운 벡터이므로 gpu 연산 불필요
+// 엡실론 벡터 만들기 (n 크기의) , 단순히 eps 로 채운 벡터이므로 gpu 연산 불필요 
+// (CUDA로 포팅하는 게 좋다는 말이 있음, memcpy 비용 고려)
 Vector make_eps_vec(int n, double eps) {
   Vector out = make_zero_vector(n);
   for (int i = 0; i < n; ++i) {
