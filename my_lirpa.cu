@@ -747,6 +747,7 @@ void relu_relax(const Vector &lower, const Vector &upper, Vector &alpha_l,
   cudaFree(d_beta_u);
 }
 
+// sigmoid_relax에서 활용 (CUDA 포팅 필요)
 double bisect_root(double lo, double hi,
                    const std::function<double(double)> &fn, int max_iter = 80,
                    double tol = 1e-12) {
@@ -809,6 +810,7 @@ double bisect_root(double lo, double hi,
   return 0.5 * (lo + hi);
 }
 
+// 커널 코드로 바꾸는 것에 대한 고려 필요 (CUDA 포팅 필요)
 void sigmoid_relax(const Vector &lower, const Vector &upper, Vector &alpha_l,
                    Vector &beta_l, Vector &alpha_u, Vector &beta_u) {
   require(lower.n == upper.n, "sigmoid_relax shape mismatch.");
@@ -910,8 +912,7 @@ ActivationType parse_activation(const std::string &name) {
   throw std::invalid_argument("Unsupported activation: " + name);
 }
 
-FullyConnectedNetwork
-make_network(int num_layers, const int *layer_in_dim, const int *layer_out_dim,
+FullyConnectedNetwork make_network(int num_layers, const int *layer_in_dim, const int *layer_out_dim,
              const double W_data[MAX_LAYERS][MAX_DIM][MAX_DIM],
              const double b_data[MAX_LAYERS][MAX_DIM],
              const std::string *activations) {
@@ -961,6 +962,7 @@ Vector network_forward(const FullyConnectedNetwork &net, const Vector &x) {
           "network_forward input dimension mismatch.");
   Vector f = x;
 
+  // 내부 활성화 함수 적용 (CUDA 포팅 필요)
   for (int l = 0; l < net.num_layers; ++l) {
     Vector s = vec_add(matvec(net.W[l], f), net.b[l]);
     for (int i = 0; i < s.n; ++i) {
@@ -1067,6 +1069,8 @@ void backward_one_layer(Matrix &lower_M, Vector &lower_p, Matrix &upper_M,
 
   Matrix lower_s_coeff = make_zero_matrix(lower_M.rows, lower_M.cols);
   Matrix upper_s_coeff = make_zero_matrix(upper_M.rows, upper_M.cols);
+
+  // CUDA 포팅 필요 ? 
   for (int i = 0; i < lower_M.rows; ++i) {
     for (int j = 0; j < lower_M.cols; ++j) {
       lower_s_coeff.a[i][j] = lower_M_pos.a[i][j] * alpha_l.v[j] +
