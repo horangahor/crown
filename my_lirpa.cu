@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cctype>
 #include <cmath>
 #include <cuda_runtime.h>
@@ -666,15 +667,13 @@ __global__ void relu_relax_gpu(const Vector *lower, const Vector *upper,
   if (tid < lower->n) {
     double l = lower->v[tid];
     double u = upper->v[tid];
-    if (l > u) {
-      return; // 쿠다 예외 처리 필요
-    }
+    assert(l <= u); // 기존 relu_relax 에 l > u 감지
 
     if (l >= 0.0) {
       alpha_l->v[tid] = 1.0;
       alpha_u->v[tid] = 1.0;
     } else if (u <= 0.0) {
-      // 이미 0으로 초기화되어 있으므로 그대로 둠
+      // keep zeros
     } else {
       double denom = u - l;
       alpha_u->v[tid] = u / denom;
@@ -719,10 +718,17 @@ void relu_relax(const Vector &lower, const Vector &upper, Vector &alpha_l,
       d_lower, d_upper, d_alpha_l, d_beta_l, d_alpha_u, d_beta_u);
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
-    std::cerr << "CUDA error in relu_relax_gpu: " << cudaGetErrorString(err)
-              << "\n";
+    std::cerr << "CUDA error in relu_relax_gpu launch: "
+              << cudaGetErrorString(err) << "\n";
   }
-  cudaDeviceSynchronize();
+
+  // 커널 내의 assert() 실패는 이 동기화 함수에서 에러로 잡힘
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    std::cerr << "CUDA error during relu_relax_gpu execution: "
+              << cudaGetErrorString(err) << "\n";
+    throw std::runtime_error("relu_relax_gpu 실행 중 에러 발생");
+  }
 
   err = cudaMemcpy(&alpha_l, d_alpha_l, sizeof(Vector), cudaMemcpyDeviceToHost);
   if (err != cudaSuccess) {
