@@ -11,6 +11,9 @@
 #include <stdexcept>
 #include <string>
 
+
+// Relaxation : 선형 근사를 통한 사잇값 계산
+
 // using namespace std; 안 쓴 이유 : 이름 충돌을 막기 위함, 코드가 복잡해지면
 // std:: 을 일일이 붙여야함 using namespace std 붙인것과 명시적으로 std:: 를
 // 사용하는 것에는 성능 차이가 없음 <== 컴파일러에게 알려주는 것이므로 컴파일
@@ -42,7 +45,7 @@ struct Vector {
   double v[MAX_DIM]{}; // 유니폼 초기화, 0.0으로 초기화됨
 };
 
-// 선형 바운드
+// 선형 바운드 Ax+c 형태 (A)
 struct AffineBound {
   Matrix lower_A;
   Vector lower_c;
@@ -59,7 +62,7 @@ struct LayerBound {
   Vector beta_upper;
 };
 
-// 설명 필요
+// 결과 (forward)
 struct ForwardBoundResult {
   AffineBound final_affine;
   Vector final_lower;
@@ -68,7 +71,7 @@ struct ForwardBoundResult {
   LayerBound layer_bounds[MAX_LAYERS]{};
 };
 
-// 설명 필요
+// 결과 (backward)
 struct BackwardBoundResult {
   AffineBound final_affine;
   Vector final_lower;
@@ -77,7 +80,7 @@ struct BackwardBoundResult {
   LayerBound layer_bounds[MAX_LAYERS]{};
 };
 
-// 설명 필요
+// 신경망 (Fully Connected Network)
 struct FullyConnectedNetwork {
   int num_layers = 0;
   int layer_in_dim[MAX_LAYERS]{};
@@ -316,7 +319,7 @@ Matrix matmul(const Matrix &A, const Matrix &B) {
   cudaMemcpy(d_B, &B, sizeof(Matrix), cudaMemcpyHostToDevice);
   cudaMemcpy(d_C, &C, sizeof(Matrix), cudaMemcpyHostToDevice);
 
-  int total_elements = A.rows * B.cols; // 행렬곱의 크기
+  int total_elements = A.rows * B.cols; // 행렬곱 결과 행렬의 크기
   int threadsPerBlock = 256;
   int blocksPerGrid = (total_elements + threadsPerBlock - 1) / threadsPerBlock;
 
