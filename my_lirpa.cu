@@ -149,17 +149,21 @@ Matrix make_eye(int n) {
   return out;
 }
 
+// ======== make 함수들은 실제 신경망 행렬의 크기로 비교가 필요할 듯 ============
+
+
+
 // 1. GPU 커널 함수: GPU 스레드, 행렬 더하기
 // 2. CPU 커널 호출 함수: 할당 -> 복사 -> 연산지시 -> 회수 -> 반납
 
 // 행렬 합 구하기
 __global__ void mat_add_gpu(const Matrix *A, const Matrix *B, Matrix *C) {
-  int tid = blockDim.x * blockIdx.x + threadIdx.x;
+  int tid = blockDim.x * blockIdx.x + threadIdx.x; // 행렬 ==> 1차원 배열에서의 원소 번호
   int total_elements = A->rows * A->cols;
 
   if (tid < total_elements) {
-    int r = tid / A->cols;
-    int c = tid % A->cols;
+    int r = tid / A->cols; // 1차원 배열에서의 행 번호 (진짜 행)
+    int c = tid % A->cols; // 1차원 배열에서의 열 번호 (진짜 열)
     C->a[r][c] = A->a[r][c] + B->a[r][c];
   }
 }
@@ -182,9 +186,9 @@ Matrix mat_add(const Matrix &A, const Matrix &B) {
   cudaMemcpy(d_B, &B, sizeof(Matrix), cudaMemcpyHostToDevice);
   cudaMemcpy(d_C, &C, sizeof(Matrix), cudaMemcpyHostToDevice);
 
-  // 스레드 분배
+  // 블럭개수, 스레드 크기 지정
   int total_elements = A.rows * A.cols;
-  int threadsPerBlock = 256;
+  int threadsPerBlock = 256; // 임시 (스레드 크기를 256)
   int blocksPerGrid = (total_elements + threadsPerBlock - 1) / threadsPerBlock;
 
   // 커널 실행 (GPU 연산 지시)
@@ -751,7 +755,8 @@ void relu_relax(const Vector &lower, const Vector &upper, Vector &alpha_l,
   cudaFree(d_beta_u);
 }
 
-// sigmoid_relax에서 활용 (CUDA 포팅 필요)
+// sigmoid_relax에서 활용 (CUDA 포팅 필요) 
+// 함수를 매개변수로 받는 것, CUDA로 포팅을 하기위해서 처리 필요
 double bisect_root(double lo, double hi,
                    const std::function<double(double)> &fn, int max_iter = 80,
                    double tol = 1e-12) {
@@ -814,7 +819,7 @@ double bisect_root(double lo, double hi,
   return 0.5 * (lo + hi);
 }
 
-// 커널 코드로 바꾸는 것에 대한 고려 필요 (CUDA 포팅 필요)
+// 커널 코드로 바꾸는 것에 대한 고려 필요 (CUDA 포팅 필요) <== 필요없는 함수
 void sigmoid_relax(const Vector &lower, const Vector &upper, Vector &alpha_l,
                    Vector &beta_l, Vector &alpha_u, Vector &beta_u) {
   require(lower.n == upper.n, "sigmoid_relax shape mismatch.");
@@ -858,13 +863,13 @@ void sigmoid_relax(const Vector &lower, const Vector &upper, Vector &alpha_l,
       beta_u.v[i] = sigmoid(u) - slope_sec * u;
     } else {
       const double su = sigmoid(u);
-      const auto fn_lower = [su, u](double d) {
+      const auto fn_lower = [su, u](double d) {   // 람다함수 <== CUDA 포팅을 하기위해 처리 필요
         return (su - sigmoid(d)) / (u - d) - sigmoid_prime(d);
       };
       const double du = bisect_root(l, 0.0, fn_lower);
 
       const double sl = sigmoid(l);
-      const auto fn_upper = [sl, l](double d) {
+      const auto fn_upper = [sl, l](double d) {   // 람다함수 <== CUDA 포팅을 하기위해 처리 필요
         return (sigmoid(d) - sl) / (d - l) - sigmoid_prime(d);
       };
       const double dl = bisect_root(0.0, u, fn_upper);
@@ -961,24 +966,53 @@ int network_output_dim(const FullyConnectedNetwork &net) {
   return net.layer_out_dim[net.num_layers - 1];
 }
 
+__global__ void apply_activation_gpu(ActivationType act, Vector *A){
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < A->n){
+    if(act == ActivationType :: Relu){
+      A->v[tid] = relu(A->v[tid]);
+    }
+    else if(act == ActivationType :: Sigmoid){
+      A->v[tid] = sigmoid(A->v[tid]);
+    }
+    else if(act == ActivationType::Linear){
+      //unchanged 
+    }
+  }
+}
+
+// 할당 -> 전달 -> 호출 -> 반환 -> 해제
+Vector apply_activation(const Vector &s, const ActivationType act){
+  Vector out = s;
+  Vector *d_s;
+  cudaMalloc((void **)&d_s, sizeof(Vector));
+
+  cudaMemcpy(d_s, &out, sizeof(Vector), cudaMemcpyHostToDevice);
+
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (out.n + threadsPerBlock - 1) / threadsPerBlock;
+
+  apply_activation_gpu<<<blocksPerGrid, threadsPerBlock>>>(act, d_s);
+  cudaDeviceSynchronize();
+
+  cudaMemcpy(&out , d_s, sizeof(Vector), cudaMemcpyDeviceToHost);
+  cudaFree(d_s);
+
+  return out;
+}
+
+
+
+
 Vector network_forward(const FullyConnectedNetwork &net, const Vector &x) {
   require(x.n == network_input_dim(net),
           "network_forward input dimension mismatch.");
   Vector f = x;
 
-  // 내부 활성화 함수 적용 (CUDA 포팅 필요)
+  // 내부 활성화 함수 적용
   for (int l = 0; l < net.num_layers; ++l) {
-    Vector s = vec_add(matvec(net.W[l], f), net.b[l]);
-    for (int i = 0; i < s.n; ++i) {
-      if (net.act[l] == ActivationType::Relu) {
-        s.v[i] = relu(s.v[i]);
-      } else if (net.act[l] == ActivationType::Sigmoid) {
-        s.v[i] = sigmoid(s.v[i]);
-      } else if (net.act[l] == ActivationType::Linear) {
-        // unchanged
-      }
-    }
-    f = s;
+    Vector s = vec_add(matvec(net.W[l], f), net.b[l]); // net의 가중치 , f와 행렬곱, 이후 net의 bias 합 
+    f = apply_activation(s, net.act[l]);
   }
 
   return f;
