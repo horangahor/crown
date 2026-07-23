@@ -122,8 +122,8 @@ void require(bool cond, const std::string &msg) {
   }
 }
 
-// 인자를 입력받아 크기를 지정한 2차원 0 행렬 만들기 (최적화 때 CUDA로 포팅하는 게 좋다는 말이 있음, memcpy 비용 고려)
-Matrix make_zero_matrix(int rows, int cols) {
+// --- CPU 원본 함수들 (성능 비교 및 백업용) ---
+Matrix make_zero_matrix_cpu(int rows, int cols) {
   require(rows >= 0 && rows <= MAX_DIM && cols >= 0 && cols <= MAX_DIM,
           "Matrix shape out of bounds.");
   Matrix out;
@@ -132,20 +132,85 @@ Matrix make_zero_matrix(int rows, int cols) {
   return out;
 }
 
-// 인자를 입력받아 1차원 0 벡터 배열 만들기 (최적화 때 CUDA로 포팅하는 게 좋다는 말이 있음, memcpy 비용 고려)
-Vector make_zero_vector(int n) {
+Vector make_zero_vector_cpu(int n) {
   require(n >= 0 && n <= MAX_DIM, "Vector length out of bounds.");
   Vector out;
   out.n = n;
   return out;
 }
 
-// 크기가 n * n 인 단위행렬 생성 (최적화 때 CUDA로 포팅하는 게 좋다는 말이 있음, memcpy 비용 고려)
-Matrix make_eye(int n) {
-  Matrix out = make_zero_matrix(n, n);
+Matrix make_eye_cpu(int n) {
+  Matrix out = make_zero_matrix_cpu(n, n);
   for (int i = 0; i < n; ++i) {
     out.a[i][i] = 1.0;
   }
+  return out;
+}
+// ----------------------------------------------
+
+// 인자를 입력받아 크기를 지정한 2차원 0 행렬 만들기 (CUDA 포팅)
+Matrix make_zero_matrix(int rows, int cols) {
+  require(rows >= 0 && rows <= MAX_DIM && cols >= 0 && cols <= MAX_DIM,
+          "Matrix shape out of bounds.");
+  Matrix out;
+  Matrix *d_out;
+  cudaMalloc((void **)&d_out, sizeof(Matrix));
+  
+  // GPU에서 0으로 초기화
+  cudaMemset(d_out, 0, sizeof(Matrix));
+  
+  cudaMemcpy(&out, d_out, sizeof(Matrix), cudaMemcpyDeviceToHost);
+  out.rows = rows;
+  out.cols = cols;
+  
+  cudaFree(d_out);
+  return out;
+}
+
+// 인자를 입력받아 1차원 0 벡터 배열 만들기 (CUDA 포팅)
+Vector make_zero_vector(int n) {
+  require(n >= 0 && n <= MAX_DIM, "Vector length out of bounds.");
+  Vector out;
+  Vector *d_out;
+  cudaMalloc((void **)&d_out, sizeof(Vector));
+  
+  // GPU에서 0으로 초기화
+  cudaMemset(d_out, 0, sizeof(Vector));
+  
+  cudaMemcpy(&out, d_out, sizeof(Vector), cudaMemcpyDeviceToHost);
+  out.n = n;
+  
+  cudaFree(d_out);
+  return out;
+}
+
+// 단위 행렬 생성을 위한 GPU 커널
+__global__ void make_eye_gpu(Matrix *out, int n) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < n) {
+    out->a[tid][tid] = 1.0;
+  }
+}
+
+// 크기가 n * n 인 단위행렬 생성 (CUDA 포팅)
+Matrix make_eye(int n) {
+  // 우선 0으로 채워진 GPU 행렬을 가져옴
+  Matrix out = make_zero_matrix(n, n);
+  Matrix *d_out;
+  
+  cudaMalloc((void **)&d_out, sizeof(Matrix));
+  cudaMemcpy(d_out, &out, sizeof(Matrix), cudaMemcpyHostToDevice);
+  
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
+  if (blocksPerGrid == 0) blocksPerGrid = 1;
+  
+  make_eye_gpu<<<blocksPerGrid, threadsPerBlock>>>(d_out, n);
+  cudaDeviceSynchronize();
+  
+  cudaMemcpy(&out, d_out, sizeof(Matrix), cudaMemcpyDeviceToHost);
+  cudaFree(d_out);
+  
   return out;
 }
 
@@ -542,13 +607,42 @@ Vector elemwise_mul(const Vector &a, const Vector &b) {
   return c;
 }
 
-// 엡실론 벡터 만들기 (n 크기의) , 단순히 eps 로 채운 벡터이므로 gpu 연산 불필요 
-// (CUDA로 포팅하는 게 좋다는 말이 있음, memcpy 비용 고려)
-Vector make_eps_vec(int n, double eps) {
-  Vector out = make_zero_vector(n);
+// make_eps_vec_cpu, CPU 원본 함수 (gpu와 비교 필요)
+Vector make_eps_vec_cpu(int n, double eps) {
+  Vector out = make_zero_vector_cpu(n);
   for (int i = 0; i < n; ++i) {
     out.v[i] = eps;
   }
+  return out;
+}
+
+// cuda로 재작성한 엡실론 벡터 만들기
+__global__ void make_eps_vec_gpu(Vector *out, int n, double eps) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < n) {
+    out->v[tid] = eps;
+  }
+}
+
+// 엡실론 벡터 만들기 (CUDA 포팅)
+Vector make_eps_vec(int n, double eps) {
+  // 우선 GPU에서 0으로 초기화된 벡터를 가져옴
+  Vector out = make_zero_vector(n);
+  Vector *d_out;
+  
+  cudaMalloc((void **)&d_out, sizeof(Vector));
+  cudaMemcpy(d_out, &out, sizeof(Vector), cudaMemcpyHostToDevice);
+  
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
+  if (blocksPerGrid == 0) blocksPerGrid = 1;
+  
+  make_eps_vec_gpu<<<blocksPerGrid, threadsPerBlock>>>(d_out, n, eps);
+  cudaDeviceSynchronize();
+  
+  cudaMemcpy(&out, d_out, sizeof(Vector), cudaMemcpyDeviceToHost);
+  cudaFree(d_out);
+  
   return out;
 }
 
@@ -1012,6 +1106,8 @@ Vector network_forward(const FullyConnectedNetwork &net, const Vector &x) {
   // 내부 활성화 함수 적용
   for (int l = 0; l < net.num_layers; ++l) {
     Vector s = vec_add(matvec(net.W[l], f), net.b[l]); // net의 가중치 , f와 행렬곱, 이후 net의 bias 합 
+
+    // vec_add 함수 __global__ (host에서 호출하고 device에서 동작)
     f = apply_activation(s, net.act[l]);
   }
 
