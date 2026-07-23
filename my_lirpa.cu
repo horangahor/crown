@@ -23,8 +23,8 @@
 // 등을 정의
 namespace {
 
-constexpr int MAX_LAYERS = 16;
-constexpr int MAX_DIM = 64;
+constexpr int MAX_LAYERS = 16; // 최대 16개 층까지 지원
+constexpr int MAX_DIM = 64; // 최대 64개 뉴런(노드)까지 지원 ==> 나중에 은닉층을 고려해 512로 수정
 
 enum class ActivationType {
   Relu,
@@ -83,11 +83,13 @@ struct BackwardBoundResult {
 // 신경망 (Fully Connected Network)
 struct FullyConnectedNetwork {
   int num_layers = 0;
+  // 층으로 들어오는 입력 (즉 특정 층을 기준으로 들어오는 입력 / 예를 들어 지금 하는 신경망은 층이 4개 (입력 1, 은닉 2, 출력 1) )
+  // 은닉1로 들어가는 입력(층) , 은닉2로 들어가는 입력(층), 출력층으로 들어가는 입력(층) == 총 3개 (MAX_LAYERS)
   int layer_in_dim[MAX_LAYERS]{};
-  int layer_out_dim[MAX_LAYERS]{};
-  Matrix W[MAX_LAYERS]{};
-  Vector b[MAX_LAYERS]{};
-  ActivationType act[MAX_LAYERS]{};
+  int layer_out_dim[MAX_LAYERS]{}; // 층에서 나가는 출력  (즉 특정 층을 기준으로 나가는 출력)
+  Matrix W[MAX_LAYERS]{}; // 가중치 행렬
+  Vector b[MAX_LAYERS]{}; // 편향 벡터
+  ActivationType act[MAX_LAYERS]{}; // 활성화 함수 타입
 };
 
 // 인라인 함수, macro 처럼 코드 자체를 치환함 (실행 시간을 최적화 하기 위함)
@@ -1015,6 +1017,7 @@ ActivationType parse_activation(const std::string &name) {
   throw std::invalid_argument("Unsupported activation: " + name);
 }
 
+// 가상 신경망 만들기
 FullyConnectedNetwork make_network(int num_layers, const int *layer_in_dim, const int *layer_out_dim,
              const double W_data[MAX_LAYERS][MAX_DIM][MAX_DIM],
              const double b_data[MAX_LAYERS][MAX_DIM],
@@ -1235,8 +1238,7 @@ void backward_one_layer(Matrix &lower_M, Vector &lower_p, Matrix &upper_M,
   upper_p = new_upper_p;
 }
 
-BackwardBoundResult
-lirpa_backward_bound(const FullyConnectedNetwork &net, const Vector &x0,
+BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const Vector &x0,
                      double eps, const Matrix *output_lower_M = nullptr,
                      const Vector *output_lower_p = nullptr,
                      const Matrix *output_upper_M = nullptr,
@@ -1456,6 +1458,7 @@ void self_test_relaxations() {
   }
 }
 
+// 신경망 틀 구성(정의), 여기서 실제 신경망을 로드해 설계도를 만들어야 함
 FullyConnectedNetwork make_xor_network() {
   int layer_in[MAX_LAYERS]{};
   int layer_out[MAX_LAYERS]{};
