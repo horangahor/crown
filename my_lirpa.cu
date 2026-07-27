@@ -24,7 +24,7 @@
 namespace {
 
 constexpr int MAX_LAYERS = 16; // 최대 16개 층까지 지원
-constexpr int MAX_DIM = 64; // 최대 64개 뉴런(노드)까지 지원 ==> 나중에 은닉층을 고려해 512로 수정
+constexpr int MAX_DIM = 512; // 최대 512개 뉴런(노드)까지 지원 (입력 크기 256 등을 위해 확장)
 
 enum class ActivationType {
   Relu,
@@ -33,6 +33,7 @@ enum class ActivationType {
 };
 
 // 항상 최대의 행렬을 가지지만 rows, cols 정보에 의해 크기가 제한되는 형식
+// 거의 2MB 의 크기를 가짐 (512 * 512 * 8byte)
 struct Matrix {
   int rows = 0;
   int cols = 0;
@@ -40,6 +41,7 @@ struct Matrix {
 };
 
 // 크기가 n인 벡터
+// 512 * 8byte (미미한 크기)
 struct Vector {
   int n = 0;
   double v[MAX_DIM]{}; // 유니폼 초기화, 0.0으로 초기화됨
@@ -64,7 +66,7 @@ struct LayerBound {
 
 // 결과 (forward)
 struct ForwardBoundResult {
-  AffineBound final_affine;
+  AffineBound final_affine; // 4MB
   Vector final_lower;
   Vector final_upper;
   int num_layer_bounds = 0;
@@ -73,7 +75,7 @@ struct ForwardBoundResult {
 
 // 결과 (backward)
 struct BackwardBoundResult {
-  AffineBound final_affine;
+  AffineBound final_affine; // Matrix 2개 4MB 
   Vector final_lower;
   Vector final_upper;
   int num_layer_bounds = 0;
@@ -1123,13 +1125,13 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
           "lirpa_forward_bound input dimension mismatch.");
 
   const int in_dim = network_input_dim(net);
-  AffineBound current;
+  AffineBound current; // 약 4MB
   current.lower_A = make_eye(in_dim);
   current.upper_A = make_eye(in_dim);
   current.lower_c = make_zero_vector(in_dim);
   current.upper_c = make_zero_vector(in_dim);
 
-  ForwardBoundResult out;
+  ForwardBoundResult out; // 4MB
   out.num_layer_bounds = net.num_layers;
 
   for (int l = 0; l < net.num_layers; ++l) {
@@ -1199,13 +1201,13 @@ void backward_one_layer(Matrix &lower_M, Vector &lower_p, Matrix &upper_M,
               beta_u.n == W.rows,
           "backward_one_layer relaxation shape mismatch.");
 
-  const Matrix lower_M_pos = positive_part(lower_M);
-  const Matrix lower_M_neg = negative_part(lower_M);
-  const Matrix upper_M_pos = positive_part(upper_M);
-  const Matrix upper_M_neg = negative_part(upper_M);
+  const Matrix lower_M_pos = positive_part(lower_M); // 2MB
+  const Matrix lower_M_neg = negative_part(lower_M); // 2MB
+  const Matrix upper_M_pos = positive_part(upper_M); // 2MB
+  const Matrix upper_M_neg = negative_part(upper_M); // 2MB 
 
-  Matrix lower_s_coeff = make_zero_matrix(lower_M.rows, lower_M.cols);
-  Matrix upper_s_coeff = make_zero_matrix(upper_M.rows, upper_M.cols);
+  Matrix lower_s_coeff = make_zero_matrix(lower_M.rows, lower_M.cols); // 2MB
+  Matrix upper_s_coeff = make_zero_matrix(upper_M.rows, upper_M.cols); // 2MB
 
   // CUDA 포팅 필요 ? 
   for (int i = 0; i < lower_M.rows; ++i) {
@@ -1217,8 +1219,8 @@ void backward_one_layer(Matrix &lower_M, Vector &lower_p, Matrix &upper_M,
     }
   }
 
-  const Matrix new_lower_M = matmul(lower_s_coeff, W);
-  const Matrix new_upper_M = matmul(upper_s_coeff, W);
+  const Matrix new_lower_M = matmul(lower_s_coeff, W); // 2MB
+  const Matrix new_upper_M = matmul(upper_s_coeff, W); // 2MB
 
   const Vector term_lp = vec_add(elemwise_mul(alpha_l, b), beta_l);
   const Vector term_ln = vec_add(elemwise_mul(alpha_u, b), beta_u);
@@ -1243,18 +1245,20 @@ BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const
                      const Vector *output_lower_p = nullptr,
                      const Matrix *output_upper_M = nullptr,
                      const Vector *output_upper_p = nullptr) {
-  const ForwardBoundResult fwd = lirpa_forward_bound(net, x0, eps);
 
+  std::cout << "clear lirpa_forward!\n" << std::endl; // 어디서 스택 오버플로우 발생인지 추적용
+  const ForwardBoundResult fwd = lirpa_forward_bound(net, x0, eps); // 포워드 결과 4MB 할당 (스택)
+  
   const int output_dim = network_output_dim(net);
-  Matrix lower_M;
-  Matrix upper_M;
+  Matrix lower_M; // 2MB 할당 (스택)
+  Matrix upper_M; // 2MB 할당 (스택)
   Vector lower_p;
   Vector upper_p;
 
   if (output_lower_M) {
     lower_M = *output_lower_M;
   } else {
-    lower_M = make_eye(output_dim);
+    lower_M = make_eye(output_dim); // 얘들은 정리되는 스택이니까 상관 X
   }
   if (output_upper_M) {
     upper_M = *output_upper_M;
@@ -1287,7 +1291,7 @@ BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const
                        lb.beta_upper);
   }
 
-  BackwardBoundResult out;
+  BackwardBoundResult out;  // 4MB 할당 (스택)
   out.final_affine.lower_A = lower_M;
   out.final_affine.lower_c = lower_p;
   out.final_affine.upper_A = upper_M;
@@ -1376,8 +1380,7 @@ private:
     }
   }
 
-  static LayerBound
-  build_one_layer_relaxation(const FullyConnectedNetwork &net, int layer,
+  static LayerBound build_one_layer_relaxation(const FullyConnectedNetwork &net, int layer,
                              const Vector &x0, double eps,
                              const LayerBound *previous_layer_bounds) {
     Matrix lower_M = net.W[layer];
@@ -1458,10 +1461,12 @@ void self_test_relaxations() {
   }
 }
 
-// 신경망 틀 구성(정의), 여기서 실제 신경망을 로드해 설계도를 만들어야 함
+// 가상 신경망 틀 구성(정의)
 FullyConnectedNetwork make_xor_network() {
   int layer_in[MAX_LAYERS]{};
   int layer_out[MAX_LAYERS]{};
+  // 가중치의 개수는 fully connected 기준 (간선을 생각해보면 (491*491)*3 , 256 - 491 - 491 - 16)
+  // [n번째 간선층][n번째 층의 m번째 노드] * [n+1번째 층의 k번째 노드]
   double W_data[MAX_LAYERS][MAX_DIM][MAX_DIM]{};
   double b_data[MAX_LAYERS][MAX_DIM]{};
   std::string acts[MAX_LAYERS];
@@ -1522,6 +1527,7 @@ void run_xor_demo(double eps) {
   bool all_certified_backward = true;
   bool all_certified_backward_only = true;
 
+  // 소수점 관련된 뭔가였던것같은데 
   std::cout << std::fixed << std::setprecision(6);
 
   for (const auto &x0 : points) {
@@ -1599,6 +1605,8 @@ void run_xor_demo(double eps) {
 
 } // namespace
 
+
+/*
 int main(int argc, char **argv) {
   try {
     std::cout << "Program started...\n";
@@ -1619,6 +1627,7 @@ int main(int argc, char **argv) {
   }
   return 0;
 }
+  */
 
 /*
 // argc 전달된 인자의 개수 (실행될 프로그램도 인자로 포함되므로 무조건 기본값
