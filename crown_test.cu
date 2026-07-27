@@ -1,6 +1,7 @@
 #include<iostream>
 #include<cuda_runtime.h>
 #include<vector>
+#include<chrono>
 #include "my_lirpa.cu"
 #include<fstream>
 
@@ -157,15 +158,16 @@ int main(int argc, char** argv){
     Vector x0 = load_test_data(data_path, net->layer_in_dim[0]);
     std::cout << "data read success (dim=" << x0.n << ")" << std::endl;
 
-    // ==========================================
-    // 대망의 CROWN 알고리즘 호출 및 출력
-    // ==========================================
+    // CROWN 알고리즘 호출 및 출력
     std::cout << "\n========================================\n";
     std::cout << "Starting CROWN Verification (eps = " << eps << ")" << std::endl;
     std::cout << "========================================\n";
 
-    // 소수점 6자리까지 예쁘게 출력
+    // 소수점 6자리까지 출력
     std::cout << std::fixed << std::setprecision(6);
+
+    // 시간 측정 시작
+    auto t_start = std::chrono::high_resolution_clock::now();
 
     // 1. 일반 예측값 확인 (신경망 정방향 통과)
     Vector y = network_forward(*net, x0);
@@ -174,7 +176,13 @@ int main(int argc, char** argv){
     // 여기서 선언시 BackwardBoundResult 빈 공간(4MB 할당 + 자잘한 벡터들까지 해서 넉넉히 0.25MB )
     // 내부 함수에 진입해서 보면 거의 32MB가 필요함 (함수 주석 참고)
     BackwardBoundResult bwd = lirpa_backward_bound(*net, x0, eps);
+
+    // 시간 측정 종료
+    auto t_end = std::chrono::high_resolution_clock::now();
+    double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
     std::cout << "calc success" << std::endl;
+    std::cout << "Elapsed time: " << elapsed_ms << " ms" << std::endl;
 
     // 3. 출력 차원에 맞게 (보통 16개) 결과 출력
     int out_dim = bwd.final_lower.n;
