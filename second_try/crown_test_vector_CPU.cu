@@ -2,7 +2,7 @@
 #include<cuda_runtime.h>
 #include<vector>
 #include<chrono>
-#include "my_lirpa.cu"
+#include "my_lirpa_vector_CPU.cu"
 #include<fstream>
 
 const char* MODEL_PATH = "C:/Users/user/Desktop/cuda/jnunnv_v1_0/jnunnv/models/Custom/Baseline mMIMO FC H hard short 80 HTHNN_LAY2_491 RELU 20241018 PRUNED 0.93_NO_SIGMOID_custom.bin";
@@ -160,13 +160,13 @@ int main(int argc, char** argv){
 
     // CROWN 알고리즘 호출 및 출력
     std::cout << "\n========================================\n";
-    std::cout << "Starting CROWN Verification (eps = " << eps << ")" << std::endl;
+    std::cout << "Starting CROWN Verification VECTOR CPU (eps = " << eps << ")" << std::endl;
     std::cout << "========================================\n";
 
     // 소수점 6자리까지 출력
     std::cout << std::fixed << std::setprecision(6);
 
-    // 시간 측정 시작
+    // 시간 측정 시작 (신경망 정방향 통과 및 CROWN)
     auto t_start = std::chrono::high_resolution_clock::now();
 
     // 1. 일반 예측값 확인 (신경망 정방향 통과)
@@ -174,7 +174,8 @@ int main(int argc, char** argv){
 
     // 2. CROWN (Backward Bound) 호출
     // 여기서 선언시 BackwardBoundResult 빈 공간(4MB 할당 + 자잘한 벡터들까지 해서 넉넉히 0.25MB )
-    // 내부 함수에 진입해서 보면 거의 32MB가 필요함 (함수 주석 참고)
+    // 내부 함수에 진입해서 보면 거의 64MB가 필요함 (함수 주석 참고) <== 근데 64MB 안되서 128MB로 함
+    // 왜인지는 모르겠다 너무 함수가 복잡해져서..
     BackwardBoundResult bwd = lirpa_backward_bound(*net, x0, eps);
 
     // 시간 측정 종료
