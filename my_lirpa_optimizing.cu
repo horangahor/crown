@@ -94,7 +94,7 @@ struct FullyConnectedNetwork {
 };
 
 // ============================================================
-// 메모리 풀 (Memory Pool) - 이 파일의 유일한 변경점
+// 메모리 풀 (Memory Pool) 
 // ============================================================
 // 함수들이 사용하는 최대 동시 GPU 버퍼 수:
 //   Matrix: 3개 (mat_add: A,B,C / matmul: A,B,C / rowwise_scale: A,out + vec1)
@@ -107,6 +107,12 @@ constexpr int NUM_POOL_VEC = 6;
 struct GpuPool {
   Matrix* d_mat[NUM_POOL_MAT];
   Vector* d_vec[NUM_POOL_VEC];
+  // Immutable network tensors.  They remain on the device across a CROWN call.
+  // 불변 가중치 메모리 풀에 올려놓기
+  Matrix* d_weight[MAX_LAYERS]{};
+  Matrix* d_weight_pos[MAX_LAYERS]{};
+  Matrix* d_weight_neg[MAX_LAYERS]{};
+  const FullyConnectedNetwork* cached_network = nullptr;
   bool initialized = false;
 
   // 1번만 실행되도록
@@ -125,6 +131,16 @@ struct GpuPool {
       cudaFree(d_mat[i]);
     for (int i = 0; i < NUM_POOL_VEC; i++)
       cudaFree(d_vec[i]);
+    // 메모리 해제
+    for (int i = 0; i < MAX_LAYERS; ++i) {
+      cudaFree(d_weight[i]);
+      cudaFree(d_weight_pos[i]);
+      cudaFree(d_weight_neg[i]);
+      d_weight[i] = nullptr;
+      d_weight_pos[i] = nullptr;
+      d_weight_neg[i] = nullptr;
+    }
+    cached_network = nullptr;
     initialized = false;
   }
 };
@@ -220,6 +236,7 @@ __global__ void make_eye_gpu(Matrix *out, int n) {
   }
 }
 
+// 단위행렬 만들기
 Matrix make_eye(int n) {
   ensure_pool();
   Matrix out = make_zero_matrix(n, n);
@@ -373,6 +390,53 @@ Matrix matmul(const Matrix &A, const Matrix &B) {
   return C;
 }
 
+// 가중치가 GPU에 미리 올라와 있는 상태의 행렬 곱셈 함수 정의
+
+// A is still a host-side intermediate, but B is an immutable matrix already
+// resident on the GPU.  This removes one full Matrix H2D transfer per call.
+Matrix matmul_device_rhs(const Matrix &A, const Matrix *d_B, int b_rows,
+                         int b_cols) {
+  require(A.cols == b_rows, "matmul_device_rhs shape mismatch.");
+  ensure_pool();
+  Matrix C = make_zero_matrix(A.rows, b_cols);
+
+  cudaMemcpy(g_pool.d_mat[0], &A, sizeof(Matrix), cudaMemcpyHostToDevice);
+
+  const int total_elements = A.rows * b_cols;
+  const int threadsPerBlock = 256;
+  const int blocksPerGrid = (total_elements + threadsPerBlock - 1) / threadsPerBlock;
+  matmul_gpu<<<blocksPerGrid, threadsPerBlock>>>(g_pool.d_mat[0], d_B,
+                                                   g_pool.d_mat[2]);
+  cudaDeviceSynchronize();
+
+  cudaMemcpy(&C, g_pool.d_mat[2], sizeof(Matrix), cudaMemcpyDeviceToHost);
+  C.rows = A.rows;
+  C.cols = b_cols;
+  return C;
+}
+
+// Device-resident left operand variant for W * A in the forward bound.
+Matrix matmul_device_lhs(const Matrix *d_A, int a_rows, int a_cols,
+                         const Matrix &B) {
+  require(a_cols == B.rows, "matmul_device_lhs shape mismatch.");
+  ensure_pool();
+  Matrix C = make_zero_matrix(a_rows, B.cols);
+
+  cudaMemcpy(g_pool.d_mat[1], &B, sizeof(Matrix), cudaMemcpyHostToDevice);
+
+  const int total_elements = a_rows * B.cols;
+  const int threadsPerBlock = 256;
+  const int blocksPerGrid = (total_elements + threadsPerBlock - 1) / threadsPerBlock;
+  matmul_gpu<<<blocksPerGrid, threadsPerBlock>>>(d_A, g_pool.d_mat[1],
+                                                   g_pool.d_mat[2]);
+  cudaDeviceSynchronize();
+
+  cudaMemcpy(&C, g_pool.d_mat[2], sizeof(Matrix), cudaMemcpyDeviceToHost);
+  C.rows = a_rows;
+  C.cols = B.cols;
+  return C;
+}
+
 // 행렬-벡터 곱 (Matrix 1개 + Vector 2개 = 풀 안에 들어감)
 __global__ void matvec_gpu(const Matrix *A, const Vector *x, Vector *y) {
   int tid = blockDim.x * blockIdx.x + threadIdx.x;
@@ -405,6 +469,27 @@ Vector matvec(const Matrix &A, const Vector &x) {
   return y;
 }
 
+// 동일하게 가중치가 미리 올라와 있는 행렬 * 벡터 곱
+// Device-resident matrix variant used for immutable network weights.
+Vector matvec_device_matrix(const Matrix *d_A, int rows, int cols,
+                            const Vector &x) {
+  require(cols == x.n, "matvec_device_matrix shape mismatch.");
+  ensure_pool();
+  Vector y = make_zero_vector(rows);
+
+  cudaMemcpy(g_pool.d_vec[0], &x, sizeof(Vector), cudaMemcpyHostToDevice);
+
+  const int threadsPerBlock = 256;
+  const int blocksPerGrid = (rows + threadsPerBlock - 1) / threadsPerBlock;
+  matvec_gpu<<<blocksPerGrid, threadsPerBlock>>>(d_A, g_pool.d_vec[0],
+                                                   g_pool.d_vec[1]);
+  cudaDeviceSynchronize();
+
+  cudaMemcpy(&y, g_pool.d_vec[1], sizeof(Vector), cudaMemcpyDeviceToHost);
+  y.n = rows;
+  return y;
+}
+
 // positive_part (Matrix 2개 사용)
 __global__ void positive_part_gpu(const Matrix *A, Matrix *out) {
   int tid = blockDim.x * blockIdx.x + threadIdx.x;
@@ -416,6 +501,7 @@ __global__ void positive_part_gpu(const Matrix *A, Matrix *out) {
   }
 }
 
+// 행렬 양수부분만 남기기
 Matrix positive_part(const Matrix &A) {
   ensure_pool();
   Matrix out = make_zero_matrix(A.rows, A.cols);
@@ -447,6 +533,7 @@ __global__ void negative_part_gpu(const Matrix *A, Matrix *out) {
   }
 }
 
+// 행렬 음수부분만 남기기
 Matrix negative_part(const Matrix &A) {
   ensure_pool();
   Matrix out = make_zero_matrix(A.rows, A.cols);
@@ -465,6 +552,43 @@ Matrix negative_part(const Matrix &A) {
   out.rows = A.rows;
   out.cols = A.cols;
   return out;
+}
+
+// Upload immutable network weights once.  The positive/negative decompositions
+// are also computed once and reused by every forward-bound operation.
+void prepare_network_on_gpu(const FullyConnectedNetwork &net) {
+  ensure_pool();
+
+  // 한번만 실행되도록
+  if (g_pool.cached_network == &net) return;
+
+  // GPU 메모리 할당 및 주소 저장
+  for (int l = 0; l < net.num_layers; ++l) {
+    if (g_pool.d_weight[l] == nullptr) {
+      cudaMalloc(&g_pool.d_weight[l], sizeof(Matrix));
+      cudaMalloc(&g_pool.d_weight_pos[l], sizeof(Matrix));
+      cudaMalloc(&g_pool.d_weight_neg[l], sizeof(Matrix));
+    }
+
+    // Seed pos/neg buffers with metadata (rows/cols); their value arrays are
+    // overwritten by the kernels below.
+    // 가중치 GPU 메모리에 복사
+    cudaMemcpy(g_pool.d_weight[l], &net.W[l], sizeof(Matrix), cudaMemcpyHostToDevice);
+    cudaMemcpy(g_pool.d_weight_pos[l], &net.W[l], sizeof(Matrix), cudaMemcpyHostToDevice);
+    cudaMemcpy(g_pool.d_weight_neg[l], &net.W[l], sizeof(Matrix), cudaMemcpyHostToDevice);
+
+    //미리 가중치 양수/음수 부분만 남겨서 메모리 풀에 저장
+    //나중에 forward 같은 데에서 계속 이걸 계산할 필요가 사라짐
+    const int total_elements = net.W[l].rows * net.W[l].cols;
+    const int threadsPerBlock = 256;
+    const int blocksPerGrid = (total_elements + threadsPerBlock - 1) / threadsPerBlock;
+    positive_part_gpu<<<blocksPerGrid, threadsPerBlock>>>(
+        g_pool.d_weight[l], g_pool.d_weight_pos[l]);
+    negative_part_gpu<<<blocksPerGrid, threadsPerBlock>>>(
+        g_pool.d_weight[l], g_pool.d_weight_neg[l]);
+  }
+  cudaDeviceSynchronize();
+  g_pool.cached_network = &net;
 }
 
 // rowwise_scale (Matrix 2개 + Vector 1개 사용)
@@ -934,9 +1058,12 @@ Vector apply_activation(const Vector &s, const ActivationType act){
 Vector network_forward(const FullyConnectedNetwork &net, const Vector &x) {
   require(x.n == network_input_dim(net),
           "network_forward input dimension mismatch.");
+  prepare_network_on_gpu(net);
   Vector f = x;
   for (int l = 0; l < net.num_layers; ++l) {
-    Vector s = vec_add(matvec(net.W[l], f), net.b[l]);
+    Vector s = vec_add(matvec_device_matrix(g_pool.d_weight[l],
+                                             net.W[l].rows, net.W[l].cols, f),
+                       net.b[l]);
     f = apply_activation(s, net.act[l]);
   }
   return f;
@@ -950,6 +1077,7 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
                                        const Vector &x0, double eps) {
   require(x0.n == network_input_dim(net),
           "lirpa_forward_bound input dimension mismatch.");
+  prepare_network_on_gpu(net);
 
   const int in_dim = network_input_dim(net);
   AffineBound current;
@@ -962,20 +1090,26 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
   out.num_layer_bounds = net.num_layers;
 
   for (int l = 0; l < net.num_layers; ++l) {
-    const Matrix W_pos = positive_part(net.W[l]);
-    const Matrix W_neg = negative_part(net.W[l]);
+    const Matrix *d_W_pos = g_pool.d_weight_pos[l];
+    const Matrix *d_W_neg = g_pool.d_weight_neg[l];
+    const int weight_rows = net.W[l].rows;
+    const int weight_cols = net.W[l].cols;
 
     AffineBound pre;
     pre.lower_A =
-        mat_add(matmul(W_pos, current.lower_A), matmul(W_neg, current.upper_A));
+        mat_add(matmul_device_lhs(d_W_pos, weight_rows, weight_cols, current.lower_A),
+                matmul_device_lhs(d_W_neg, weight_rows, weight_cols, current.upper_A));
     pre.lower_c = vec_add(
-        vec_add(matvec(W_pos, current.lower_c), matvec(W_neg, current.upper_c)),
+        vec_add(matvec_device_matrix(d_W_pos, weight_rows, weight_cols, current.lower_c),
+                matvec_device_matrix(d_W_neg, weight_rows, weight_cols, current.upper_c)),
         net.b[l]);
 
     pre.upper_A =
-        mat_add(matmul(W_pos, current.upper_A), matmul(W_neg, current.lower_A));
+        mat_add(matmul_device_lhs(d_W_pos, weight_rows, weight_cols, current.upper_A),
+                matmul_device_lhs(d_W_neg, weight_rows, weight_cols, current.lower_A));
     pre.upper_c = vec_add(
-        vec_add(matvec(W_pos, current.upper_c), matvec(W_neg, current.lower_c)),
+        vec_add(matvec_device_matrix(d_W_pos, weight_rows, weight_cols, current.upper_c),
+                matvec_device_matrix(d_W_neg, weight_rows, weight_cols, current.lower_c)),
         net.b[l]);
 
     const Vector pre_lower = affine_min(pre.lower_A, pre.lower_c, x0, eps);

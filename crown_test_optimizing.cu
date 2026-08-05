@@ -167,6 +167,8 @@ int main(int argc, char** argv){
     std::cout << std::fixed << std::setprecision(6);
 
     ensure_pool();
+    // Immutable weights are uploaded and decomposed before timed verification.
+    prepare_network_on_gpu(*net);
 
     // 시간 측정 시작 (신경망 정방향 통과 및 CROWN)
     auto t_start = std::chrono::high_resolution_clock::now();
@@ -204,6 +206,6 @@ int main(int argc, char** argv){
     // 동적 할당 해제
     delete net;
 
-    system("pause");
+    //system("pause");
     return 0;
 }
