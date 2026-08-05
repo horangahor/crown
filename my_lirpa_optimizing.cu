@@ -103,10 +103,15 @@ struct FullyConnectedNetwork {
 
 constexpr int NUM_POOL_MAT = 3;
 constexpr int NUM_POOL_VEC = 6;
+constexpr int NUM_FWD_MAT = 6;
+constexpr int NUM_FWD_VEC = 14;
 
 struct GpuPool {
   Matrix* d_mat[NUM_POOL_MAT];
   Vector* d_vec[NUM_POOL_VEC];
+  // Dedicated workspace for a complete GPU-resident forward-bound pass.
+  Matrix* d_fwd_mat[NUM_FWD_MAT]{};
+  Vector* d_fwd_vec[NUM_FWD_VEC]{};
   // Immutable network tensors.  They remain on the device across a CROWN call.
   // 불변 가중치 메모리 풀에 올려놓기
   Matrix* d_weight[MAX_LAYERS]{};
@@ -122,6 +127,10 @@ struct GpuPool {
       cudaMalloc(&d_mat[i], sizeof(Matrix));
     for (int i = 0; i < NUM_POOL_VEC; i++)
       cudaMalloc(&d_vec[i], sizeof(Vector));
+    for (int i = 0; i < NUM_FWD_MAT; ++i)
+      cudaMalloc(&d_fwd_mat[i], sizeof(Matrix));
+    for (int i = 0; i < NUM_FWD_VEC; ++i)
+      cudaMalloc(&d_fwd_vec[i], sizeof(Vector));
     initialized = true;
   }
 
@@ -131,6 +140,10 @@ struct GpuPool {
       cudaFree(d_mat[i]);
     for (int i = 0; i < NUM_POOL_VEC; i++)
       cudaFree(d_vec[i]);
+    for (int i = 0; i < NUM_FWD_MAT; ++i)
+      cudaFree(d_fwd_mat[i]);
+    for (int i = 0; i < NUM_FWD_VEC; ++i)
+      cudaFree(d_fwd_vec[i]);
     // 메모리 해제
     for (int i = 0; i < MAX_LAYERS; ++i) {
       cudaFree(d_weight[i]);
@@ -803,6 +816,47 @@ __global__ void relu_relax_gpu(const Vector *lower, const Vector *upper,
   }
 }
 
+// GPU-resident forward-bound helpers.  Kernels write only value arrays, so
+// keep the small shape metadata valid on every reusable workspace buffer.
+inline void set_matrix_shape(Matrix *d_matrix, int rows, int cols) {
+  const int shape[2] = {rows, cols};
+  cudaMemcpy(d_matrix, shape, sizeof(shape), cudaMemcpyHostToDevice);
+}
+
+inline void set_vector_size(Vector *d_vector, int n) {
+  cudaMemcpy(d_vector, &n, sizeof(n), cudaMemcpyHostToDevice);
+}
+
+__global__ void relu_relax_full_gpu(const Vector *lower, const Vector *upper,
+                                    Vector *alpha_l, Vector *beta_l,
+                                    Vector *alpha_u, Vector *beta_u) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= lower->n) return;
+  const double l = lower->v[tid];
+  const double u = upper->v[tid];
+  if (l >= 0.0) {
+    alpha_l->v[tid] = 1.0; beta_l->v[tid] = 0.0;
+    alpha_u->v[tid] = 1.0; beta_u->v[tid] = 0.0;
+  } else if (u <= 0.0) {
+    alpha_l->v[tid] = 0.0; beta_l->v[tid] = 0.0;
+    alpha_u->v[tid] = 0.0; beta_u->v[tid] = 0.0;
+  } else {
+    const double slope = u / (u - l);
+    alpha_u->v[tid] = slope; beta_u->v[tid] = -u * l / (u - l);
+    alpha_l->v[tid] = fabs(l) < fabs(u) ? 1.0 : 0.0;
+    beta_l->v[tid] = 0.0;
+  }
+}
+
+__global__ void linear_relax_full_gpu(Vector *alpha_l, Vector *beta_l,
+                                      Vector *alpha_u, Vector *beta_u, int n) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < n) {
+    alpha_l->v[tid] = 1.0; beta_l->v[tid] = 0.0;
+    alpha_u->v[tid] = 1.0; beta_u->v[tid] = 0.0;
+  }
+}
+
 void relu_relax(const Vector &lower, const Vector &upper, Vector &alpha_l,
                 Vector &beta_l, Vector &alpha_u, Vector &beta_u) {
   require(lower.n == upper.n, "relu_relax shape mismatch.");
@@ -1078,77 +1132,132 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
   require(x0.n == network_input_dim(net),
           "lirpa_forward_bound input dimension mismatch.");
   prepare_network_on_gpu(net);
-
-  const int in_dim = network_input_dim(net);
-  AffineBound current;
-  current.lower_A = make_eye(in_dim);
-  current.upper_A = make_eye(in_dim);
-  current.lower_c = make_zero_vector(in_dim);
-  current.upper_c = make_zero_vector(in_dim);
-
   ForwardBoundResult out;
   out.num_layer_bounds = net.num_layers;
+  Matrix *const lower_A = g_pool.d_fwd_mat[0];
+  Matrix *const upper_A = g_pool.d_fwd_mat[1];
+  Matrix *const pre_lower_A = g_pool.d_fwd_mat[2];
+  Matrix *const pre_upper_A = g_pool.d_fwd_mat[3];
+  Matrix *const tmp_A = g_pool.d_fwd_mat[4];
+  Matrix *const tmp_B = g_pool.d_fwd_mat[5];
+  Vector *const lower_c = g_pool.d_fwd_vec[0];
+  Vector *const upper_c = g_pool.d_fwd_vec[1];
+  Vector *const pre_lower_c = g_pool.d_fwd_vec[2];
+  Vector *const pre_upper_c = g_pool.d_fwd_vec[3];
+  Vector *const pre_lower = g_pool.d_fwd_vec[4];
+  Vector *const pre_upper = g_pool.d_fwd_vec[5];
+  Vector *const alpha_l = g_pool.d_fwd_vec[6];
+  Vector *const beta_l = g_pool.d_fwd_vec[7];
+  Vector *const alpha_u = g_pool.d_fwd_vec[8];
+  Vector *const beta_u = g_pool.d_fwd_vec[9];
+  Vector *const tmp_v0 = g_pool.d_fwd_vec[10];
+  Vector *const tmp_v1 = g_pool.d_fwd_vec[11];
+  Vector *const d_xl = g_pool.d_fwd_vec[12];
+  Vector *const d_xu = g_pool.d_fwd_vec[13];
+  const int in_dim = network_input_dim(net);
+  cudaMemset(lower_A, 0, sizeof(Matrix));
+  cudaMemset(upper_A, 0, sizeof(Matrix));
+  set_matrix_shape(lower_A, in_dim, in_dim);
+  set_matrix_shape(upper_A, in_dim, in_dim);
+  make_eye_gpu<<<(in_dim + 255) / 256, 256>>>(lower_A, in_dim);
+  make_eye_gpu<<<(in_dim + 255) / 256, 256>>>(upper_A, in_dim);
+  cudaMemset(lower_c, 0, sizeof(Vector)); set_vector_size(lower_c, in_dim);
+  cudaMemset(upper_c, 0, sizeof(Vector)); set_vector_size(upper_c, in_dim);
+  Vector xl = x0, xu = x0;
+  for (int i = 0; i < in_dim; ++i) { xl.v[i] -= eps; xu.v[i] += eps; }
+  cudaMemcpy(d_xl, &xl, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_xu, &xu, sizeof(Vector), cudaMemcpyHostToDevice);
 
   for (int l = 0; l < net.num_layers; ++l) {
     const Matrix *d_W_pos = g_pool.d_weight_pos[l];
     const Matrix *d_W_neg = g_pool.d_weight_neg[l];
     const int weight_rows = net.W[l].rows;
-    const int weight_cols = net.W[l].cols;
+    const int matrix_elements = weight_rows * in_dim;
+    const int matrix_blocks = (matrix_elements + 255) / 256;
+    matmul_gpu<<<matrix_blocks, 256>>>(d_W_pos, lower_A, tmp_A);
+    matmul_gpu<<<matrix_blocks, 256>>>(d_W_neg, upper_A, tmp_B);
+    set_matrix_shape(tmp_A, weight_rows, in_dim);
+    set_matrix_shape(tmp_B, weight_rows, in_dim);
+    mat_add_gpu<<<matrix_blocks, 256>>>(tmp_A, tmp_B, pre_lower_A);
+    set_matrix_shape(pre_lower_A, weight_rows, in_dim);
+    matmul_gpu<<<matrix_blocks, 256>>>(d_W_pos, upper_A, tmp_A);
+    matmul_gpu<<<matrix_blocks, 256>>>(d_W_neg, lower_A, tmp_B);
+    set_matrix_shape(tmp_A, weight_rows, in_dim);
+    set_matrix_shape(tmp_B, weight_rows, in_dim);
+    mat_add_gpu<<<matrix_blocks, 256>>>(tmp_A, tmp_B, pre_upper_A);
+    set_matrix_shape(pre_upper_A, weight_rows, in_dim);
 
-    AffineBound pre;
-    pre.lower_A =
-        mat_add(matmul_device_lhs(d_W_pos, weight_rows, weight_cols, current.lower_A),
-                matmul_device_lhs(d_W_neg, weight_rows, weight_cols, current.upper_A));
-    pre.lower_c = vec_add(
-        vec_add(matvec_device_matrix(d_W_pos, weight_rows, weight_cols, current.lower_c),
-                matvec_device_matrix(d_W_neg, weight_rows, weight_cols, current.upper_c)),
-        net.b[l]);
+    const int vector_blocks = (weight_rows + 255) / 256;
+    matvec_gpu<<<vector_blocks, 256>>>(d_W_pos, lower_c, tmp_v0);
+    matvec_gpu<<<vector_blocks, 256>>>(d_W_neg, upper_c, tmp_v1);
+    set_vector_size(tmp_v0, weight_rows); set_vector_size(tmp_v1, weight_rows);
+    vec_add_gpu<<<vector_blocks, 256>>>(tmp_v0, tmp_v1, pre_lower_c);
+    // pre_lower_c is reused as the next kernel's input, so its header must
+    // be valid before that kernel reads pre_lower_c->n.
+    set_vector_size(pre_lower_c, weight_rows);
+    cudaMemcpy(tmp_v1, &net.b[l], sizeof(Vector), cudaMemcpyHostToDevice);
+    vec_add_gpu<<<vector_blocks, 256>>>(pre_lower_c, tmp_v1, pre_lower_c);
+    set_vector_size(pre_lower_c, weight_rows);
+    matvec_gpu<<<vector_blocks, 256>>>(d_W_pos, upper_c, tmp_v0);
+    matvec_gpu<<<vector_blocks, 256>>>(d_W_neg, lower_c, tmp_v1);
+    set_vector_size(tmp_v0, weight_rows); set_vector_size(tmp_v1, weight_rows);
+    vec_add_gpu<<<vector_blocks, 256>>>(tmp_v0, tmp_v1, pre_upper_c);
+    // Same requirement for the in-place bias addition below.
+    set_vector_size(pre_upper_c, weight_rows);
+    cudaMemcpy(tmp_v1, &net.b[l], sizeof(Vector), cudaMemcpyHostToDevice);
+    vec_add_gpu<<<vector_blocks, 256>>>(pre_upper_c, tmp_v1, pre_upper_c);
+    set_vector_size(pre_upper_c, weight_rows);
 
-    pre.upper_A =
-        mat_add(matmul_device_lhs(d_W_pos, weight_rows, weight_cols, current.upper_A),
-                matmul_device_lhs(d_W_neg, weight_rows, weight_cols, current.lower_A));
-    pre.upper_c = vec_add(
-        vec_add(matvec_device_matrix(d_W_pos, weight_rows, weight_cols, current.upper_c),
-                matvec_device_matrix(d_W_neg, weight_rows, weight_cols, current.lower_c)),
-        net.b[l]);
-
-    const Vector pre_lower = affine_min(pre.lower_A, pre.lower_c, x0, eps);
-    const Vector pre_upper = affine_max(pre.upper_A, pre.upper_c, x0, eps);
-
-    Vector alpha_l, beta_l, alpha_u, beta_u;
-    if (net.act[l] == ActivationType::Linear) {
-      alpha_l = make_zero_vector(pre_lower.n);
-      alpha_u = make_zero_vector(pre_lower.n);
-      beta_l = make_zero_vector(pre_lower.n);
-      beta_u = make_zero_vector(pre_lower.n);
-      for (int i = 0; i < pre_lower.n; ++i) {
-        alpha_l.v[i] = 1.0;
-        alpha_u.v[i] = 1.0;
-      }
-    } else if (net.act[l] == ActivationType::Relu) {
-      relu_relax(pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u);
+    affine_min_gpu<<<vector_blocks, 256>>>(pre_lower_A, pre_lower_c, d_xl, d_xu, pre_lower);
+    affine_max_gpu<<<vector_blocks, 256>>>(pre_upper_A, pre_upper_c, d_xl, d_xu, pre_upper);
+    set_vector_size(pre_lower, weight_rows); set_vector_size(pre_upper, weight_rows);
+    set_vector_size(alpha_l, weight_rows); set_vector_size(beta_l, weight_rows);
+    set_vector_size(alpha_u, weight_rows); set_vector_size(beta_u, weight_rows);
+    if (net.act[l] == ActivationType::Relu) {
+      relu_relax_full_gpu<<<vector_blocks, 256>>>(pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u);
+    } else if (net.act[l] == ActivationType::Linear) {
+      linear_relax_full_gpu<<<vector_blocks, 256>>>(alpha_l, beta_l, alpha_u, beta_u, weight_rows);
     } else {
-      sigmoid_relax(pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u);
+      Vector h_lower, h_upper, h_alpha_l, h_beta_l, h_alpha_u, h_beta_u;
+      cudaMemcpy(&h_lower, pre_lower, sizeof(Vector), cudaMemcpyDeviceToHost);
+      cudaMemcpy(&h_upper, pre_upper, sizeof(Vector), cudaMemcpyDeviceToHost);
+      h_lower.n = h_upper.n = weight_rows;
+      sigmoid_relax(h_lower, h_upper, h_alpha_l, h_beta_l, h_alpha_u, h_beta_u);
+      cudaMemcpy(alpha_l, &h_alpha_l, sizeof(Vector), cudaMemcpyHostToDevice);
+      cudaMemcpy(beta_l, &h_beta_l, sizeof(Vector), cudaMemcpyHostToDevice);
+      cudaMemcpy(alpha_u, &h_alpha_u, sizeof(Vector), cudaMemcpyHostToDevice);
+      cudaMemcpy(beta_u, &h_beta_u, sizeof(Vector), cudaMemcpyHostToDevice);
     }
+    rowwise_scale_gpu<<<matrix_blocks, 256>>>(pre_lower_A, alpha_l, lower_A);
+    rowwise_scale_gpu<<<matrix_blocks, 256>>>(pre_upper_A, alpha_u, upper_A);
+    set_matrix_shape(lower_A, weight_rows, in_dim); set_matrix_shape(upper_A, weight_rows, in_dim);
+    elemwise_mul_gpu<<<vector_blocks, 256>>>(alpha_l, pre_lower_c, lower_c);
+    // lower_c/upper_c become inputs to the in-place bias-add kernels.
+    set_vector_size(lower_c, weight_rows);
+    vec_add_gpu<<<vector_blocks, 256>>>(lower_c, beta_l, lower_c);
+    elemwise_mul_gpu<<<vector_blocks, 256>>>(alpha_u, pre_upper_c, upper_c);
+    set_vector_size(upper_c, weight_rows);
+    vec_add_gpu<<<vector_blocks, 256>>>(upper_c, beta_u, upper_c);
+    set_vector_size(lower_c, weight_rows); set_vector_size(upper_c, weight_rows);
 
-    AffineBound post;
-    post.lower_A = rowwise_scale(pre.lower_A, alpha_l);
-    post.lower_c = vec_add(elemwise_mul(alpha_l, pre.lower_c), beta_l);
-    post.upper_A = rowwise_scale(pre.upper_A, alpha_u);
-    post.upper_c = vec_add(elemwise_mul(alpha_u, pre.upper_c), beta_u);
-
-    current = post;
-
-    out.layer_bounds[l].dim = alpha_l.n;
-    out.layer_bounds[l].alpha_lower = alpha_l;
-    out.layer_bounds[l].beta_lower = beta_l;
-    out.layer_bounds[l].alpha_upper = alpha_u;
-    out.layer_bounds[l].beta_upper = beta_u;
+    out.layer_bounds[l].dim = weight_rows;
+    cudaMemcpy(&out.layer_bounds[l].alpha_lower, alpha_l, sizeof(Vector), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&out.layer_bounds[l].beta_lower, beta_l, sizeof(Vector), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&out.layer_bounds[l].alpha_upper, alpha_u, sizeof(Vector), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&out.layer_bounds[l].beta_upper, beta_u, sizeof(Vector), cudaMemcpyDeviceToHost);
+    out.layer_bounds[l].alpha_lower.n = out.layer_bounds[l].beta_lower.n = weight_rows;
+    out.layer_bounds[l].alpha_upper.n = out.layer_bounds[l].beta_upper.n = weight_rows;
   }
-
-  out.final_affine = current;
-  out.final_lower = affine_min(current.lower_A, current.lower_c, x0, eps);
-  out.final_upper = affine_max(current.upper_A, current.upper_c, x0, eps);
+  cudaMemcpy(&out.final_affine.lower_A, lower_A, sizeof(Matrix), cudaMemcpyDeviceToHost);
+  cudaMemcpy(&out.final_affine.upper_A, upper_A, sizeof(Matrix), cudaMemcpyDeviceToHost);
+  cudaMemcpy(&out.final_affine.lower_c, lower_c, sizeof(Vector), cudaMemcpyDeviceToHost);
+  cudaMemcpy(&out.final_affine.upper_c, upper_c, sizeof(Vector), cudaMemcpyDeviceToHost);
+  const int out_dim = network_output_dim(net);
+  out.final_affine.lower_A.rows = out.final_affine.upper_A.rows = out_dim;
+  out.final_affine.lower_A.cols = out.final_affine.upper_A.cols = in_dim;
+  out.final_affine.lower_c.n = out.final_affine.upper_c.n = out_dim;
+  out.final_lower = affine_min(out.final_affine.lower_A, out.final_affine.lower_c, x0, eps);
+  out.final_upper = affine_max(out.final_affine.upper_A, out.final_affine.upper_c, x0, eps);
   return out;
 }
 
