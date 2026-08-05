@@ -260,7 +260,8 @@ Matrix mat_add(const Matrix &A, const Matrix &B) {
 
   cudaMemcpy(g_pool.d_mat[0], &A, sizeof(Matrix), cudaMemcpyHostToDevice);
   cudaMemcpy(g_pool.d_mat[1], &B, sizeof(Matrix), cudaMemcpyHostToDevice);
-  cudaMemcpy(g_pool.d_mat[2], &C, sizeof(Matrix), cudaMemcpyHostToDevice);
+  // Output is fully overwritten by mat_add_gpu; no H2D initialization needed.
+  // cudaMemcpy(g_pool.d_mat[2], &C, sizeof(Matrix), cudaMemcpyHostToDevice);
 
   int total_elements = A.rows * A.cols;
   int threadsPerBlock = 256;
@@ -270,6 +271,8 @@ Matrix mat_add(const Matrix &A, const Matrix &B) {
   cudaDeviceSynchronize();
 
   cudaMemcpy(&C, g_pool.d_mat[2], sizeof(Matrix), cudaMemcpyDeviceToHost);
+  C.rows = A.rows;
+  C.cols = A.cols;
   return C;
 }
 
@@ -288,7 +291,8 @@ Vector vec_add(const Vector &a, const Vector &b) {
 
   cudaMemcpy(g_pool.d_vec[0], &a, sizeof(Vector), cudaMemcpyHostToDevice);
   cudaMemcpy(g_pool.d_vec[1], &b, sizeof(Vector), cudaMemcpyHostToDevice);
-  cudaMemcpy(g_pool.d_vec[2], &c, sizeof(Vector), cudaMemcpyHostToDevice);
+  // 굳이 c를 GPU에서 복사하지 말고 (어짜피 의미가 없는 0벡터니까)
+  // cudaMemcpy(g_pool.d_vec[2], &c, sizeof(Vector), cudaMemcpyHostToDevice);
 
   int threadsPerBlock = 256;
   int blocksPerGrid = (a.n + threadsPerBlock - 1) / threadsPerBlock;
@@ -297,6 +301,7 @@ Vector vec_add(const Vector &a, const Vector &b) {
   cudaDeviceSynchronize();
 
   cudaMemcpy(&c, g_pool.d_vec[2], sizeof(Vector), cudaMemcpyDeviceToHost);
+  c.n = a.n;
   return c;
 }
 
@@ -315,7 +320,7 @@ Vector vec_sub(const Vector &a, const Vector &b) {
 
   cudaMemcpy(g_pool.d_vec[0], &a, sizeof(Vector), cudaMemcpyHostToDevice);
   cudaMemcpy(g_pool.d_vec[1], &b, sizeof(Vector), cudaMemcpyHostToDevice);
-  cudaMemcpy(g_pool.d_vec[2], &c, sizeof(Vector), cudaMemcpyHostToDevice);
+  // cudaMemcpy(g_pool.d_vec[2], &c, sizeof(Vector), cudaMemcpyHostToDevice);
 
   int threadsPerBlock = 256;
   int blocksPerGrid = (a.n + threadsPerBlock - 1) / threadsPerBlock;
@@ -324,6 +329,7 @@ Vector vec_sub(const Vector &a, const Vector &b) {
   cudaDeviceSynchronize();
 
   cudaMemcpy(&c, g_pool.d_vec[2], sizeof(Vector), cudaMemcpyDeviceToHost);
+  c.n = a.n; // 벡터 열의 개수 업데이트 (shape)
   return c;
 }
 
@@ -352,7 +358,7 @@ Matrix matmul(const Matrix &A, const Matrix &B) {
 
   cudaMemcpy(g_pool.d_mat[0], &A, sizeof(Matrix), cudaMemcpyHostToDevice);
   cudaMemcpy(g_pool.d_mat[1], &B, sizeof(Matrix), cudaMemcpyHostToDevice);
-  cudaMemcpy(g_pool.d_mat[2], &C, sizeof(Matrix), cudaMemcpyHostToDevice);
+  // cudaMemcpy(g_pool.d_mat[2], &C, sizeof(Matrix), cudaMemcpyHostToDevice);
 
   int total_elements = A.rows * B.cols;
   int threadsPerBlock = 256;
@@ -362,6 +368,8 @@ Matrix matmul(const Matrix &A, const Matrix &B) {
   cudaDeviceSynchronize();
 
   cudaMemcpy(&C, g_pool.d_mat[2], sizeof(Matrix), cudaMemcpyDeviceToHost);
+  C.rows = A.rows;
+  C.cols = B.cols;
   return C;
 }
 
@@ -384,7 +392,7 @@ Vector matvec(const Matrix &A, const Vector &x) {
 
   cudaMemcpy(g_pool.d_mat[0], &A, sizeof(Matrix), cudaMemcpyHostToDevice);
   cudaMemcpy(g_pool.d_vec[0], &x, sizeof(Vector), cudaMemcpyHostToDevice);
-  cudaMemcpy(g_pool.d_vec[1], &y, sizeof(Vector), cudaMemcpyHostToDevice);
+  // cudaMemcpy(g_pool.d_vec[1], &y, sizeof(Vector), cudaMemcpyHostToDevice);
 
   int threadsPerBlock = 256;
   int blocksPerGrid = (A.rows + threadsPerBlock - 1) / threadsPerBlock;
@@ -393,6 +401,7 @@ Vector matvec(const Matrix &A, const Vector &x) {
   cudaDeviceSynchronize();
 
   cudaMemcpy(&y, g_pool.d_vec[1], sizeof(Vector), cudaMemcpyDeviceToHost);
+  y.n = A.rows;
   return y;
 }
 
@@ -412,7 +421,7 @@ Matrix positive_part(const Matrix &A) {
   Matrix out = make_zero_matrix(A.rows, A.cols);
 
   cudaMemcpy(g_pool.d_mat[0], &A, sizeof(Matrix), cudaMemcpyHostToDevice);
-  cudaMemcpy(g_pool.d_mat[1], &out, sizeof(Matrix), cudaMemcpyHostToDevice);
+  // cudaMemcpy(g_pool.d_mat[1], &out, sizeof(Matrix), cudaMemcpyHostToDevice);
 
   int total_elements = A.rows * A.cols;
   int threadsPerBlock = 256;
@@ -422,6 +431,8 @@ Matrix positive_part(const Matrix &A) {
   cudaDeviceSynchronize();
 
   cudaMemcpy(&out, g_pool.d_mat[1], sizeof(Matrix), cudaMemcpyDeviceToHost);
+  out.rows = A.rows;
+  out.cols = A.cols;
   return out;
 }
 
@@ -441,7 +452,7 @@ Matrix negative_part(const Matrix &A) {
   Matrix out = make_zero_matrix(A.rows, A.cols);
 
   cudaMemcpy(g_pool.d_mat[0], &A, sizeof(Matrix), cudaMemcpyHostToDevice);
-  cudaMemcpy(g_pool.d_mat[1], &out, sizeof(Matrix), cudaMemcpyHostToDevice);
+  // cudaMemcpy(g_pool.d_mat[1], &out, sizeof(Matrix), cudaMemcpyHostToDevice);
 
   int total_elements = A.rows * A.cols;
   int threadsPerBlock = 256;
@@ -451,6 +462,8 @@ Matrix negative_part(const Matrix &A) {
   cudaDeviceSynchronize();
 
   cudaMemcpy(&out, g_pool.d_mat[1], sizeof(Matrix), cudaMemcpyDeviceToHost);
+  out.rows = A.rows;
+  out.cols = A.cols;
   return out;
 }
 
@@ -472,7 +485,7 @@ Matrix rowwise_scale(const Matrix &A, const Vector &s) {
 
   cudaMemcpy(g_pool.d_mat[0], &A, sizeof(Matrix), cudaMemcpyHostToDevice);
   cudaMemcpy(g_pool.d_vec[0], &s, sizeof(Vector), cudaMemcpyHostToDevice);
-  cudaMemcpy(g_pool.d_mat[1], &out, sizeof(Matrix), cudaMemcpyHostToDevice);
+  // cudaMemcpy(g_pool.d_mat[1], &out, sizeof(Matrix), cudaMemcpyHostToDevice);
 
   int total_elements = A.rows * A.cols;
   int threadsPerBlock = 256;
@@ -482,6 +495,8 @@ Matrix rowwise_scale(const Matrix &A, const Vector &s) {
   cudaDeviceSynchronize();
 
   cudaMemcpy(&out, g_pool.d_mat[1], sizeof(Matrix), cudaMemcpyDeviceToHost);
+  out.rows = A.rows;
+  out.cols = A.cols;
   return out;
 }
 
@@ -500,7 +515,7 @@ Vector elemwise_mul(const Vector &a, const Vector &b) {
 
   cudaMemcpy(g_pool.d_vec[0], &a, sizeof(Vector), cudaMemcpyHostToDevice);
   cudaMemcpy(g_pool.d_vec[1], &b, sizeof(Vector), cudaMemcpyHostToDevice);
-  cudaMemcpy(g_pool.d_vec[2], &c, sizeof(Vector), cudaMemcpyHostToDevice);
+  // cudaMemcpy(g_pool.d_vec[2], &c, sizeof(Vector), cudaMemcpyHostToDevice);
 
   int threadsPerBlock = 256;
   int blocksPerGrid = (a.n + threadsPerBlock - 1) / threadsPerBlock;
@@ -509,6 +524,7 @@ Vector elemwise_mul(const Vector &a, const Vector &b) {
   cudaDeviceSynchronize();
 
   cudaMemcpy(&c, g_pool.d_vec[2], sizeof(Vector), cudaMemcpyDeviceToHost);
+  c.n = a.n;
   return c;
 }
 
@@ -533,7 +549,7 @@ Vector make_eps_vec(int n, double eps) {
   ensure_pool();
   Vector out = make_zero_vector(n);
 
-  cudaMemcpy(g_pool.d_vec[0], &out, sizeof(Vector), cudaMemcpyHostToDevice);
+  // cudaMemcpy(g_pool.d_vec[0], &out, sizeof(Vector), cudaMemcpyHostToDevice);
 
   int threadsPerBlock = 256;
   int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
@@ -543,6 +559,7 @@ Vector make_eps_vec(int n, double eps) {
   cudaDeviceSynchronize();
 
   cudaMemcpy(&out, g_pool.d_vec[0], sizeof(Vector), cudaMemcpyDeviceToHost);
+  out.n = n;
   return out;
 }
 
@@ -576,7 +593,7 @@ Vector affine_min(const Matrix &A, const Vector &c, const Vector &x0,
   cudaMemcpy(g_pool.d_vec[0], &c, sizeof(Vector), cudaMemcpyHostToDevice);
   cudaMemcpy(g_pool.d_vec[1], &xl, sizeof(Vector), cudaMemcpyHostToDevice);
   cudaMemcpy(g_pool.d_vec[2], &xu, sizeof(Vector), cudaMemcpyHostToDevice);
-  cudaMemcpy(g_pool.d_vec[3], &out, sizeof(Vector), cudaMemcpyHostToDevice);
+  // cudaMemcpy(g_pool.d_vec[3], &out, sizeof(Vector), cudaMemcpyHostToDevice);
 
   int threadsPerBlock = 256;
   int blocksPerGrid = (A.rows + threadsPerBlock - 1) / threadsPerBlock;
@@ -587,6 +604,7 @@ Vector affine_min(const Matrix &A, const Vector &c, const Vector &x0,
   cudaDeviceSynchronize();
 
   cudaMemcpy(&out, g_pool.d_vec[3], sizeof(Vector), cudaMemcpyDeviceToHost);
+  out.n = A.rows;
   return out;
 }
 
@@ -619,7 +637,7 @@ Vector affine_max(const Matrix &A, const Vector &c, const Vector &x0,
   cudaMemcpy(g_pool.d_vec[0], &c, sizeof(Vector), cudaMemcpyHostToDevice);
   cudaMemcpy(g_pool.d_vec[1], &xl, sizeof(Vector), cudaMemcpyHostToDevice);
   cudaMemcpy(g_pool.d_vec[2], &xu, sizeof(Vector), cudaMemcpyHostToDevice);
-  cudaMemcpy(g_pool.d_vec[3], &out, sizeof(Vector), cudaMemcpyHostToDevice);
+  // cudaMemcpy(g_pool.d_vec[3], &out, sizeof(Vector), cudaMemcpyHostToDevice);
 
   int threadsPerBlock = 256;
   int blocksPerGrid = (A.rows + threadsPerBlock - 1) / threadsPerBlock;
@@ -630,6 +648,7 @@ Vector affine_max(const Matrix &A, const Vector &c, const Vector &x0,
   cudaDeviceSynchronize();
 
   cudaMemcpy(&out, g_pool.d_vec[3], sizeof(Vector), cudaMemcpyDeviceToHost);
+  out.n = A.rows;
   return out;
 }
 
