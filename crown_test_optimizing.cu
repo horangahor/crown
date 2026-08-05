@@ -2,7 +2,7 @@
 #include<cuda_runtime.h>
 #include<vector>
 #include<chrono>
-#include "my_lirpa_mempool_warmup.cu"
+#include "my_lirpa_optimizing.cu"
 #include<fstream>
 
 const char* MODEL_PATH = "C:/Users/user/Desktop/cuda/jnunnv_v1_0/jnunnv/models/Custom/Baseline mMIMO FC H hard short 80 HTHNN_LAY2_491 RELU 20241018 PRUNED 0.93_NO_SIGMOID_custom.bin";
