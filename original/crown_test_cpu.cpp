@@ -787,21 +787,14 @@ int main(int argc, char** argv){
     // 시간 측정 시작
     auto t_start = std::chrono::high_resolution_clock::now();
 
-    Vector y;
-    BackwardBoundResult bwd;
-    const int NUM_ITERS = 500;
-    
-    for (int iter = 0; iter < NUM_ITERS; ++iter) {
-        y = network_forward(*net, x0);
-        bwd = lirpa_backward_bound(*net, x0, eps);
-    }
+    Vector y = network_forward(*net, x0);
+    BackwardBoundResult bwd = lirpa_backward_bound(*net, x0, eps);
 
     auto t_end = std::chrono::high_resolution_clock::now();
     double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
-    std::cout << "calc success " << NUM_ITERS << "iterations" << std::endl;
-    std::cout << "Total Elapsed time: " << elapsed_ms << " ms" << std::endl;
-    std::cout << "Average time per iter: " << elapsed_ms / NUM_ITERS << " ms" << std::endl;
+    std::cout << "calc success" << std::endl;
+    std::cout << "Elapsed time: " << elapsed_ms << " ms" << std::endl;
 
     int out_dim = bwd.final_lower.n;
     std::cout << "Output Dimension: " << out_dim << "\n\n";
