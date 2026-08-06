@@ -1,6 +1,7 @@
 #include<iostream>
 #include<cuda_runtime.h>
 #include<vector>
+#include<algorithm>
 #include<chrono>
 #include "my_lirpa_optimizing.cu"
 #include<fstream>
@@ -202,6 +203,57 @@ int main(int argc, char** argv){
                   << std::setw(9) << y.v[i] << "\n";
     }
     std::cout << "========================================\n";
+
+    struct NodeResult {
+        int index;
+        double lower;
+        double upper;
+        double pred;
+        double range;
+    };
+
+    std::vector<NodeResult> results;
+    for (int i = 0; i < out_dim; ++i) {
+        results.push_back({i, bwd.final_lower.v[i], bwd.final_upper.v[i], y.v[i], bwd.final_upper.v[i] - bwd.final_lower.v[i]});
+    }
+
+    int print_count = std::min(8, out_dim);
+
+    // 신경망 출력값(Normal Pred) 정렬
+    std::sort(results.begin(), results.end(), [](const NodeResult& a, const NodeResult& b) {
+        return a.pred > b.pred;
+    });
+
+    std::cout << "\n[Top 8 Nodes - Sorted by Normal Pred]\n";
+    std::cout << "[Index] | Lower Bound | Upper Bound | Normal Pred (y) | Range (Upper - Lower)\n";
+    std::cout << "-----------------------------------------------------------------------\n";
+    for (int i = 0; i < print_count; ++i) {
+        const auto& r = results[i];
+        std::cout << "[" << std::setw(3) << r.index << "]   |  " 
+                  << std::setw(9) << r.lower << "  |  "
+                  << std::setw(9) << r.upper << "  |  "
+                  << std::setw(9) << r.pred << "      |  "
+                  << std::setw(9) << r.range << "\n";
+    }
+    std::cout << "=======================================================================\n";
+
+    // 신경망 정렬 (범위)
+    std::sort(results.begin(), results.end(), [](const NodeResult& a, const NodeResult& b) {
+        return a.range < b.range;
+    });
+
+    std::cout << "\n[Top 8 Nodes - Sorted by Range]\n";
+    std::cout << "[Index] | Lower Bound | Upper Bound | Normal Pred (y) | Range (Upper - Lower)\n";
+    std::cout << "-----------------------------------------------------------------------\n";
+    for (int i = 0; i < print_count; ++i) {
+        const auto& r = results[i];
+        std::cout << "[" << std::setw(3) << r.index << "]   |  " 
+                  << std::setw(9) << r.lower << "  |  "
+                  << std::setw(9) << r.upper << "  |  "
+                  << std::setw(9) << r.pred << "      |  "
+                  << std::setw(9) << r.range << "\n";
+    }
+    std::cout << "=======================================================================\n";
 
     // 동적 할당 해제
     delete net;
