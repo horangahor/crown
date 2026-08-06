@@ -204,6 +204,6 @@ int main(int argc, char** argv){
     // 동적 할당 해제
     delete net;
 
-    system("pause");
+    //system("pause");
     return 0;
 }

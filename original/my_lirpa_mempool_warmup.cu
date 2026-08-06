@@ -670,6 +670,8 @@ __global__ void relu_relax_gpu(const Vector *lower, const Vector *upper,
   }
 }
 
+// 2개의 벡터를 입력으로 사용 (lower, upper)
+// 4개의 벡터를 출력으로 사용 (alpha_l, beta_l, alpha_u, beta_u)
 void relu_relax(const Vector &lower, const Vector &upper, Vector &alpha_l,
                 Vector &beta_l, Vector &alpha_u, Vector &beta_u) {
   require(lower.n == upper.n, "relu_relax shape mismatch.");
@@ -942,38 +944,50 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
   require(x0.n == network_input_dim(net),
           "lirpa_forward_bound input dimension mismatch.");
 
-  const int in_dim = network_input_dim(net);
-  AffineBound current;
-  current.lower_A = make_eye(in_dim);
-  current.upper_A = make_eye(in_dim);
-  current.lower_c = make_zero_vector(in_dim);
-  current.upper_c = make_zero_vector(in_dim);
+  const int in_dim = network_input_dim(net); // 입력 차원(노드) 개수 
+  
+  // 1. [초기화 단계] 입력층의 수식을 항등 행렬(Identity)과 0 벡터로 시작합니다.
+  // 수식으로 치면 f(x) = 1*x + 0 과 같습니다.
+  AffineBound current;                       
+  current.lower_A = make_eye(in_dim);        // 하한선 계수 행렬 A (단위 행렬)
+  current.upper_A = make_eye(in_dim);        // 상한선 계수 행렬 A (단위 행렬)
+  current.lower_c = make_zero_vector(in_dim); // 하한선 편향 벡터 c (0 벡터)
+  current.upper_c = make_zero_vector(in_dim); // 상한선 편향 벡터 c (0 벡터)
 
   ForwardBoundResult out;
   out.num_layer_bounds = net.num_layers;
 
+  // 2. [레이어 순회] 입력층부터 출력층까지 순차적으로(Forward) 수식을 밀어냅니다.
   for (int l = 0; l < net.num_layers; ++l) {
+    // 가중치 행렬 W를 양수(W_pos)와 음수(W_neg) 파트로 분리합니다.
+    // 이유: 부등식에서 음수를 곱하면 부등호 방향(상한/하한)이 뒤집히기 때문입니다.
     const Matrix W_pos = positive_part(net.W[l]);
     const Matrix W_neg = negative_part(net.W[l]);
 
+    // [Pre-activation 계산] 활성화 함수(ReLU)를 거치기 전의 선형 수식(Wx+b)을 구합니다.
     AffineBound pre;
+    // 하한선의 계수: 양수 가중치에는 하한선을 곱하고, 음수 가중치에는 상한선을 곱해 더합니다 (최악의 하한선)
     pre.lower_A =
         mat_add(matmul(W_pos, current.lower_A), matmul(W_neg, current.upper_A));
     pre.lower_c = vec_add(
         vec_add(matvec(W_pos, current.lower_c), matvec(W_neg, current.upper_c)),
         net.b[l]);
 
+    // 상한선의 계수: 양수 가중치에는 상한선을 곱하고, 음수 가중치에는 하한선을 곱해 더합니다 (최상의 상한선)
     pre.upper_A =
         mat_add(matmul(W_pos, current.upper_A), matmul(W_neg, current.lower_A));
     pre.upper_c = vec_add(
         vec_add(matvec(W_pos, current.upper_c), matvec(W_neg, current.lower_c)),
         net.b[l]);
 
+    // 위에서 구한 선형 수식(계수 A와 편향 c)을 바탕으로, 
+    // 입력 공간(x0 ± eps) 내에서 가질 수 있는 실제 최솟값(pre_lower)과 최댓값(pre_upper)을 계산합니다.
     const Vector pre_lower = affine_min(pre.lower_A, pre.lower_c, x0, eps);
     const Vector pre_upper = affine_max(pre.upper_A, pre.upper_c, x0, eps);
 
+    // [Relaxation (이완) 계산] 비선형 함수(ReLU 등)를 선형 부등식 두 개(상한/하한 직선)로 근사(Relax)합니다.
     Vector alpha_l, beta_l, alpha_u, beta_u;
-    if (net.act[l] == ActivationType::Linear) {
+    if (net.act[l] == ActivationType::Linear) { // 선형일 때는 그대로 1차 함수 유지
       alpha_l = make_zero_vector(pre_lower.n);
       alpha_u = make_zero_vector(pre_lower.n);
       beta_l = make_zero_vector(pre_lower.n);
@@ -983,19 +997,23 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
         alpha_u.v[i] = 1.0;
       }
     } else if (net.act[l] == ActivationType::Relu) {
+      // ReLU 곡선을 덮어씌우는 두 개의 직선(기울기 alpha, 절편 beta)을 계산합니다.
       relu_relax(pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u);
     } else {
       sigmoid_relax(pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u);
     }
 
+    // [Post-activation 계산] 방금 구한 이완 직선(alpha, beta)을 이전 수식(pre)에 곱해서 더합니다.
     AffineBound post;
-    post.lower_A = rowwise_scale(pre.lower_A, alpha_l);
-    post.lower_c = vec_add(elemwise_mul(alpha_l, pre.lower_c), beta_l);
-    post.upper_A = rowwise_scale(pre.upper_A, alpha_u);
+    post.lower_A = rowwise_scale(pre.lower_A, alpha_l); // 계수행렬 A에 기울기 alpha_l을 곱함
+    post.lower_c = vec_add(elemwise_mul(alpha_l, pre.lower_c), beta_l); // 편향 c에 alpha_l을 곱하고 beta_l을 더함
+    post.upper_A = rowwise_scale(pre.upper_A, alpha_u); // 상한선도 동일하게 진행
     post.upper_c = vec_add(elemwise_mul(alpha_u, pre.upper_c), beta_u);
 
+    // 이제 현재(current) 상태를 갱신하고 다음 레이어로 넘어갈 준비를 합니다.
     current = post;
 
+    // 나중에 Backward(역방향) 계산에서 이 값들을 다시 써먹어야 하므로 캐싱해둡니다.
     out.layer_bounds[l].dim = alpha_l.n;
     out.layer_bounds[l].alpha_lower = alpha_l;
     out.layer_bounds[l].beta_lower = beta_l;
@@ -1003,7 +1021,9 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
     out.layer_bounds[l].beta_upper = beta_u;
   }
 
+  // 3. [최종 결과 도출] 모든 레이어를 통과한 최종 수식(최종 계수 A와 편향 c)
   out.final_affine = current;
+  // 그 최종 수식에 입력 박스(x0 ± eps)를 대입하여 절대적인 최종 하한/상한 범위를 확정합니다.
   out.final_lower = affine_min(current.lower_A, current.lower_c, x0, eps);
   out.final_upper = affine_max(current.upper_A, current.upper_c, x0, eps);
   return out;

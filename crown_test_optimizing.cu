@@ -204,6 +204,7 @@ int main(int argc, char** argv){
     }
     std::cout << "========================================\n";
 
+    // 노드 결과 구조체
     struct NodeResult {
         int index;
         double lower;
@@ -212,6 +213,7 @@ int main(int argc, char** argv){
         double range;
     };
 
+    // 구조체를 element 로 하는 벡터
     std::vector<NodeResult> results;
     for (int i = 0; i < out_dim; ++i) {
         results.push_back({i, bwd.final_lower.v[i], bwd.final_upper.v[i], y.v[i], bwd.final_upper.v[i] - bwd.final_lower.v[i]});
@@ -224,7 +226,7 @@ int main(int argc, char** argv){
         return a.pred > b.pred;
     });
 
-    std::cout << "\n[Top 8 Nodes - Sorted by Normal Pred]\n";
+    std::cout << "\n[8 Nodes - Sorted by Normal Pred]\n";
     std::cout << "[Index] | Lower Bound | Upper Bound | Normal Pred (y) | Range (Upper - Lower)\n";
     std::cout << "-----------------------------------------------------------------------\n";
     for (int i = 0; i < print_count; ++i) {
@@ -242,7 +244,7 @@ int main(int argc, char** argv){
         return a.range < b.range;
     });
 
-    std::cout << "\n[Top 8 Nodes - Sorted by Range]\n";
+    std::cout << "\n[8 Nodes - Sorted by Range]\n";
     std::cout << "[Index] | Lower Bound | Upper Bound | Normal Pred (y) | Range (Upper - Lower)\n";
     std::cout << "-----------------------------------------------------------------------\n";
     for (int i = 0; i < print_count; ++i) {
