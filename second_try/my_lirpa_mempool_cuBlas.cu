@@ -19,6 +19,8 @@
 #include <cassert>
 #include <cctype>
 #include <cmath>
+#include <cstddef>
+#include <cublas_v2.h> // [추가] cuBLAS를 사용하기 위한 헤더
 #include <cuda_runtime.h>
 #include <functional>
 #include <iomanip>
@@ -108,6 +110,7 @@ struct GpuPool {
   Matrix* d_mat[NUM_POOL_MAT];
   Vector* d_vec[NUM_POOL_VEC];
   bool initialized = false;
+  cublasHandle_t cublas_handle = nullptr; // [추가] cuBLAS 핸들
 
   // 1번만 실행되도록
   void init() {
@@ -116,6 +119,8 @@ struct GpuPool {
       cudaMalloc(&d_mat[i], sizeof(Matrix));
     for (int i = 0; i < NUM_POOL_VEC; i++)
       cudaMalloc(&d_vec[i], sizeof(Vector));
+      
+    cublasCreate(&cublas_handle); // [추가] cuBLAS 핸들 생성
     initialized = true;
   }
 
@@ -125,6 +130,8 @@ struct GpuPool {
       cudaFree(d_mat[i]);
     for (int i = 0; i < NUM_POOL_VEC; i++)
       cudaFree(d_vec[i]);
+      
+    cublasDestroy(cublas_handle); // [추가] cuBLAS 핸들 소멸
     initialized = false;
   }
 };
@@ -355,6 +362,7 @@ __global__ void matmul_gpu(const Matrix *A, const Matrix *B, Matrix *C) {
   }
 }
 
+// [변경] 기존의 커널 런칭 대신 cuBLAS의 cublasDgemm을 활용
 Matrix matmul(const Matrix &A, const Matrix &B) {
   require(A.cols == B.rows, "matmul shape mismatch.");
   ensure_pool();
@@ -364,11 +372,22 @@ Matrix matmul(const Matrix &A, const Matrix &B) {
   cudaMemcpy(g_pool.d_mat[1], &B, sizeof(Matrix), cudaMemcpyHostToDevice);
   cudaMemcpy(g_pool.d_mat[2], &C, sizeof(Matrix), cudaMemcpyHostToDevice);
 
-  int total_elements = A.rows * B.cols;
-  int threadsPerBlock = 256;
-  int blocksPerGrid = (total_elements + threadsPerBlock - 1) / threadsPerBlock;
-
-  matmul_gpu<<<blocksPerGrid, threadsPerBlock>>>(g_pool.d_mat[0], g_pool.d_mat[1], g_pool.d_mat[2]);
+  // [추가] d_mat 내의 실제 2D 데이터 배열 포인터 추출
+  double* d_A = (double*)((char*)g_pool.d_mat[0] + offsetof(Matrix, a));
+  double* d_B = (double*)((char*)g_pool.d_mat[1] + offsetof(Matrix, a));
+  double* d_C = (double*)((char*)g_pool.d_mat[2] + offsetof(Matrix, a));
+  
+  double alpha = 1.0;
+  double beta = 0.0;
+  
+  // [추가] cuBLAS는 열 우선(Column-Major) 기준. 행 우선(Row-Major)인 C = A * B를 연산하기 위해
+  // cuBLAS 관점에서는 C^T = B^T * A^T 로 취급하여 연산
+  // 매개변수: 핸들, OP(B^T), OP(A^T), m, n, k, alpha, B(ldb), A(lda), beta, C(ldc)
+  cublasDgemm(g_pool.cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+              B.cols, A.rows, A.cols,
+              &alpha, d_B, MAX_DIM, d_A, MAX_DIM,
+              &beta, d_C, MAX_DIM);
+              
   cudaDeviceSynchronize();
 
   cudaMemcpy(&C, g_pool.d_mat[2], sizeof(Matrix), cudaMemcpyDeviceToHost);
@@ -387,6 +406,7 @@ __global__ void matvec_gpu(const Matrix *A, const Vector *x, Vector *y) {
   }
 }
 
+// [변경] 기존 커널 대신 cuBLAS의 cublasDgemv 활용
 Vector matvec(const Matrix &A, const Vector &x) {
   require(A.cols == x.n, "matvec shape mismatch.");
   ensure_pool();
@@ -396,10 +416,22 @@ Vector matvec(const Matrix &A, const Vector &x) {
   cudaMemcpy(g_pool.d_vec[0], &x, sizeof(Vector), cudaMemcpyHostToDevice);
   cudaMemcpy(g_pool.d_vec[1], &y, sizeof(Vector), cudaMemcpyHostToDevice);
 
-  int threadsPerBlock = 256;
-  int blocksPerGrid = (A.rows + threadsPerBlock - 1) / threadsPerBlock;
+  // [추가] d_mat, d_vec 내의 실제 데이터 배열 포인터 추출
+  double* d_A = (double*)((char*)g_pool.d_mat[0] + offsetof(Matrix, a));
+  double* d_x = (double*)((char*)g_pool.d_vec[0] + offsetof(Vector, v));
+  double* d_y = (double*)((char*)g_pool.d_vec[1] + offsetof(Vector, v));
 
-  matvec_gpu<<<blocksPerGrid, threadsPerBlock>>>(g_pool.d_mat[0], g_pool.d_vec[0], g_pool.d_vec[1]);
+  double alpha = 1.0;
+  double beta = 0.0;
+
+  // [추가] cuBLAS는 열 우선(Column-Major) 행렬을 기대하므로,
+  // C언어의 행 우선(Row-Major) 배열을 넘길 경우 A^T 로 인식됩니다.
+  // 따라서 A * x 연산을 수행하기 위해 전치옵션(CUBLAS_OP_T)을 지정합니다.
+  cublasDgemv(g_pool.cublas_handle, CUBLAS_OP_T,
+              A.cols, A.rows,
+              &alpha, d_A, MAX_DIM, d_x, 1,
+              &beta, d_y, 1);
+
   cudaDeviceSynchronize();
 
   cudaMemcpy(&y, g_pool.d_vec[1], sizeof(Vector), cudaMemcpyDeviceToHost);
@@ -1063,7 +1095,6 @@ BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const
                      const Matrix *output_upper_M = nullptr,
                      const Vector *output_upper_p = nullptr) {
 
-  std::cout << "clear lirpa_forward!\n" << std::endl;
   const ForwardBoundResult fwd = lirpa_forward_bound(net, x0, eps);
 
   const int output_dim = network_output_dim(net);

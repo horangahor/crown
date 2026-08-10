@@ -2,7 +2,7 @@
 #include<cuda_runtime.h>
 #include<vector>
 #include<chrono>
-#include "my_lirpa_mempool.cu"
+#include "my_lirpa_mempool_cuBlas.cu"
 #include<fstream>
 
 const char* MODEL_PATH = "C:/Users/user/Desktop/cuda/jnunnv_v1_0/jnunnv/models/Custom/Baseline mMIMO FC H hard short 80 HTHNN_LAY2_491 RELU 20241018 PRUNED 0.93_NO_SIGMOID_custom.bin";
@@ -160,11 +160,14 @@ int main(int argc, char** argv){
 
     // CROWN 알고리즘 호출 및 출력
     std::cout << "\n========================================\n";
-    std::cout << "Starting CROWN Verification (eps = " << eps << ")" << std::endl;
+    std::cout << "Starting CROWN Verification (eps = " << eps << "), mempool + cuBlas + warmup" << std::endl;
     std::cout << "========================================\n";
 
     // 소수점 6자리까지 출력
     std::cout << std::fixed << std::setprecision(6);
+
+    // 메모리풀 + cuBlas 미리 할당 및 로드 , 근데 어짜피 
+    ensure_pool();
 
     // 시간 측정 시작 (신경망 정방향 통과 및 CROWN)
     auto t_start = std::chrono::high_resolution_clock::now();
@@ -201,5 +204,7 @@ int main(int argc, char** argv){
 
     // 동적 할당 해제
     delete net;
+
+    system("pause");
     return 0;
 }
