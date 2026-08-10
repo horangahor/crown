@@ -1,0 +1,5 @@
+nvcc -Xcompiler "/utf-8" -Xlinker "/STACK:8388608" -arch=sm_89 my_lirpa.cu -o my_lirpa.exe
+
+
+nvcc -Xcompiler "/utf-8" -Xlinker "/STACK:134217728" -arch=sm_89 crown_test_op_only_GPU.cu -o crown_test_op_only_GPU.exe
+

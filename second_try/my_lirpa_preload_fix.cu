@@ -1,0 +1,1196 @@
+// ============================================================
+// my_lirpa_preload_fix.cu - 메모리 풀 + GPU 사전로드 가중치 실제 활용 버전
+//
+// my_lirpa_mempool_preload_on_gpu.cu 대비 변경점:
+//   - d_W를 Matrix* 타입으로 변경 (전체 Matrix 구조체를 GPU에 올림)
+//   - positive_part, negative_part, matmul, matvec에
+//     선택적 d_preloaded 파라미터 추가
+//   - 가중치가 이미 GPU에 있으면 cudaMemcpy(2MB) 스킵
+//   - lirpa_forward_bound, backward_one_layer 등에서 net.d_W[l] 활용
+//
+// 컴파일: nvcc -Xcompiler "/utf-8" -Xlinker "/STACK:134217728"
+//         -arch=sm_89 crown_test_preload_fix.cu -o crown_test_preload_fix.exe
+// ============================================================
+
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cctype>
+#include <cmath>
+#include <cuda_runtime.h>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <random>
+#include <stdexcept>
+#include <string>
+
+namespace {
+
+constexpr int MAX_LAYERS = 16;
+constexpr int MAX_DIM = 512;
+
+enum class ActivationType {
+  Relu,
+  Sigmoid,
+  Linear,
+};
+
+struct Matrix {
+  int rows = 0;
+  int cols = 0;
+  double a[MAX_DIM][MAX_DIM]{};
+};
+
+struct Vector {
+  int n = 0;
+  double v[MAX_DIM]{};
+};
+
+struct AffineBound {
+  Matrix lower_A;
+  Vector lower_c;
+  Matrix upper_A;
+  Vector upper_c;
+};
+
+struct LayerBound {
+  int dim = 0;
+  Vector alpha_lower;
+  Vector beta_lower;
+  Vector alpha_upper;
+  Vector beta_upper;
+};
+
+struct ForwardBoundResult {
+  AffineBound final_affine;
+  Vector final_lower;
+  Vector final_upper;
+  int num_layer_bounds = 0;
+  LayerBound layer_bounds[MAX_LAYERS]{};
+};
+
+struct BackwardBoundResult {
+  AffineBound final_affine;
+  Vector final_lower;
+  Vector final_upper;
+  int num_layer_bounds = 0;
+  LayerBound layer_bounds[MAX_LAYERS]{};
+};
+
+struct FullyConnectedNetwork {
+  int num_layers = 0;
+  int layer_in_dim[MAX_LAYERS]{};
+  int layer_out_dim[MAX_LAYERS]{};
+  Matrix W[MAX_LAYERS]{};
+  Vector b[MAX_LAYERS]{};
+  ActivationType act[MAX_LAYERS]{};
+  // [변경] double* → Matrix* : 구조체 전체를 GPU에 올려서 커널에 바로 전달 가능
+  Matrix* d_W[MAX_LAYERS]{};
+};
+
+// ============================================================
+// 메모리 풀
+// ============================================================
+
+constexpr int NUM_POOL_MAT = 3;
+constexpr int NUM_POOL_VEC = 6;
+
+struct GpuPool {
+  Matrix* d_mat[NUM_POOL_MAT];
+  Vector* d_vec[NUM_POOL_VEC];
+  bool initialized = false;
+
+  void init() {
+    if (initialized) return;
+    for (int i = 0; i < NUM_POOL_MAT; i++)
+      cudaMalloc(&d_mat[i], sizeof(Matrix));
+    for (int i = 0; i < NUM_POOL_VEC; i++)
+      cudaMalloc(&d_vec[i], sizeof(Vector));
+    initialized = true;
+  }
+
+  void destroy() {
+    if (!initialized) return;
+    for (int i = 0; i < NUM_POOL_MAT; i++)
+      cudaFree(d_mat[i]);
+    for (int i = 0; i < NUM_POOL_VEC; i++)
+      cudaFree(d_vec[i]);
+    initialized = false;
+  }
+};
+
+static GpuPool g_pool;
+
+void ensure_pool() {
+  if (!g_pool.initialized) g_pool.init();
+}
+
+void gpu_pool_cleanup() {
+  g_pool.destroy();
+}
+
+// ============================================================
+// 기본 유틸리티
+// ============================================================
+
+__host__ __device__ inline double pos(double x) { return x > 0.0 ? x : 0.0; }
+__host__ __device__ inline double neg(double x) { return x < 0.0 ? x : 0.0; }
+__host__ __device__ inline double relu(double x) { return x > 0.0 ? x : 0.0; }
+
+__host__ __device__ inline double sigmoid(double x) {
+  if (x >= 0.0) return 1.0 / (1.0 + exp(-x));
+  const double ex = exp(x);
+  return ex / (1.0 + ex);
+}
+
+__host__ __device__ inline double sigmoid_prime(double x) {
+  const double s = sigmoid(x);
+  return s * (1.0 - s);
+}
+
+void require(bool cond, const std::string &msg) {
+  if (!cond) throw std::invalid_argument(msg);
+}
+
+// --- CPU 원본 함수들 ---
+Matrix make_zero_matrix_cpu(int rows, int cols) {
+  require(rows >= 0 && rows <= MAX_DIM && cols >= 0 && cols <= MAX_DIM,
+          "Matrix shape out of bounds.");
+  Matrix out;
+  out.rows = rows;
+  out.cols = cols;
+  return out;
+}
+
+Vector make_zero_vector_cpu(int n) {
+  require(n >= 0 && n <= MAX_DIM, "Vector length out of bounds.");
+  Vector out;
+  out.n = n;
+  return out;
+}
+
+Matrix make_eye_cpu(int n) {
+  Matrix out = make_zero_matrix_cpu(n, n);
+  for (int i = 0; i < n; ++i) out.a[i][i] = 1.0;
+  return out;
+}
+
+// ============================================================
+// make 함수들
+// ============================================================
+
+Matrix make_zero_matrix(int rows, int cols) {
+  require(rows >= 0 && rows <= MAX_DIM && cols >= 0 && cols <= MAX_DIM,
+          "Matrix shape out of bounds.");
+  ensure_pool();
+  Matrix out;
+  cudaMemset(g_pool.d_mat[0], 0, sizeof(Matrix));
+  cudaMemcpy(&out, g_pool.d_mat[0], sizeof(Matrix), cudaMemcpyDeviceToHost);
+  out.rows = rows;
+  out.cols = cols;
+  return out;
+}
+
+Vector make_zero_vector(int n) {
+  require(n >= 0 && n <= MAX_DIM, "Vector length out of bounds.");
+  ensure_pool();
+  Vector out;
+  cudaMemset(g_pool.d_vec[0], 0, sizeof(Vector));
+  cudaMemcpy(&out, g_pool.d_vec[0], sizeof(Vector), cudaMemcpyDeviceToHost);
+  out.n = n;
+  return out;
+}
+
+__global__ void make_eye_gpu(Matrix *out, int n) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < n) out->a[tid][tid] = 1.0;
+}
+
+Matrix make_eye(int n) {
+  ensure_pool();
+  Matrix out = make_zero_matrix(n, n);
+  cudaMemcpy(g_pool.d_mat[0], &out, sizeof(Matrix), cudaMemcpyHostToDevice);
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
+  if (blocksPerGrid == 0) blocksPerGrid = 1;
+  make_eye_gpu<<<blocksPerGrid, threadsPerBlock>>>(g_pool.d_mat[0], n);
+  cudaDeviceSynchronize();
+  cudaMemcpy(&out, g_pool.d_mat[0], sizeof(Matrix), cudaMemcpyDeviceToHost);
+  return out;
+}
+
+// ============================================================
+// GPU 커널 함수들 (동일)
+// ============================================================
+
+__global__ void mat_add_gpu(const Matrix *A, const Matrix *B, Matrix *C) {
+  int tid = blockDim.x * blockIdx.x + threadIdx.x;
+  int total_elements = A->rows * A->cols;
+  if (tid < total_elements) {
+    int r = tid / A->cols;
+    int c = tid % A->cols;
+    C->a[r][c] = A->a[r][c] + B->a[r][c];
+  }
+}
+
+Matrix mat_add(const Matrix &A, const Matrix &B) {
+  require(A.rows == B.rows && A.cols == B.cols, "mat_add shape mismatch.");
+  ensure_pool();
+  Matrix C = make_zero_matrix(A.rows, A.cols);
+  cudaMemcpy(g_pool.d_mat[0], &A, sizeof(Matrix), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_mat[1], &B, sizeof(Matrix), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_mat[2], &C, sizeof(Matrix), cudaMemcpyHostToDevice);
+  int total_elements = A.rows * A.cols;
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (total_elements + threadsPerBlock - 1) / threadsPerBlock;
+  mat_add_gpu<<<blocksPerGrid, threadsPerBlock>>>(g_pool.d_mat[0], g_pool.d_mat[1], g_pool.d_mat[2]);
+  cudaDeviceSynchronize();
+  cudaMemcpy(&C, g_pool.d_mat[2], sizeof(Matrix), cudaMemcpyDeviceToHost);
+  return C;
+}
+
+__global__ void vec_add_gpu(const Vector *A, const Vector *B, Vector *C) {
+  int tid = blockDim.x * blockIdx.x + threadIdx.x;
+  if (tid < A->n) C->v[tid] = A->v[tid] + B->v[tid];
+}
+
+Vector vec_add(const Vector &a, const Vector &b) {
+  require(a.n == b.n, "vec_add shape mismatch.");
+  ensure_pool();
+  Vector c = make_zero_vector(a.n);
+  cudaMemcpy(g_pool.d_vec[0], &a, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[1], &b, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[2], &c, sizeof(Vector), cudaMemcpyHostToDevice);
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (a.n + threadsPerBlock - 1) / threadsPerBlock;
+  vec_add_gpu<<<blocksPerGrid, threadsPerBlock>>>(g_pool.d_vec[0], g_pool.d_vec[1], g_pool.d_vec[2]);
+  cudaDeviceSynchronize();
+  cudaMemcpy(&c, g_pool.d_vec[2], sizeof(Vector), cudaMemcpyDeviceToHost);
+  return c;
+}
+
+__global__ void vec_sub_gpu(const Vector *A, const Vector *B, Vector *C) {
+  int tid = blockDim.x * blockIdx.x + threadIdx.x;
+  if (tid < A->n) C->v[tid] = A->v[tid] - B->v[tid];
+}
+
+Vector vec_sub(const Vector &a, const Vector &b) {
+  require(a.n == b.n, "vec_sub shape mismatch.");
+  ensure_pool();
+  Vector c = make_zero_vector(a.n);
+  cudaMemcpy(g_pool.d_vec[0], &a, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[1], &b, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[2], &c, sizeof(Vector), cudaMemcpyHostToDevice);
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (a.n + threadsPerBlock - 1) / threadsPerBlock;
+  vec_sub_gpu<<<blocksPerGrid, threadsPerBlock>>>(g_pool.d_vec[0], g_pool.d_vec[1], g_pool.d_vec[2]);
+  cudaDeviceSynchronize();
+  cudaMemcpy(&c, g_pool.d_vec[2], sizeof(Vector), cudaMemcpyDeviceToHost);
+  return c;
+}
+
+// ============================================================
+// [핵심 변경] matmul - B행렬(가중치)에 대한 사전로드 포인터 지원
+// ============================================================
+
+__global__ void matmul_gpu(const Matrix *A, const Matrix *B, Matrix *C) {
+  int tid = blockDim.x * blockIdx.x + threadIdx.x;
+  int total_elements = A->rows * B->cols;
+  if (tid < total_elements) {
+    int r = tid / B->cols;
+    int c = tid % B->cols;
+    double sum = 0.0;
+    for (int k = 0; k < A->cols; ++k) {
+      if (A->a[r][k] == 0.0) continue;
+      sum += A->a[r][k] * B->a[k][c];
+    }
+    C->a[r][c] = sum;
+  }
+}
+
+// d_B_preloaded: 이미 GPU에 올려둔 B행렬(가중치) 포인터. nullptr이면 기존대로 복사.
+Matrix matmul(const Matrix &A, const Matrix &B, Matrix* d_B_preloaded = nullptr) {
+  require(A.cols == B.rows, "matmul shape mismatch.");
+  ensure_pool();
+  Matrix C = make_zero_matrix(A.rows, B.cols);
+
+  cudaMemcpy(g_pool.d_mat[0], &A, sizeof(Matrix), cudaMemcpyHostToDevice);
+
+  // [핵심] B행렬이 이미 GPU에 있으면 2MB 복사 스킵!
+  Matrix* d_B_ptr;
+  if (d_B_preloaded) {
+    d_B_ptr = d_B_preloaded;  // 이미 GPU에 있는 포인터 직접 사용
+  } else {
+    cudaMemcpy(g_pool.d_mat[1], &B, sizeof(Matrix), cudaMemcpyHostToDevice);
+    d_B_ptr = g_pool.d_mat[1];
+  }
+
+  cudaMemcpy(g_pool.d_mat[2], &C, sizeof(Matrix), cudaMemcpyHostToDevice);
+
+  int total_elements = A.rows * B.cols;
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (total_elements + threadsPerBlock - 1) / threadsPerBlock;
+
+  matmul_gpu<<<blocksPerGrid, threadsPerBlock>>>(g_pool.d_mat[0], d_B_ptr, g_pool.d_mat[2]);
+  cudaDeviceSynchronize();
+
+  cudaMemcpy(&C, g_pool.d_mat[2], sizeof(Matrix), cudaMemcpyDeviceToHost);
+  return C;
+}
+
+// ============================================================
+// [핵심 변경] matvec - A행렬(가중치)에 대한 사전로드 포인터 지원
+// ============================================================
+
+__global__ void matvec_gpu(const Matrix *A, const Vector *x, Vector *y) {
+  int tid = blockDim.x * blockIdx.x + threadIdx.x;
+  if (tid < A->rows) {
+    double sum = 0.0;
+    for (int j = 0; j < A->cols; ++j)
+      sum += A->a[tid][j] * x->v[j];
+    y->v[tid] = sum;
+  }
+}
+
+// d_A_preloaded: 이미 GPU에 올려둔 A행렬(가중치) 포인터
+Vector matvec(const Matrix &A, const Vector &x, Matrix* d_A_preloaded = nullptr) {
+  require(A.cols == x.n, "matvec shape mismatch.");
+  ensure_pool();
+  Vector y = make_zero_vector(A.rows);
+
+  // [핵심] A행렬이 이미 GPU에 있으면 2MB 복사 스킵!
+  Matrix* d_A_ptr;
+  if (d_A_preloaded) {
+    d_A_ptr = d_A_preloaded;
+  } else {
+    cudaMemcpy(g_pool.d_mat[0], &A, sizeof(Matrix), cudaMemcpyHostToDevice);
+    d_A_ptr = g_pool.d_mat[0];
+  }
+
+  cudaMemcpy(g_pool.d_vec[0], &x, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[1], &y, sizeof(Vector), cudaMemcpyHostToDevice);
+
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (A.rows + threadsPerBlock - 1) / threadsPerBlock;
+  matvec_gpu<<<blocksPerGrid, threadsPerBlock>>>(d_A_ptr, g_pool.d_vec[0], g_pool.d_vec[1]);
+  cudaDeviceSynchronize();
+
+  cudaMemcpy(&y, g_pool.d_vec[1], sizeof(Vector), cudaMemcpyDeviceToHost);
+  return y;
+}
+
+// ============================================================
+// [핵심 변경] positive_part, negative_part - 사전로드 포인터 지원
+// ============================================================
+
+__global__ void positive_part_gpu(const Matrix *A, Matrix *out) {
+  int tid = blockDim.x * blockIdx.x + threadIdx.x;
+  int total_elements = A->rows * A->cols;
+  if (tid < total_elements) {
+    int r = tid / A->cols;
+    int c = tid % A->cols;
+    out->a[r][c] = pos(A->a[r][c]);
+  }
+}
+
+// d_A_preloaded: 이미 GPU에 올려둔 입력 행렬 포인터
+Matrix positive_part(const Matrix &A, Matrix* d_A_preloaded = nullptr) {
+  ensure_pool();
+  Matrix out = make_zero_matrix(A.rows, A.cols);
+
+  // [핵심] 입력 행렬이 이미 GPU에 있으면 2MB 복사 스킵!
+  Matrix* d_A_ptr;
+  if (d_A_preloaded) {
+    d_A_ptr = d_A_preloaded;
+  } else {
+    cudaMemcpy(g_pool.d_mat[0], &A, sizeof(Matrix), cudaMemcpyHostToDevice);
+    d_A_ptr = g_pool.d_mat[0];
+  }
+
+  cudaMemcpy(g_pool.d_mat[1], &out, sizeof(Matrix), cudaMemcpyHostToDevice);
+
+  int total_elements = A.rows * A.cols;
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (total_elements + threadsPerBlock - 1) / threadsPerBlock;
+  positive_part_gpu<<<blocksPerGrid, threadsPerBlock>>>(d_A_ptr, g_pool.d_mat[1]);
+  cudaDeviceSynchronize();
+
+  cudaMemcpy(&out, g_pool.d_mat[1], sizeof(Matrix), cudaMemcpyDeviceToHost);
+  return out;
+}
+
+__global__ void negative_part_gpu(const Matrix *A, Matrix *out) {
+  int tid = blockDim.x * blockIdx.x + threadIdx.x;
+  int total_elements = A->rows * A->cols;
+  if (tid < total_elements) {
+    int r = tid / A->cols;
+    int c = tid % A->cols;
+    out->a[r][c] = neg(A->a[r][c]);
+  }
+}
+
+Matrix negative_part(const Matrix &A, Matrix* d_A_preloaded = nullptr) {
+  ensure_pool();
+  Matrix out = make_zero_matrix(A.rows, A.cols);
+
+  Matrix* d_A_ptr;
+  if (d_A_preloaded) {
+    d_A_ptr = d_A_preloaded;
+  } else {
+    cudaMemcpy(g_pool.d_mat[0], &A, sizeof(Matrix), cudaMemcpyHostToDevice);
+    d_A_ptr = g_pool.d_mat[0];
+  }
+
+  cudaMemcpy(g_pool.d_mat[1], &out, sizeof(Matrix), cudaMemcpyHostToDevice);
+
+  int total_elements = A.rows * A.cols;
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (total_elements + threadsPerBlock - 1) / threadsPerBlock;
+  negative_part_gpu<<<blocksPerGrid, threadsPerBlock>>>(d_A_ptr, g_pool.d_mat[1]);
+  cudaDeviceSynchronize();
+
+  cudaMemcpy(&out, g_pool.d_mat[1], sizeof(Matrix), cudaMemcpyDeviceToHost);
+  return out;
+}
+
+// ============================================================
+// rowwise_scale, elemwise_mul 등 (변경 없음 - 가중치 직접 안 씀)
+// ============================================================
+
+__global__ void rowwise_scale_gpu(const Matrix *A, const Vector *s, Matrix *out) {
+  int tid = blockDim.x * blockIdx.x + threadIdx.x;
+  int total_elements = A->rows * A->cols;
+  if (tid < total_elements) {
+    int r = tid / A->cols;
+    int c = tid % A->cols;
+    out->a[r][c] = A->a[r][c] * s->v[r];
+  }
+}
+
+Matrix rowwise_scale(const Matrix &A, const Vector &s) {
+  require(A.rows == s.n, "rowwise_scale shape mismatch.");
+  ensure_pool();
+  Matrix out = make_zero_matrix(A.rows, A.cols);
+  cudaMemcpy(g_pool.d_mat[0], &A, sizeof(Matrix), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[0], &s, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_mat[1], &out, sizeof(Matrix), cudaMemcpyHostToDevice);
+  int total_elements = A.rows * A.cols;
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (total_elements + threadsPerBlock - 1) / threadsPerBlock;
+  rowwise_scale_gpu<<<blocksPerGrid, threadsPerBlock>>>(g_pool.d_mat[0], g_pool.d_vec[0], g_pool.d_mat[1]);
+  cudaDeviceSynchronize();
+  cudaMemcpy(&out, g_pool.d_mat[1], sizeof(Matrix), cudaMemcpyDeviceToHost);
+  return out;
+}
+
+__global__ void elemwise_mul_gpu(const Vector *A, const Vector *B, Vector *C) {
+  int tid = blockDim.x * blockIdx.x + threadIdx.x;
+  if (tid < A->n) C->v[tid] = A->v[tid] * B->v[tid];
+}
+
+Vector elemwise_mul(const Vector &a, const Vector &b) {
+  require(a.n == b.n, "elemwise_mul shape mismatch.");
+  ensure_pool();
+  Vector c = make_zero_vector(a.n);
+  cudaMemcpy(g_pool.d_vec[0], &a, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[1], &b, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[2], &c, sizeof(Vector), cudaMemcpyHostToDevice);
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (a.n + threadsPerBlock - 1) / threadsPerBlock;
+  elemwise_mul_gpu<<<blocksPerGrid, threadsPerBlock>>>(g_pool.d_vec[0], g_pool.d_vec[1], g_pool.d_vec[2]);
+  cudaDeviceSynchronize();
+  cudaMemcpy(&c, g_pool.d_vec[2], sizeof(Vector), cudaMemcpyDeviceToHost);
+  return c;
+}
+
+Vector make_eps_vec_cpu(int n, double eps) {
+  Vector out = make_zero_vector_cpu(n);
+  for (int i = 0; i < n; ++i) out.v[i] = eps;
+  return out;
+}
+
+__global__ void make_eps_vec_gpu(Vector *out, int n, double eps) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < n) out->v[tid] = eps;
+}
+
+Vector make_eps_vec(int n, double eps) {
+  ensure_pool();
+  Vector out = make_zero_vector(n);
+  cudaMemcpy(g_pool.d_vec[0], &out, sizeof(Vector), cudaMemcpyHostToDevice);
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
+  if (blocksPerGrid == 0) blocksPerGrid = 1;
+  make_eps_vec_gpu<<<blocksPerGrid, threadsPerBlock>>>(g_pool.d_vec[0], n, eps);
+  cudaDeviceSynchronize();
+  cudaMemcpy(&out, g_pool.d_vec[0], sizeof(Vector), cudaMemcpyDeviceToHost);
+  return out;
+}
+
+// affine_min, affine_max (변경 없음)
+__global__ void affine_min_gpu(const Matrix *A, const Vector *c,
+                               const Vector *xl, const Vector *xu, Vector *out) {
+  int tid = blockDim.x * blockIdx.x + threadIdx.x;
+  if (tid < A->rows) {
+    double sum = c->v[tid];
+    for (int j = 0; j < A->cols; ++j) {
+      double aij = A->a[tid][j];
+      sum += pos(aij) * xl->v[j] + neg(aij) * xu->v[j];
+    }
+    out->v[tid] = sum;
+  }
+}
+
+Vector affine_min(const Matrix &A, const Vector &c, const Vector &x0, double eps) {
+  require(A.rows == c.n && A.cols == x0.n, "affine_min shape mismatch.");
+  ensure_pool();
+  const Vector e = make_eps_vec(x0.n, eps);
+  const Vector xl = vec_sub(x0, e);
+  const Vector xu = vec_add(x0, e);
+  Vector out = make_zero_vector(A.rows);
+  cudaMemcpy(g_pool.d_mat[0], &A, sizeof(Matrix), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[0], &c, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[1], &xl, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[2], &xu, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[3], &out, sizeof(Vector), cudaMemcpyHostToDevice);
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (A.rows + threadsPerBlock - 1) / threadsPerBlock;
+  affine_min_gpu<<<blocksPerGrid, threadsPerBlock>>>(g_pool.d_mat[0], g_pool.d_vec[0],
+      g_pool.d_vec[1], g_pool.d_vec[2], g_pool.d_vec[3]);
+  cudaDeviceSynchronize();
+  cudaMemcpy(&out, g_pool.d_vec[3], sizeof(Vector), cudaMemcpyDeviceToHost);
+  return out;
+}
+
+__global__ void affine_max_gpu(const Matrix *A, const Vector *c,
+                               const Vector *xl, const Vector *xu, Vector *out) {
+  int tid = blockDim.x * blockIdx.x + threadIdx.x;
+  if (tid < A->rows) {
+    double sum = c->v[tid];
+    for (int j = 0; j < A->cols; ++j) {
+      double aij = A->a[tid][j];
+      sum += pos(aij) * xu->v[j] + neg(aij) * xl->v[j];
+    }
+    out->v[tid] = sum;
+  }
+}
+
+Vector affine_max(const Matrix &A, const Vector &c, const Vector &x0, double eps) {
+  require(A.rows == c.n && A.cols == x0.n, "affine_max shape mismatch.");
+  ensure_pool();
+  const Vector e = make_eps_vec(x0.n, eps);
+  const Vector xl = vec_sub(x0, e);
+  const Vector xu = vec_add(x0, e);
+  Vector out = make_zero_vector(A.rows);
+  cudaMemcpy(g_pool.d_mat[0], &A, sizeof(Matrix), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[0], &c, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[1], &xl, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[2], &xu, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[3], &out, sizeof(Vector), cudaMemcpyHostToDevice);
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (A.rows + threadsPerBlock - 1) / threadsPerBlock;
+  affine_max_gpu<<<blocksPerGrid, threadsPerBlock>>>(g_pool.d_mat[0], g_pool.d_vec[0],
+      g_pool.d_vec[1], g_pool.d_vec[2], g_pool.d_vec[3]);
+  cudaDeviceSynchronize();
+  cudaMemcpy(&out, g_pool.d_vec[3], sizeof(Vector), cudaMemcpyDeviceToHost);
+  return out;
+}
+
+// relu_relax (변경 없음)
+__global__ void relu_relax_gpu(const Vector *lower, const Vector *upper,
+                               Vector *alpha_l, Vector *beta_l, Vector *alpha_u,
+                               Vector *beta_u) {
+  int tid = blockDim.x * blockIdx.x + threadIdx.x;
+  if (tid < lower->n) {
+    double l = lower->v[tid];
+    double u = upper->v[tid];
+    assert(l <= u);
+    if (l >= 0.0) {
+      alpha_l->v[tid] = 1.0;
+      alpha_u->v[tid] = 1.0;
+    } else if (u <= 0.0) {
+      // keep zeros
+    } else {
+      double denom = u - l;
+      alpha_u->v[tid] = u / denom;
+      beta_u->v[tid] = -u * l / denom;
+      alpha_l->v[tid] = (fabs(l) < fabs(u)) ? 1.0 : 0.0;
+      beta_l->v[tid] = 0.0;
+    }
+  }
+}
+
+void relu_relax(const Vector &lower, const Vector &upper, Vector &alpha_l,
+                Vector &beta_l, Vector &alpha_u, Vector &beta_u) {
+  require(lower.n == upper.n, "relu_relax shape mismatch.");
+  ensure_pool();
+  alpha_l = make_zero_vector(lower.n);
+  beta_l = make_zero_vector(lower.n);
+  alpha_u = make_zero_vector(lower.n);
+  beta_u = make_zero_vector(lower.n);
+  cudaMemcpy(g_pool.d_vec[0], &lower, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[1], &upper, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[2], &alpha_l, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[3], &beta_l, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[4], &alpha_u, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(g_pool.d_vec[5], &beta_u, sizeof(Vector), cudaMemcpyHostToDevice);
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (lower.n + threadsPerBlock - 1) / threadsPerBlock;
+  relu_relax_gpu<<<blocksPerGrid, threadsPerBlock>>>(
+      g_pool.d_vec[0], g_pool.d_vec[1], g_pool.d_vec[2], g_pool.d_vec[3],
+      g_pool.d_vec[4], g_pool.d_vec[5]);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess)
+    std::cerr << "CUDA error in relu_relax_gpu launch: " << cudaGetErrorString(err) << "\n";
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    std::cerr << "CUDA error during relu_relax_gpu execution: " << cudaGetErrorString(err) << "\n";
+    throw std::runtime_error("relu_relax_gpu 실행 중 에러 발생");
+  }
+  cudaMemcpy(&alpha_l, g_pool.d_vec[2], sizeof(Vector), cudaMemcpyDeviceToHost);
+  cudaMemcpy(&beta_l, g_pool.d_vec[3], sizeof(Vector), cudaMemcpyDeviceToHost);
+  cudaMemcpy(&alpha_u, g_pool.d_vec[4], sizeof(Vector), cudaMemcpyDeviceToHost);
+  cudaMemcpy(&beta_u, g_pool.d_vec[5], sizeof(Vector), cudaMemcpyDeviceToHost);
+}
+
+// sigmoid_relax (변경 없음 - CPU 함수)
+double bisect_root(double lo, double hi,
+                   const std::function<double(double)> &fn, int max_iter = 80,
+                   double tol = 1e-12) {
+  double flo = fn(lo);
+  double fhi = fn(hi);
+  if (std::abs(flo) < tol) return lo;
+  if (std::abs(fhi) < tol) return hi;
+  if (flo * fhi > 0.0) {
+    constexpr int GRID = 257;
+    std::array<double, GRID> xs{}, vals{};
+    for (int i = 0; i < GRID; ++i) {
+      xs[i] = lo + (hi - lo) * static_cast<double>(i) / static_cast<double>(GRID - 1);
+      vals[i] = fn(xs[i]);
+    }
+    int best = 0;
+    double best_abs = std::abs(vals[0]);
+    for (int i = 1; i < GRID; ++i) {
+      double cur = std::abs(vals[i]);
+      if (cur < best_abs) { best_abs = cur; best = i; }
+    }
+    bool found = false;
+    for (int i = 0; i < GRID - 1; ++i) {
+      if (vals[i] == 0.0 || vals[i] * vals[i + 1] <= 0.0) {
+        lo = xs[i]; hi = xs[i + 1]; flo = vals[i]; found = true; break;
+      }
+    }
+    if (!found) return xs[best];
+  }
+  for (int it = 0; it < max_iter; ++it) {
+    const double mid = 0.5 * (lo + hi);
+    const double fmid = fn(mid);
+    if (std::abs(fmid) < tol || std::abs(hi - lo) < tol) return mid;
+    if (flo * fmid <= 0.0) hi = mid;
+    else { lo = mid; flo = fmid; }
+  }
+  return 0.5 * (lo + hi);
+}
+
+void sigmoid_relax(const Vector &lower, const Vector &upper, Vector &alpha_l,
+                   Vector &beta_l, Vector &alpha_u, Vector &beta_u) {
+  require(lower.n == upper.n, "sigmoid_relax shape mismatch.");
+  alpha_l = make_zero_vector(lower.n);
+  beta_l = make_zero_vector(lower.n);
+  alpha_u = make_zero_vector(lower.n);
+  beta_u = make_zero_vector(lower.n);
+  for (int i = 0; i < lower.n; ++i) {
+    const double l = lower.v[i];
+    const double u = upper.v[i];
+    require(l <= u, "Invalid interval in sigmoid_relax.");
+    if (std::abs(u - l) < 1e-14) {
+      double slope = sigmoid_prime(l);
+      double intercept = sigmoid(l) - slope * l;
+      alpha_l.v[i] = slope; beta_l.v[i] = intercept;
+      alpha_u.v[i] = slope; beta_u.v[i] = intercept;
+      continue;
+    }
+    if (l >= 0.0) {
+      double slope_sec = (sigmoid(u) - sigmoid(l)) / (u - l);
+      alpha_l.v[i] = slope_sec;
+      beta_l.v[i] = sigmoid(u) - slope_sec * u;
+      double x0 = 0.5 * (l + u);
+      double slope_tan = sigmoid_prime(x0);
+      alpha_u.v[i] = slope_tan;
+      beta_u.v[i] = sigmoid(x0) - slope_tan * x0;
+    } else if (u <= 0.0) {
+      double x0 = 0.5 * (l + u);
+      double slope_tan = sigmoid_prime(x0);
+      alpha_l.v[i] = slope_tan;
+      beta_l.v[i] = sigmoid(x0) - slope_tan * x0;
+      double slope_sec = (sigmoid(u) - sigmoid(l)) / (u - l);
+      alpha_u.v[i] = slope_sec;
+      beta_u.v[i] = sigmoid(u) - slope_sec * u;
+    } else {
+      double su = sigmoid(u);
+      auto fn_lower = [su, u](double d) {
+        return (su - sigmoid(d)) / (u - d) - sigmoid_prime(d);
+      };
+      double du = bisect_root(l, 0.0, fn_lower);
+      double sl = sigmoid(l);
+      auto fn_upper = [sl, l](double d) {
+        return (sigmoid(d) - sl) / (d - l) - sigmoid_prime(d);
+      };
+      double dl = bisect_root(0.0, u, fn_upper);
+      double slope_lower = sigmoid_prime(du);
+      alpha_l.v[i] = slope_lower;
+      beta_l.v[i] = sigmoid(du) - slope_lower * du;
+      double slope_upper = sigmoid_prime(dl);
+      alpha_u.v[i] = slope_upper;
+      beta_u.v[i] = sigmoid(dl) - slope_upper * dl;
+    }
+    double lower_violation = 0.0, upper_violation = 0.0;
+    constexpr int SAMPLES = 1001;
+    for (int k = 0; k < SAMPLES; ++k) {
+      double x = l + (u - l) * static_cast<double>(k) / static_cast<double>(SAMPLES - 1);
+      double y = sigmoid(x);
+      lower_violation = std::max(lower_violation, alpha_l.v[i] * x + beta_l.v[i] - y);
+      upper_violation = std::max(upper_violation, y - (alpha_u.v[i] * x + beta_u.v[i]));
+    }
+    if (lower_violation > 1e-10) beta_l.v[i] -= lower_violation + 1e-10;
+    if (upper_violation > 1e-10) beta_u.v[i] += upper_violation + 1e-10;
+  }
+}
+
+// ============================================================
+// 신경망 관련 함수
+// ============================================================
+
+ActivationType parse_activation(const std::string &name) {
+  std::string lower = name;
+  for (char &ch : lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  if (lower == "relu") return ActivationType::Relu;
+  if (lower == "sigmoid") return ActivationType::Sigmoid;
+  if (lower == "linear") return ActivationType::Linear;
+  throw std::invalid_argument("Unsupported activation: " + name);
+}
+
+FullyConnectedNetwork make_network(int num_layers, const int *layer_in_dim, const int *layer_out_dim,
+             const double W_data[MAX_LAYERS][MAX_DIM][MAX_DIM],
+             const double b_data[MAX_LAYERS][MAX_DIM],
+             const std::string *activations) {
+  require(num_layers >= 1 && num_layers <= MAX_LAYERS, "num_layers out of bounds.");
+  FullyConnectedNetwork net;
+  net.num_layers = num_layers;
+  for (int l = 0; l < num_layers; ++l) {
+    const int in_d = layer_in_dim[l];
+    const int out_d = layer_out_dim[l];
+    require(in_d >= 1 && in_d <= MAX_DIM, "layer_in_dim out of bounds.");
+    require(out_d >= 1 && out_d <= MAX_DIM, "layer_out_dim out of bounds.");
+    net.layer_in_dim[l] = in_d;
+    net.layer_out_dim[l] = out_d;
+    net.W[l] = make_zero_matrix(out_d, in_d);
+    net.b[l] = make_zero_vector(out_d);
+    net.act[l] = parse_activation(activations[l]);
+    for (int i = 0; i < out_d; ++i) {
+      net.b[l].v[i] = b_data[l][i];
+      for (int j = 0; j < in_d; ++j) net.W[l].a[i][j] = W_data[l][i][j];
+    }
+    if (l > 0) require(net.layer_out_dim[l - 1] == in_d, "Layer dimension mismatch.");
+  }
+  return net;
+}
+
+int network_input_dim(const FullyConnectedNetwork &net) { return net.layer_in_dim[0]; }
+int network_output_dim(const FullyConnectedNetwork &net) { return net.layer_out_dim[net.num_layers - 1]; }
+
+__global__ void apply_activation_gpu(ActivationType act, Vector *A) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < A->n) {
+    if (act == ActivationType::Relu) A->v[tid] = relu(A->v[tid]);
+    else if (act == ActivationType::Sigmoid) A->v[tid] = sigmoid(A->v[tid]);
+  }
+}
+
+Vector apply_activation(const Vector &s, const ActivationType act) {
+  ensure_pool();
+  Vector out = s;
+  cudaMemcpy(g_pool.d_vec[0], &out, sizeof(Vector), cudaMemcpyHostToDevice);
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (out.n + threadsPerBlock - 1) / threadsPerBlock;
+  apply_activation_gpu<<<blocksPerGrid, threadsPerBlock>>>(act, g_pool.d_vec[0]);
+  cudaDeviceSynchronize();
+  cudaMemcpy(&out, g_pool.d_vec[0], sizeof(Vector), cudaMemcpyDeviceToHost);
+  return out;
+}
+
+// [변경] network_forward - d_W 활용
+Vector network_forward(const FullyConnectedNetwork &net, const Vector &x) {
+  require(x.n == network_input_dim(net), "network_forward input dimension mismatch.");
+  Vector f = x;
+  for (int l = 0; l < net.num_layers; ++l) {
+    // [핵심] d_W가 있으면 matvec에 사전로드 포인터 전달
+    Vector s = vec_add(matvec(net.W[l], f, net.d_W[l]), net.b[l]);
+    f = apply_activation(s, net.act[l]);
+  }
+  return f;
+}
+
+// ============================================================
+// [변경] CROWN 알고리즘 - d_W 활용
+// ============================================================
+
+ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
+                                       const Vector &x0, double eps) {
+  require(x0.n == network_input_dim(net), "lirpa_forward_bound input dimension mismatch.");
+  const int in_dim = network_input_dim(net);
+  AffineBound current;
+  current.lower_A = make_eye(in_dim);
+  current.upper_A = make_eye(in_dim);
+  current.lower_c = make_zero_vector(in_dim);
+  current.upper_c = make_zero_vector(in_dim);
+
+  ForwardBoundResult out;
+  out.num_layer_bounds = net.num_layers;
+
+  for (int l = 0; l < net.num_layers; ++l) {
+    // [핵심] positive_part, negative_part에 d_W 전달 → W 복사 2MB×2 = 4MB 절약/레이어
+    const Matrix W_pos = positive_part(net.W[l], net.d_W[l]);
+    const Matrix W_neg = negative_part(net.W[l], net.d_W[l]);
+
+    AffineBound pre;
+    pre.lower_A = mat_add(matmul(W_pos, current.lower_A), matmul(W_neg, current.upper_A));
+    pre.lower_c = vec_add(
+        vec_add(matvec(W_pos, current.lower_c), matvec(W_neg, current.upper_c)),
+        net.b[l]);
+    pre.upper_A = mat_add(matmul(W_pos, current.upper_A), matmul(W_neg, current.lower_A));
+    pre.upper_c = vec_add(
+        vec_add(matvec(W_pos, current.upper_c), matvec(W_neg, current.lower_c)),
+        net.b[l]);
+
+    const Vector pre_lower = affine_min(pre.lower_A, pre.lower_c, x0, eps);
+    const Vector pre_upper = affine_max(pre.upper_A, pre.upper_c, x0, eps);
+
+    Vector alpha_l, beta_l, alpha_u, beta_u;
+    if (net.act[l] == ActivationType::Linear) {
+      alpha_l = make_zero_vector(pre_lower.n);
+      alpha_u = make_zero_vector(pre_lower.n);
+      beta_l = make_zero_vector(pre_lower.n);
+      beta_u = make_zero_vector(pre_lower.n);
+      for (int i = 0; i < pre_lower.n; ++i) { alpha_l.v[i] = 1.0; alpha_u.v[i] = 1.0; }
+    } else if (net.act[l] == ActivationType::Relu) {
+      relu_relax(pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u);
+    } else {
+      sigmoid_relax(pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u);
+    }
+
+    AffineBound post;
+    post.lower_A = rowwise_scale(pre.lower_A, alpha_l);
+    post.lower_c = vec_add(elemwise_mul(alpha_l, pre.lower_c), beta_l);
+    post.upper_A = rowwise_scale(pre.upper_A, alpha_u);
+    post.upper_c = vec_add(elemwise_mul(alpha_u, pre.upper_c), beta_u);
+    current = post;
+
+    out.layer_bounds[l].dim = alpha_l.n;
+    out.layer_bounds[l].alpha_lower = alpha_l;
+    out.layer_bounds[l].beta_lower = beta_l;
+    out.layer_bounds[l].alpha_upper = alpha_u;
+    out.layer_bounds[l].beta_upper = beta_u;
+  }
+
+  out.final_affine = current;
+  out.final_lower = affine_min(current.lower_A, current.lower_c, x0, eps);
+  out.final_upper = affine_max(current.upper_A, current.upper_c, x0, eps);
+  return out;
+}
+
+// [변경] backward_one_layer - d_W_preloaded 파라미터 추가
+void backward_one_layer(Matrix &lower_M, Vector &lower_p, Matrix &upper_M,
+                        Vector &upper_p, const Matrix &W, const Vector &b,
+                        const Vector &alpha_l, const Vector &beta_l,
+                        const Vector &alpha_u, const Vector &beta_u,
+                        Matrix* d_W_preloaded = nullptr) {
+  require(lower_M.cols == W.rows && upper_M.cols == W.rows,
+          "backward_one_layer shape mismatch.");
+  require(alpha_l.n == W.rows && beta_l.n == W.rows && alpha_u.n == W.rows &&
+              beta_u.n == W.rows,
+          "backward_one_layer relaxation shape mismatch.");
+
+  const Matrix lower_M_pos = positive_part(lower_M);
+  const Matrix lower_M_neg = negative_part(lower_M);
+  const Matrix upper_M_pos = positive_part(upper_M);
+  const Matrix upper_M_neg = negative_part(upper_M);
+
+  Matrix lower_s_coeff = make_zero_matrix(lower_M.rows, lower_M.cols);
+  Matrix upper_s_coeff = make_zero_matrix(upper_M.rows, upper_M.cols);
+  for (int i = 0; i < lower_M.rows; ++i) {
+    for (int j = 0; j < lower_M.cols; ++j) {
+      lower_s_coeff.a[i][j] = lower_M_pos.a[i][j] * alpha_l.v[j] +
+                              lower_M_neg.a[i][j] * alpha_u.v[j];
+      upper_s_coeff.a[i][j] = upper_M_pos.a[i][j] * alpha_u.v[j] +
+                              upper_M_neg.a[i][j] * alpha_l.v[j];
+    }
+  }
+
+  // [핵심] matmul에 d_W_preloaded 전달 → B행렬(W) 복사 2MB×2 = 4MB 절약/레이어
+  const Matrix new_lower_M = matmul(lower_s_coeff, W, d_W_preloaded);
+  const Matrix new_upper_M = matmul(upper_s_coeff, W, d_W_preloaded);
+
+  const Vector term_lp = vec_add(elemwise_mul(alpha_l, b), beta_l);
+  const Vector term_ln = vec_add(elemwise_mul(alpha_u, b), beta_u);
+  const Vector new_lower_p = vec_add(
+      vec_add(matvec(lower_M_pos, term_lp), matvec(lower_M_neg, term_ln)), lower_p);
+
+  const Vector term_up = vec_add(elemwise_mul(alpha_u, b), beta_u);
+  const Vector term_un = vec_add(elemwise_mul(alpha_l, b), beta_l);
+  const Vector new_upper_p = vec_add(
+      vec_add(matvec(upper_M_pos, term_up), matvec(upper_M_neg, term_un)), upper_p);
+
+  lower_M = new_lower_M;
+  lower_p = new_lower_p;
+  upper_M = new_upper_M;
+  upper_p = new_upper_p;
+}
+
+// [변경] lirpa_backward_bound - net.d_W[l] 전달
+BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const Vector &x0,
+                     double eps, const Matrix *output_lower_M = nullptr,
+                     const Vector *output_lower_p = nullptr,
+                     const Matrix *output_upper_M = nullptr,
+                     const Vector *output_upper_p = nullptr) {
+
+  //std::cout << "clear lirpa_forward!\n" << std::endl;
+  const ForwardBoundResult fwd = lirpa_forward_bound(net, x0, eps);
+
+  const int output_dim = network_output_dim(net);
+  Matrix lower_M, upper_M;
+  Vector lower_p, upper_p;
+
+  if (output_lower_M) lower_M = *output_lower_M;
+  else lower_M = make_eye(output_dim);
+  if (output_upper_M) upper_M = *output_upper_M;
+  else upper_M = make_eye(output_dim);
+  if (output_lower_p) lower_p = *output_lower_p;
+  else lower_p = make_zero_vector(lower_M.rows);
+  if (output_upper_p) upper_p = *output_upper_p;
+  else upper_p = make_zero_vector(upper_M.rows);
+
+  require(lower_M.cols == output_dim && upper_M.cols == output_dim,
+          "Output spec matrix column mismatch.");
+  require(lower_M.rows == upper_M.rows, "Output spec lower/upper row mismatch.");
+  require(lower_p.n == lower_M.rows && upper_p.n == upper_M.rows,
+          "Output spec vector row mismatch.");
+
+  for (int l = net.num_layers - 1; l >= 0; --l) {
+    const LayerBound &lb = fwd.layer_bounds[l];
+    // [핵심] net.d_W[l] 전달!
+    backward_one_layer(lower_M, lower_p, upper_M, upper_p, net.W[l], net.b[l],
+                       lb.alpha_lower, lb.beta_lower, lb.alpha_upper,
+                       lb.beta_upper, net.d_W[l]);
+  }
+
+  BackwardBoundResult out;
+  out.final_affine.lower_A = lower_M;
+  out.final_affine.lower_c = lower_p;
+  out.final_affine.upper_A = upper_M;
+  out.final_affine.upper_c = upper_p;
+  out.final_lower = affine_min(lower_M, lower_p, x0, eps);
+  out.final_upper = affine_max(upper_M, upper_p, x0, eps);
+  out.num_layer_bounds = fwd.num_layer_bounds;
+  for (int i = 0; i < fwd.num_layer_bounds; ++i)
+    out.layer_bounds[i] = fwd.layer_bounds[i];
+  return out;
+}
+
+// [변경] LiRPABackwardOnly - net.d_W 활용
+class LiRPABackwardOnly {
+public:
+  BackwardBoundResult bound(const FullyConnectedNetwork &net, const Vector &x0,
+                            double eps, const Matrix *output_lower_M = nullptr,
+                            const Vector *output_lower_p = nullptr,
+                            const Matrix *output_upper_M = nullptr,
+                            const Vector *output_upper_p = nullptr) const {
+    require(x0.n == network_input_dim(net), "LiRPABackwardOnly input dimension mismatch.");
+
+    LayerBound layer_bounds[MAX_LAYERS]{};
+    for (int l = 0; l < net.num_layers; ++l)
+      layer_bounds[l] = build_one_layer_relaxation(net, l, x0, eps, layer_bounds);
+
+    const int output_dim = network_output_dim(net);
+    Matrix lower_M = output_lower_M ? *output_lower_M : make_eye(output_dim);
+    Matrix upper_M = output_upper_M ? *output_upper_M : make_eye(output_dim);
+    Vector lower_p = output_lower_p ? *output_lower_p : make_zero_vector(lower_M.rows);
+    Vector upper_p = output_upper_p ? *output_upper_p : make_zero_vector(upper_M.rows);
+
+    require(lower_M.cols == output_dim && upper_M.cols == output_dim,
+            "Output spec matrix column mismatch.");
+    require(lower_M.rows == upper_M.rows, "Output spec lower/upper row mismatch.");
+    require(lower_p.n == lower_M.rows && upper_p.n == upper_M.rows,
+            "Output spec vector row mismatch.");
+
+    for (int l = net.num_layers - 1; l >= 0; --l) {
+      const LayerBound &lb = layer_bounds[l];
+      backward_one_layer(lower_M, lower_p, upper_M, upper_p, net.W[l], net.b[l],
+                         lb.alpha_lower, lb.beta_lower, lb.alpha_upper,
+                         lb.beta_upper, net.d_W[l]);
+    }
+
+    BackwardBoundResult out;
+    out.final_affine.lower_A = lower_M;
+    out.final_affine.lower_c = lower_p;
+    out.final_affine.upper_A = upper_M;
+    out.final_affine.upper_c = upper_p;
+    out.final_lower = affine_min(lower_M, lower_p, x0, eps);
+    out.final_upper = affine_max(upper_M, upper_p, x0, eps);
+    out.num_layer_bounds = net.num_layers;
+    for (int l = 0; l < net.num_layers; ++l)
+      out.layer_bounds[l] = layer_bounds[l];
+    return out;
+  }
+
+private:
+  static void relax_activation(ActivationType act, const Vector &pre_lower,
+                               const Vector &pre_upper, Vector &alpha_l,
+                               Vector &beta_l, Vector &alpha_u, Vector &beta_u) {
+    if (act == ActivationType::Linear) {
+      alpha_l = make_zero_vector(pre_lower.n);
+      alpha_u = make_zero_vector(pre_lower.n);
+      beta_l = make_zero_vector(pre_lower.n);
+      beta_u = make_zero_vector(pre_lower.n);
+      for (int i = 0; i < pre_lower.n; ++i) { alpha_l.v[i] = 1.0; alpha_u.v[i] = 1.0; }
+    } else if (act == ActivationType::Relu) {
+      relu_relax(pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u);
+    } else if (act == ActivationType::Sigmoid) {
+      sigmoid_relax(pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u);
+    } else {
+      throw std::invalid_argument("No relaxation for activation.");
+    }
+  }
+
+  static LayerBound build_one_layer_relaxation(const FullyConnectedNetwork &net, int layer,
+                             const Vector &x0, double eps,
+                             const LayerBound *previous_layer_bounds) {
+    Matrix lower_M = net.W[layer];
+    Matrix upper_M = net.W[layer];
+    Vector lower_p = net.b[layer];
+    Vector upper_p = net.b[layer];
+
+    for (int prev = layer - 1; prev >= 0; --prev) {
+      const LayerBound &lb = previous_layer_bounds[prev];
+      backward_one_layer(lower_M, lower_p, upper_M, upper_p, net.W[prev],
+                         net.b[prev], lb.alpha_lower, lb.beta_lower,
+                         lb.alpha_upper, lb.beta_upper, net.d_W[prev]);
+    }
+
+    const Vector pre_lower = affine_min(lower_M, lower_p, x0, eps);
+    const Vector pre_upper = affine_max(upper_M, upper_p, x0, eps);
+
+    Vector alpha_l, beta_l, alpha_u, beta_u;
+    relax_activation(net.act[layer], pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u);
+
+    LayerBound out;
+    out.dim = alpha_l.n;
+    out.alpha_lower = alpha_l;
+    out.beta_lower = beta_l;
+    out.alpha_upper = alpha_u;
+    out.beta_upper = beta_u;
+    return out;
+  }
+};
+
+// ============================================================
+// XOR 데모 및 테스트
+// ============================================================
+
+void self_test_relaxations() {
+  std::mt19937_64 rng(0);
+  std::uniform_real_distribution<double> dist(-5.0, 5.0);
+  for (int t = 0; t < 200; ++t) {
+    double a = dist(rng), b = dist(rng);
+    if (a > b) std::swap(a, b);
+    if (std::abs(a - b) < 1e-8) b = a + 1e-6;
+    Vector l = make_zero_vector(1), u = make_zero_vector(1);
+    l.v[0] = a; u.v[0] = b;
+    Vector al, bl, au, bu;
+    relu_relax(l, u, al, bl, au, bu);
+    for (int k = 0; k < 201; ++k) {
+      double x = a + (b - a) * static_cast<double>(k) / 200.0;
+      double y = relu(x);
+      double lhs = al.v[0] * x + bl.v[0];
+      double rhs = au.v[0] * x + bu.v[0];
+      if (lhs > y + 1e-8 || y > rhs + 1e-8) {
+        std::cerr << "ReLU test failed!\n";
+        throw std::runtime_error("ReLU relaxation self-test failed.");
+      }
+    }
+    sigmoid_relax(l, u, al, bl, au, bu);
+    for (int k = 0; k < 201; ++k) {
+      double x = a + (b - a) * static_cast<double>(k) / 200.0;
+      double y = sigmoid(x);
+      double lhs = al.v[0] * x + bl.v[0];
+      double rhs = au.v[0] * x + bu.v[0];
+      if (lhs > y + 1e-8 || y > rhs + 1e-8)
+        throw std::runtime_error("Sigmoid relaxation self-test failed.");
+    }
+  }
+}
+
+FullyConnectedNetwork make_xor_network() {
+  int layer_in[MAX_LAYERS]{}, layer_out[MAX_LAYERS]{};
+  double W_data[MAX_LAYERS][MAX_DIM][MAX_DIM]{}, b_data[MAX_LAYERS][MAX_DIM]{};
+  std::string acts[MAX_LAYERS];
+  layer_in[0] = 2; layer_out[0] = 2; acts[0] = "relu";
+  layer_in[1] = 2; layer_out[1] = 1; acts[1] = "sigmoid";
+  W_data[0][0][0] = 2.1247;  W_data[0][0][1] = 2.1267;
+  W_data[0][1][0] = -2.1237; W_data[0][1][1] = -2.1235;
+  b_data[0][0] = -2.1259;    b_data[0][1] = 2.1234;
+  W_data[1][0][0] = -3.6788; W_data[1][0][1] = -3.6766;
+  b_data[1][0] = 3.5451;
+  return make_network(2, layer_in, layer_out, W_data, b_data, acts);
+}
+
+int xor_expected_label(const Vector &x) {
+  require(x.n >= 2, "xor_expected_label requires at least 2-dimensional input.");
+  return static_cast<int>(std::llround(x.v[0])) ^ static_cast<int>(std::llround(x.v[1]));
+}
+
+void run_xor_demo(double eps) {
+  const FullyConnectedNetwork network = make_xor_network();
+  const LiRPABackwardOnly backward_only_verifier;
+  Vector points[4];
+  for (int i = 0; i < 4; ++i) points[i] = make_zero_vector(2);
+  points[0].v[0] = 0.0; points[0].v[1] = 0.0;
+  points[1].v[0] = 0.0; points[1].v[1] = 1.0;
+  points[2].v[0] = 1.0; points[2].v[1] = 0.0;
+  points[3].v[0] = 1.0; points[3].v[1] = 1.0;
+  std::cout << "XOR network point predictions and LiRPA-certified output bounds\n";
+  std::cout << "Perturbation: L_inf epsilon = " << eps << "\n\n";
+  bool all_fwd = true, all_bwd = true, all_bwd_only = true;
+  std::cout << std::fixed << std::setprecision(6);
+  for (const auto &x0 : points) {
+    const Vector y = network_forward(network, x0);
+    const ForwardBoundResult fwd = lirpa_forward_bound(network, x0, eps);
+    const BackwardBoundResult bwd = lirpa_backward_bound(network, x0, eps);
+    const BackwardBoundResult bwd_only = backward_only_verifier.bound(network, x0, eps);
+    const int expected = xor_expected_label(x0);
+    bool fc, bc, boc; std::string cond;
+    if (expected == 1) {
+      fc = fwd.final_lower.v[0] > 0.5; bc = bwd.final_lower.v[0] > 0.5;
+      boc = bwd_only.final_lower.v[0] > 0.5; cond = "lower bound > 0.5";
+    } else {
+      fc = fwd.final_upper.v[0] < 0.5; bc = bwd.final_upper.v[0] < 0.5;
+      boc = bwd_only.final_upper.v[0] < 0.5; cond = "upper bound < 0.5";
+    }
+    all_fwd &= fc; all_bwd &= bc; all_bwd_only &= boc;
+    std::cout << "x0=[" << x0.v[0] << ", " << x0.v[1] << "], expected=" << expected
+              << ", network_output=" << y.v[0] << "\n";
+    std::cout << "  forward  bound=[" << fwd.final_lower.v[0] << ", " << fwd.final_upper.v[0]
+              << "], certified=" << (fc ? "True" : "False") << " (" << cond << ")\n";
+    std::cout << "  backward bound=[" << bwd.final_lower.v[0] << ", " << bwd.final_upper.v[0]
+              << "], certified=" << (bc ? "True" : "False") << " (" << cond << ")\n";
+    std::cout << "  backward-only bound=[" << bwd_only.final_lower.v[0] << ", " << bwd_only.final_upper.v[0]
+              << "], certified=" << (boc ? "True" : "False") << " (" << cond << ")\n";
+  }
+  std::cout << "\n";
+  std::cout << (all_fwd ? "Forward mode certifies all.\n" : "Forward mode does not certify all.\n");
+  std::cout << (all_bwd ? "Backward mode certifies all.\n" : "Backward mode does not certify all.\n");
+  std::cout << (all_bwd_only ? "Backward-only mode certifies all.\n" : "Backward-only mode does not certify all.\n");
+}
+
+} // namespace
