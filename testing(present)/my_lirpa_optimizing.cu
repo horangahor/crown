@@ -195,22 +195,6 @@ void require(bool cond, const std::string &msg) {
 }
 
 // --- CPU 원본 함수들 (성능 비교 및 백업용) ---
-Matrix make_zero_matrix_cpu(int rows, int cols) {
-  require(rows >= 0 && rows <= MAX_DIM && cols >= 0 && cols <= MAX_DIM,
-          "Matrix shape out of bounds.");
-  Matrix out;
-  out.rows = rows;
-  out.cols = cols;
-  return out;
-}
-
-Vector make_zero_vector_cpu(int n) {
-  require(n >= 0 && n <= MAX_DIM, "Vector length out of bounds.");
-  Vector out;
-  out.n = n;
-  return out;
-}
-
 Matrix make_eye_cpu(int n) {
   Matrix out = make_zero_matrix_cpu(n, n);
   for (int i = 0; i < n; ++i) {
@@ -220,7 +204,7 @@ Matrix make_eye_cpu(int n) {
 }
 
 // ============================================================
-// make 함수들 - 풀 사용으로 변경
+// make 함수들 - cpu + 풀 사용으로 변경
 // ============================================================
 
 Matrix make_zero_matrix(int rows, int cols) {
@@ -535,6 +519,16 @@ Matrix positive_part(const Matrix &A) {
   return out;
 }
 
+// Vector 양수부분만 남기기 (코드 상 분석으로는 총 4번 호출하는데 cpu로 해도 될지도? (O(n)이니까))
+// 혹시 모르니까 주석 기록은 남겨놓음(필요시 바꿀 수 있게) <== 이것도 Gpool에 올려놓기?
+Vector positive_part(const Vector& x) {
+    Vector out = make_zero_vector(x.n);
+    for (int i = 0; i < x.n; ++i) {
+        out.v[i] = pos(x.v[i]);
+    }
+    return out;
+}
+
 // negative_part (Matrix 2개 사용)
 __global__ void negative_part_gpu(const Matrix *A, Matrix *out) {
   int tid = blockDim.x * blockIdx.x + threadIdx.x;
@@ -565,6 +559,16 @@ Matrix negative_part(const Matrix &A) {
   out.rows = A.rows;
   out.cols = A.cols;
   return out;
+}
+
+// Vector 음수부분만 남기기 (총 4번 호출) (코드 상 분석으로는 총 4번 호출하는데 cpu로 해도 될지도? (O(n)이니까))
+// 혹시 모르니까 주석 기록은 남겨놓음(필요시 바꿀 수 있게) <== 이것도 Gpool에 올려놓기? , 고정값인지는 아직 모름
+Vector negative_part(const Vector& x) {
+    Vector out = make_zero_vector(x.n);
+    for (int i = 0; i < x.n; ++i) {
+        out.v[i] = neg(x.v[i]);
+    }
+    return out;
 }
 
 // Upload immutable network weights once.  The positive/negative decompositions
@@ -615,6 +619,7 @@ __global__ void rowwise_scale_gpu(const Matrix *A, const Vector *s, Matrix *out)
   }
 }
 
+// 행렬의 i번 째 행(원소들과) 벡터의 i번째 원소를 곱하기
 Matrix rowwise_scale(const Matrix &A, const Vector &s) {
   require(A.rows == s.n, "rowwise_scale shape mismatch.");
   ensure_pool();
@@ -637,7 +642,19 @@ Matrix rowwise_scale(const Matrix &A, const Vector &s) {
   return out;
 }
 
-// elemwise_mul (Vector 3개 사용)
+// backward_only_iteration에 필요한 함수 
+Matrix colwise_scale(const Matrix& A, const Vector& s) {
+    require(A.cols == s.n, "colwise_scale shape mismatch.");
+    Matrix out = make_zero_matrix(A.rows, A.cols);
+    for (int i = 0; i < A.rows; ++i) {
+        for (int j = 0; j < A.cols; ++j) {
+            out.a[i][j] = A.a[i][j] * s.v[j];
+        }
+    }
+    return out;
+}
+
+// elemwise_mul (Vector 3개 사용) 원소 개수가 같은 벡터의 같은 인덱스의 원소끼리 곱하기
 __global__ void elemwise_mul_gpu(const Vector *A, const Vector *B, Vector *C) {
   int tid = blockDim.x * blockIdx.x + threadIdx.x;
   if (tid < A->n) {
@@ -1401,6 +1418,7 @@ BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const
   return out;
 }
 
+// 얘는 재귀버전이라 CUDA로 재작성하기 쉽지 않을 것임.. ==> 이터레이션 버전 추가
 class LiRPABackwardOnly {
 public:
   BackwardBoundResult bound(const FullyConnectedNetwork &net, const Vector &x0,
