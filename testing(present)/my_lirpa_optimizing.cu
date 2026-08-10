@@ -105,6 +105,8 @@ constexpr int NUM_POOL_MAT = 3;
 constexpr int NUM_POOL_VEC = 6;
 constexpr int NUM_FWD_MAT = 6;
 constexpr int NUM_FWD_VEC = 14;
+constexpr int NUM_BWD_MAT = 10;
+constexpr int NUM_BWD_VEC = 14;
 
 struct GpuPool {
   Matrix* d_mat[NUM_POOL_MAT];        // 2MB * 3 ==> 6MB
@@ -112,6 +114,8 @@ struct GpuPool {
   // 
   Matrix* d_fwd_mat[NUM_FWD_MAT]{};
   Vector* d_fwd_vec[NUM_FWD_VEC]{};
+  Matrix* d_bwd_mat[NUM_BWD_MAT]{};
+  Vector* d_bwd_vec[NUM_BWD_VEC]{};
   // 불변 가중치 메모리 풀에 올려놓기
   Matrix* d_weight[MAX_LAYERS]{};     // 2MB * 16 ==> 32
   Matrix* d_weight_pos[MAX_LAYERS]{}; // 2MB * 16 ==> 32
@@ -130,6 +134,10 @@ struct GpuPool {
       cudaMalloc(&d_fwd_mat[i], sizeof(Matrix));
     for (int i = 0; i < NUM_FWD_VEC; ++i)
       cudaMalloc(&d_fwd_vec[i], sizeof(Vector));
+    for (int i = 0; i < NUM_BWD_MAT; ++i)
+      cudaMalloc(&d_bwd_mat[i], sizeof(Matrix));
+    for (int i = 0; i < NUM_BWD_VEC; ++i)
+      cudaMalloc(&d_bwd_vec[i], sizeof(Vector));
     initialized = true;
   }
 
@@ -143,6 +151,10 @@ struct GpuPool {
       cudaFree(d_fwd_mat[i]);
     for (int i = 0; i < NUM_FWD_VEC; ++i)
       cudaFree(d_fwd_vec[i]);
+    for (int i = 0; i < NUM_BWD_MAT; ++i)
+      cudaFree(d_bwd_mat[i]);
+    for (int i = 0; i < NUM_BWD_VEC; ++i)
+      cudaFree(d_bwd_vec[i]);
     // 메모리 해제
     for (int i = 0; i < MAX_LAYERS; ++i) {
       cudaFree(d_weight[i]);
@@ -194,15 +206,6 @@ void require(bool cond, const std::string &msg) {
   }
 }
 
-// --- CPU 원본 함수들 (성능 비교 및 백업용) ---
-Matrix make_eye_cpu(int n) {
-  Matrix out = make_zero_matrix_cpu(n, n);
-  for (int i = 0; i < n; ++i) {
-    out.a[i][i] = 1.0;
-  }
-  return out;
-}
-
 // ============================================================
 // make 함수들 - cpu + 풀 사용으로 변경
 // ============================================================
@@ -222,6 +225,15 @@ Vector make_zero_vector(int n) {
 
   Vector out{};       // CPU에서 0 초기화
   out.n = n;
+  return out;
+}
+
+// --- CPU 원본 함수 (성능 비교 및 백업용) ---
+Matrix make_eye_cpu(int n) {
+  Matrix out = make_zero_matrix(n, n);
+  for (int i = 0; i < n; ++i) {
+    out.a[i][i] = 1.0;
+  }
   return out;
 }
 
@@ -684,7 +696,7 @@ Vector elemwise_mul(const Vector &a, const Vector &b) {
 
 // CPU 원본 (비교용)
 Vector make_eps_vec_cpu(int n, double eps) {
-  Vector out = make_zero_vector_cpu(n);
+  Vector out = make_zero_vector(n);
   for (int i = 0; i < n; ++i) {
     out.v[i] = eps;
   }
@@ -1318,6 +1330,141 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
   return out;
 }
 
+__global__ void colwise_scale_gpu(const Matrix *A, const Vector *s,
+                                  Matrix *out) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = A->rows * A->cols;
+  if (tid < total) {
+    const int r = tid / A->cols;
+    const int c = tid % A->cols;
+    out->a[r][c] = A->a[r][c] * s->v[c];
+  }
+}
+
+// GPU-resident backward pass. Host copies are limited to the relaxation
+// coefficients (produced by the forward pass) and the final affine result.
+void backward_bound_gpu(const FullyConnectedNetwork &net,
+                        const ForwardBoundResult &fwd,
+                        const Matrix &initial_lower_M,
+                        const Vector &initial_lower_p,
+                        const Matrix &initial_upper_M,
+                        const Vector &initial_upper_p,
+                        Matrix &final_lower_M, Vector &final_lower_p,
+                        Matrix &final_upper_M, Vector &final_upper_p) {
+  Matrix *lower_M = g_pool.d_bwd_mat[0];
+  Matrix *upper_M = g_pool.d_bwd_mat[1];
+  Matrix *lower_pos = g_pool.d_bwd_mat[2];
+  Matrix *lower_neg = g_pool.d_bwd_mat[3];
+  Matrix *upper_pos = g_pool.d_bwd_mat[4];
+  Matrix *upper_neg = g_pool.d_bwd_mat[5];
+  Matrix *lower_coeff = g_pool.d_bwd_mat[6];
+  Matrix *upper_coeff = g_pool.d_bwd_mat[7];
+  Matrix *new_lower_M = g_pool.d_bwd_mat[8];
+  Matrix *new_upper_M = g_pool.d_bwd_mat[9];
+  Vector *lower_p = g_pool.d_bwd_vec[0];
+  Vector *upper_p = g_pool.d_bwd_vec[1];
+  Vector *alpha_l = g_pool.d_bwd_vec[2];
+  Vector *beta_l = g_pool.d_bwd_vec[3];
+  Vector *alpha_u = g_pool.d_bwd_vec[4];
+  Vector *beta_u = g_pool.d_bwd_vec[5];
+  Vector *term_lp = g_pool.d_bwd_vec[6];
+  Vector *term_ln = g_pool.d_bwd_vec[7];
+  Vector *term_up = g_pool.d_bwd_vec[8];
+  Vector *term_un = g_pool.d_bwd_vec[9];
+  Vector *tmp0 = g_pool.d_bwd_vec[10];
+  Vector *tmp1 = g_pool.d_bwd_vec[11];
+  Vector *bias = g_pool.d_bwd_vec[12];
+  Vector *new_p = g_pool.d_bwd_vec[13];
+
+  cudaMemcpy(lower_M, &initial_lower_M, sizeof(Matrix), cudaMemcpyHostToDevice);
+  cudaMemcpy(upper_M, &initial_upper_M, sizeof(Matrix), cudaMemcpyHostToDevice);
+  cudaMemcpy(lower_p, &initial_lower_p, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(upper_p, &initial_upper_p, sizeof(Vector), cudaMemcpyHostToDevice);
+
+  for (int l = net.num_layers - 1; l >= 0; --l) {
+    // The number of specification rows stays constant while propagating
+    // backward; only the matrix column dimension changes per layer.
+    const int m_rows = initial_lower_M.rows;
+    const int m_cols = net.layer_out_dim[l];
+    const int w_rows = net.layer_out_dim[l];
+    const int w_cols = net.layer_in_dim[l];
+    const int matrix_elems = m_rows * m_cols;
+    const int matrix_blocks = (matrix_elems + 255) / 256;
+    const int vector_blocks = (m_rows + 255) / 256;
+
+    cudaMemcpy(alpha_l, &fwd.layer_bounds[l].alpha_lower, sizeof(Vector), cudaMemcpyHostToDevice);
+    cudaMemcpy(beta_l, &fwd.layer_bounds[l].beta_lower, sizeof(Vector), cudaMemcpyHostToDevice);
+    cudaMemcpy(alpha_u, &fwd.layer_bounds[l].alpha_upper, sizeof(Vector), cudaMemcpyHostToDevice);
+    cudaMemcpy(beta_u, &fwd.layer_bounds[l].beta_upper, sizeof(Vector), cudaMemcpyHostToDevice);
+    set_vector_size(alpha_l, w_rows); set_vector_size(beta_l, w_rows);
+    set_vector_size(alpha_u, w_rows); set_vector_size(beta_u, w_rows);
+
+    positive_part_gpu<<<matrix_blocks, 256>>>(lower_M, lower_pos);
+    negative_part_gpu<<<matrix_blocks, 256>>>(lower_M, lower_neg);
+    positive_part_gpu<<<matrix_blocks, 256>>>(upper_M, upper_pos);
+    negative_part_gpu<<<matrix_blocks, 256>>>(upper_M, upper_neg);
+    set_matrix_shape(lower_pos, m_rows, m_cols); set_matrix_shape(lower_neg, m_rows, m_cols);
+    set_matrix_shape(upper_pos, m_rows, m_cols); set_matrix_shape(upper_neg, m_rows, m_cols);
+
+    colwise_scale_gpu<<<matrix_blocks, 256>>>(lower_pos, alpha_l, new_lower_M);
+    set_matrix_shape(new_lower_M, m_rows, m_cols);
+    colwise_scale_gpu<<<matrix_blocks, 256>>>(lower_neg, alpha_u, lower_coeff);
+    set_matrix_shape(lower_coeff, m_rows, m_cols);
+    mat_add_gpu<<<matrix_blocks, 256>>>(new_lower_M, lower_coeff, lower_coeff);
+    set_matrix_shape(lower_coeff, m_rows, m_cols);
+    colwise_scale_gpu<<<matrix_blocks, 256>>>(upper_pos, alpha_u, new_upper_M);
+    set_matrix_shape(new_upper_M, m_rows, m_cols);
+    colwise_scale_gpu<<<matrix_blocks, 256>>>(upper_neg, alpha_l, upper_coeff);
+    set_matrix_shape(upper_coeff, m_rows, m_cols);
+    mat_add_gpu<<<matrix_blocks, 256>>>(new_upper_M, upper_coeff, upper_coeff);
+    set_matrix_shape(upper_coeff, m_rows, m_cols);
+
+    matmul_gpu<<<(m_rows * w_cols + 255) / 256, 256>>>(lower_coeff,
+                                                        g_pool.d_weight[l], new_lower_M);
+    matmul_gpu<<<(m_rows * w_cols + 255) / 256, 256>>>(upper_coeff,
+                                                        g_pool.d_weight[l], new_upper_M);
+    set_matrix_shape(new_lower_M, m_rows, w_cols);
+    set_matrix_shape(new_upper_M, m_rows, w_cols);
+
+    cudaMemcpy(bias, &net.b[l], sizeof(Vector), cudaMemcpyHostToDevice);
+    set_vector_size(bias, w_rows);
+    elemwise_mul_gpu<<<(w_rows + 255) / 256, 256>>>(alpha_l, bias, term_lp);
+    set_vector_size(term_lp, w_rows);
+    vec_add_gpu<<<(w_rows + 255) / 256, 256>>>(term_lp, beta_l, term_lp);
+    elemwise_mul_gpu<<<(w_rows + 255) / 256, 256>>>(alpha_u, bias, term_ln);
+    set_vector_size(term_ln, w_rows);
+    vec_add_gpu<<<(w_rows + 255) / 256, 256>>>(term_ln, beta_u, term_ln);
+    elemwise_mul_gpu<<<(w_rows + 255) / 256, 256>>>(alpha_u, bias, term_up);
+    set_vector_size(term_up, w_rows);
+    vec_add_gpu<<<(w_rows + 255) / 256, 256>>>(term_up, beta_u, term_up);
+    elemwise_mul_gpu<<<(w_rows + 255) / 256, 256>>>(alpha_l, bias, term_un);
+    set_vector_size(term_un, w_rows);
+    vec_add_gpu<<<(w_rows + 255) / 256, 256>>>(term_un, beta_l, term_un);
+
+    matvec_gpu<<<vector_blocks, 256>>>(lower_pos, term_lp, tmp0);
+    matvec_gpu<<<vector_blocks, 256>>>(lower_neg, term_ln, tmp1);
+    set_vector_size(tmp0, m_rows); set_vector_size(tmp1, m_rows);
+    vec_add_gpu<<<vector_blocks, 256>>>(tmp0, tmp1, new_p);
+    set_vector_size(new_p, m_rows);
+    vec_add_gpu<<<vector_blocks, 256>>>(new_p, lower_p, new_p);
+    cudaMemcpy(lower_p, new_p, sizeof(Vector), cudaMemcpyDeviceToDevice);
+    matvec_gpu<<<vector_blocks, 256>>>(upper_pos, term_up, tmp0);
+    matvec_gpu<<<vector_blocks, 256>>>(upper_neg, term_un, tmp1);
+    set_vector_size(tmp0, m_rows); set_vector_size(tmp1, m_rows);
+    vec_add_gpu<<<vector_blocks, 256>>>(tmp0, tmp1, new_p);
+    set_vector_size(new_p, m_rows);
+    vec_add_gpu<<<vector_blocks, 256>>>(new_p, upper_p, new_p);
+    cudaMemcpy(upper_p, new_p, sizeof(Vector), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(lower_M, new_lower_M, sizeof(Matrix), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(upper_M, new_upper_M, sizeof(Matrix), cudaMemcpyDeviceToDevice);
+  }
+  cudaMemcpy(&final_lower_M, lower_M, sizeof(Matrix), cudaMemcpyDeviceToHost);
+  cudaMemcpy(&final_upper_M, upper_M, sizeof(Matrix), cudaMemcpyDeviceToHost);
+  cudaMemcpy(&final_lower_p, lower_p, sizeof(Vector), cudaMemcpyDeviceToHost);
+  cudaMemcpy(&final_upper_p, upper_p, sizeof(Vector), cudaMemcpyDeviceToHost);
+}
+
+// 이거 대신 backward_bound_gpu를 사용함 (로직은 동일, 다만 GPU, CPU구현에서 차이)
 void backward_one_layer(Matrix &lower_M, Vector &lower_p, Matrix &upper_M,
                         Vector &upper_p, const Matrix &W, const Vector &b,
                         const Vector &alpha_l, const Vector &beta_l,
@@ -1397,20 +1544,14 @@ BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const
   require(lower_p.n == lower_M.rows && upper_p.n == upper_M.rows,
           "Output spec vector row mismatch.");
 
-  for (int l = net.num_layers - 1; l >= 0; --l) {
-    const LayerBound &lb = fwd.layer_bounds[l];
-    backward_one_layer(lower_M, lower_p, upper_M, upper_p, net.W[l], net.b[l],
-                       lb.alpha_lower, lb.beta_lower, lb.alpha_upper,
-                       lb.beta_upper);
-  }
-
   BackwardBoundResult out;
-  out.final_affine.lower_A = lower_M;
-  out.final_affine.lower_c = lower_p;
-  out.final_affine.upper_A = upper_M;
-  out.final_affine.upper_c = upper_p;
-  out.final_lower = affine_min(lower_M, lower_p, x0, eps);
-  out.final_upper = affine_max(upper_M, upper_p, x0, eps);
+  backward_bound_gpu(net, fwd, lower_M, lower_p, upper_M, upper_p,
+                     out.final_affine.lower_A, out.final_affine.lower_c,
+                     out.final_affine.upper_A, out.final_affine.upper_c);
+  out.final_lower = affine_min(out.final_affine.lower_A,
+                               out.final_affine.lower_c, x0, eps);
+  out.final_upper = affine_max(out.final_affine.upper_A,
+                               out.final_affine.upper_c, x0, eps);
   out.num_layer_bounds = fwd.num_layer_bounds;
   for (int i = 0; i < fwd.num_layer_bounds; ++i) {
     out.layer_bounds[i] = fwd.layer_bounds[i];
