@@ -1512,6 +1512,28 @@ private:
 // XOR 데모 및 테스트 (my_lirpa.cu와 동일)
 // ============================================================
 
+FullyConnectedNetwork make_xor_network() {
+  int layer_in[MAX_LAYERS]{};
+  int layer_out[MAX_LAYERS]{};
+  double W_data[MAX_LAYERS][MAX_DIM][MAX_DIM]{};
+  double b_data[MAX_LAYERS][MAX_DIM]{};
+  std::string acts[MAX_LAYERS];
+
+  const int L = 2;
+  layer_in[0] = 2;  layer_out[0] = 2;  acts[0] = "relu";
+  layer_in[1] = 2;  layer_out[1] = 1;  acts[1] = "sigmoid";
+
+  W_data[0][0][0] = 2.1247;  W_data[0][0][1] = 2.1267;
+  W_data[0][1][0] = -2.1237; W_data[0][1][1] = -2.1235;
+  b_data[0][0] = -2.1259;    b_data[0][1] = 2.1234;
+
+  W_data[1][0][0] = -3.6788; W_data[1][0][1] = -3.6766;
+  b_data[1][0] = 3.5451;
+
+  return make_network(L, layer_in, layer_out, W_data, b_data, acts);
+}
+
+// 아래 3개의 함수는 테스트용 (임시 데이터셋 + temp 신경망)
 void self_test_relaxations() {
   std::mt19937_64 rng(0);
   std::uniform_real_distribution<double> dist(-5.0, 5.0);
@@ -1555,27 +1577,6 @@ void self_test_relaxations() {
       }
     }
   }
-}
-
-FullyConnectedNetwork make_xor_network() {
-  int layer_in[MAX_LAYERS]{};
-  int layer_out[MAX_LAYERS]{};
-  double W_data[MAX_LAYERS][MAX_DIM][MAX_DIM]{};
-  double b_data[MAX_LAYERS][MAX_DIM]{};
-  std::string acts[MAX_LAYERS];
-
-  const int L = 2;
-  layer_in[0] = 2;  layer_out[0] = 2;  acts[0] = "relu";
-  layer_in[1] = 2;  layer_out[1] = 1;  acts[1] = "sigmoid";
-
-  W_data[0][0][0] = 2.1247;  W_data[0][0][1] = 2.1267;
-  W_data[0][1][0] = -2.1237; W_data[0][1][1] = -2.1235;
-  b_data[0][0] = -2.1259;    b_data[0][1] = 2.1234;
-
-  W_data[1][0][0] = -3.6788; W_data[1][0][1] = -3.6766;
-  b_data[1][0] = 3.5451;
-
-  return make_network(L, layer_in, layer_out, W_data, b_data, acts);
 }
 
 int xor_expected_label(const Vector &x) {
