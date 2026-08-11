@@ -844,6 +844,10 @@ __global__ void matmul_pair_add_gpu(const Matrix *A1, const Matrix *B1,
                                     Matrix *out) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = A1->rows * B1->cols;
+  if (tid == 0) {
+    out->rows = A1->rows;
+    out->cols = B1->cols;
+  }
   if (tid < total) {
     const int r = tid / B1->cols;
     const int c = tid % B1->cols;
@@ -860,6 +864,7 @@ __global__ void matvec_pair_bias_gpu(const Matrix *A1, const Vector *x1,
                                      const Matrix *A2, const Vector *x2,
                                      const Vector *bias, Vector *out) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid == 0) out->n = A1->rows;
   if (tid < A1->rows) {
     double sum = bias->v[tid];
     for (int j = 0; j < A1->cols; ++j) {
@@ -885,6 +890,10 @@ __global__ void elemwise_affine_pair_gpu(
     const Vector *upper_value, const Vector *upper_beta,
     Vector *lower_out, Vector *upper_out) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid == 0) {
+    lower_out->n = lower_alpha->n;
+    upper_out->n = lower_alpha->n;
+  }
   if (tid < lower_alpha->n) {
     lower_out->v[tid] = lower_alpha->v[tid] * lower_value->v[tid]
                       + lower_beta->v[tid];
@@ -899,6 +908,12 @@ __global__ void rowwise_scale_pair_gpu(
     Matrix *lower_out, Matrix *upper_out) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = lower_in->rows * lower_in->cols;
+  if (tid == 0) {
+    lower_out->rows = lower_in->rows;
+    lower_out->cols = lower_in->cols;
+    upper_out->rows = upper_in->rows;
+    upper_out->cols = upper_in->cols;
+  }
   if (tid < total) {
     const int r = tid / lower_in->cols;
     const int c = tid % lower_in->cols;
@@ -913,6 +928,10 @@ __global__ void affine_minmax_pair_gpu(
     const Vector *xl, const Vector *xu,
     Vector *lower_out, Vector *upper_out) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid == 0) {
+    lower_out->n = lower_A->rows;
+    upper_out->n = upper_A->rows;
+  }
   if (tid < lower_A->rows) {
     double lower_sum = lower_c->v[tid];
     double upper_sum = upper_c->v[tid];
@@ -933,6 +952,12 @@ __global__ void relu_relax_full_gpu(const Vector *lower, const Vector *upper,
                                     Vector *alpha_l, Vector *beta_l,
                                     Vector *alpha_u, Vector *beta_u) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid == 0) {
+    alpha_l->n = lower->n;
+    beta_l->n = lower->n;
+    alpha_u->n = lower->n;
+    beta_u->n = lower->n;
+  }
   if (tid >= lower->n) return;
   const double l = lower->v[tid];
   const double u = upper->v[tid];
@@ -953,6 +978,12 @@ __global__ void relu_relax_full_gpu(const Vector *lower, const Vector *upper,
 __global__ void linear_relax_full_gpu(Vector *alpha_l, Vector *beta_l,
                                       Vector *alpha_u, Vector *beta_u, int n) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid == 0) {
+    alpha_l->n = n;
+    beta_l->n = n;
+    alpha_u->n = n;
+    beta_u->n = n;
+  }
   if (tid < n) {
     alpha_l->v[tid] = 1.0; beta_l->v[tid] = 0.0;
     alpha_u->v[tid] = 1.0; beta_u->v[tid] = 0.0;
@@ -1287,12 +1318,10 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
     // ---------------------------------------------------------
     matmul_pair_add_gpu<<<matrix_blocks, 256>>>(
         d_W_pos, lower_A, d_W_neg, upper_A, pre_lower_A);
-    set_matrix_shape(pre_lower_A, weight_rows, in_dim);
     
     // 원본: pre.upper_A = W_pos*upper_A + W_neg*lower_A
     matmul_pair_add_gpu<<<matrix_blocks, 256>>>(
         d_W_pos, upper_A, d_W_neg, lower_A, pre_upper_A);
-    set_matrix_shape(pre_upper_A, weight_rows, in_dim);
 
     // ---------------------------------------------------------
     // [편향(Bias) 계산] 원본: pre.lower_c = W_pos*lower_c + W_neg*upper_c + b
@@ -1303,17 +1332,14 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
         d_W_pos, lower_c, d_W_neg, upper_c, tmp_v1, pre_lower_c);
     // pre_lower_c is reused as the next kernel's input, so its header must
     // be valid before that kernel reads pre_lower_c->n.
-    set_vector_size(pre_lower_c, weight_rows);
     
     // CPU에 있는 net.b[l]만 어쩔 수 없이 아주 잠깐 복사해옴 (크기가 작아 부담 적음)
     // pre.lower_c = pre.lower_c + b (덮어쓰기 In-place 연산!)
-    set_vector_size(pre_lower_c, weight_rows);
     
     // 원본: pre.upper_c = W_pos*upper_c + W_neg*lower_c + b
     matvec_pair_bias_gpu<<<vector_blocks, 256>>>(
         d_W_pos, upper_c, d_W_neg, lower_c, tmp_v1, pre_upper_c);
     // Same requirement for the in-place bias addition below.
-    set_vector_size(pre_upper_c, weight_rows);
 
     // ---------------------------------------------------------
     // [구체적 수치로 변환] 원본: pre_lower = affine_min(pre.lower_A, ...)
@@ -1321,9 +1347,6 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
     affine_minmax_pair_gpu<<<vector_blocks, 256>>>(
         pre_lower_A, pre_lower_c, pre_upper_A, pre_upper_c,
         d_xl, d_xu, pre_lower, pre_upper);
-    set_vector_size(pre_lower, weight_rows); set_vector_size(pre_upper, weight_rows);
-    set_vector_size(alpha_l, weight_rows); set_vector_size(beta_l, weight_rows);
-    set_vector_size(alpha_u, weight_rows); set_vector_size(beta_u, weight_rows);
     
     // ---------------------------------------------------------
     // [Relaxation (샌드위치 이완)] 원본: relu_relax(pre_lower, ...)
@@ -1350,15 +1373,12 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
     // ---------------------------------------------------------
     rowwise_scale_pair_gpu<<<matrix_blocks, 256>>>(
         pre_lower_A, alpha_l, pre_upper_A, alpha_u, lower_A, upper_A);
-    set_matrix_shape(lower_A, weight_rows, in_dim); set_matrix_shape(upper_A, weight_rows, in_dim);
     
     // 원본: post.lower_c = (pre.lower_c * alpha_l) + beta_l
     elemwise_affine_pair_gpu<<<vector_blocks, 256>>>(
         alpha_l, pre_lower_c, beta_l,
         alpha_u, pre_upper_c, beta_u,
         lower_c, upper_c);
-    set_vector_size(lower_c, weight_rows);
-    set_vector_size(upper_c, weight_rows);
 
     out.layer_bounds[l].dim = weight_rows;
     cudaMemcpy(&out.layer_bounds[l].alpha_lower, alpha_l, sizeof(Vector), cudaMemcpyDeviceToHost);
@@ -1416,6 +1436,16 @@ __global__ void split_pos_neg_pair_gpu(
     Matrix *upper_pos, Matrix *upper_neg) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = lower_in->rows * lower_in->cols;
+  if (tid == 0) {
+    lower_pos->rows = lower_in->rows;
+    lower_pos->cols = lower_in->cols;
+    lower_neg->rows = lower_in->rows;
+    lower_neg->cols = lower_in->cols;
+    upper_pos->rows = upper_in->rows;
+    upper_pos->cols = upper_in->cols;
+    upper_neg->rows = upper_in->rows;
+    upper_neg->cols = upper_in->cols;
+  }
   if (tid < total) {
     const int r = tid / lower_in->cols;
     const int c = tid % lower_in->cols;
@@ -1447,6 +1477,12 @@ __global__ void build_coeff_pair_fused_gpu(
     Matrix *lower_out, Matrix *upper_out) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = lower_in->rows * lower_in->cols;
+  if (tid == 0) {
+    lower_out->rows = lower_in->rows;
+    lower_out->cols = lower_in->cols;
+    upper_out->rows = upper_in->rows;
+    upper_out->cols = upper_in->cols;
+  }
   if (tid < total) {
     const int r = tid / lower_in->cols;
     const int c = tid % lower_in->cols;
@@ -1474,6 +1510,10 @@ __global__ void affine_term_pair_fused_gpu(
     const Vector *alpha_u, const Vector *beta_u,
     const Vector *bias, Vector *lower_out, Vector *upper_out) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid == 0) {
+    lower_out->n = alpha_l->n;
+    upper_out->n = alpha_l->n;
+  }
   if (tid < alpha_l->n) {
     lower_out->v[tid] = alpha_l->v[tid] * bias->v[tid] + beta_l->v[tid];
     upper_out->v[tid] = alpha_u->v[tid] * bias->v[tid] + beta_u->v[tid];
@@ -1504,6 +1544,10 @@ __global__ void backward_bias_pair_fused_gpu(
     const Vector *lower_old_p, const Vector *upper_old_p,
     Vector *lower_out, Vector *upper_out) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid == 0) {
+    lower_out->n = lower_pos->rows;
+    upper_out->n = upper_pos->rows;
+  }
   if (tid < lower_pos->rows) {
     double lower_sum = lower_old_p->v[tid];
     double upper_sum = upper_old_p->v[tid];
@@ -1525,6 +1569,12 @@ __global__ void backward_matmul_pair_gpu(
     Matrix *lower_out, Matrix *upper_out) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = lower_in->rows * weight->cols;
+  if (tid == 0) {
+    lower_out->rows = lower_in->rows;
+    lower_out->cols = weight->cols;
+    upper_out->rows = upper_in->rows;
+    upper_out->cols = weight->cols;
+  }
   if (tid < total) {
     const int r = tid / weight->cols;
     const int c = tid % weight->cols;
@@ -1594,37 +1644,25 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
     cudaMemcpy(beta_l, &fwd.layer_bounds[l].beta_lower, sizeof(Vector), cudaMemcpyHostToDevice);
     cudaMemcpy(alpha_u, &fwd.layer_bounds[l].alpha_upper, sizeof(Vector), cudaMemcpyHostToDevice);
     cudaMemcpy(beta_u, &fwd.layer_bounds[l].beta_upper, sizeof(Vector), cudaMemcpyHostToDevice);
-    set_vector_size(alpha_l, w_rows); set_vector_size(beta_l, w_rows);
-    set_vector_size(alpha_u, w_rows); set_vector_size(beta_u, w_rows);
 
     split_pos_neg_pair_gpu<<<matrix_blocks, 256>>>(
         lower_M, upper_M, lower_pos, lower_neg, upper_pos, upper_neg);
-    set_matrix_shape(lower_pos, m_rows, m_cols); set_matrix_shape(lower_neg, m_rows, m_cols);
-    set_matrix_shape(upper_pos, m_rows, m_cols); set_matrix_shape(upper_neg, m_rows, m_cols);
 
     build_coeff_pair_fused_gpu<<<matrix_blocks, 256>>>(
         lower_M, upper_M, alpha_l, alpha_u, lower_coeff, upper_coeff);
-    set_matrix_shape(lower_coeff, m_rows, m_cols);
-    set_matrix_shape(upper_coeff, m_rows, m_cols);
 
     backward_matmul_pair_gpu<<<(m_rows * w_cols + 255) / 256, 256>>>(
         lower_coeff, upper_coeff, g_pool.d_weight[l], new_lower_M,
         new_upper_M);
-    set_matrix_shape(new_lower_M, m_rows, w_cols);
-    set_matrix_shape(new_upper_M, m_rows, w_cols);
 
     cudaMemcpy(bias, &net.b[l], sizeof(Vector), cudaMemcpyHostToDevice);
-    set_vector_size(bias, w_rows);
     affine_term_pair_fused_gpu<<<(w_rows + 255) / 256, 256>>>(
         alpha_l, beta_l, alpha_u, beta_u, bias, term_lp, term_ln);
-    set_vector_size(term_lp, w_rows); set_vector_size(term_ln, w_rows);
 
     backward_bias_pair_fused_gpu<<<vector_blocks, 256>>>(
         lower_pos, lower_neg, upper_pos, upper_neg,
         term_lp, term_ln, term_ln, term_lp,
         lower_p, upper_p, new_lower_p, new_upper_p);
-    set_vector_size(new_lower_p, m_rows);
-    set_vector_size(new_upper_p, m_rows);
 
     // The newly computed buffers become the current state for the next
     // layer.  Swapping pointers avoids copying full matrices/vectors on GPU.
