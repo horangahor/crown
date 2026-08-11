@@ -839,6 +839,46 @@ inline void set_vector_size(Vector *d_vector, int n) {
   cudaMemcpy(d_vector, &n, sizeof(n), cudaMemcpyHostToDevice);
 }
 
+__global__ void matmul_pair_add_gpu(const Matrix *A1, const Matrix *B1,
+                                    const Matrix *A2, const Matrix *B2,
+                                    Matrix *out) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = A1->rows * B1->cols;
+  if (tid < total) {
+    const int r = tid / B1->cols;
+    const int c = tid % B1->cols;
+    double sum = 0.0;
+    for (int k = 0; k < A1->cols; ++k) {
+      sum += A1->a[r][k] * B1->a[k][c]
+           + A2->a[r][k] * B2->a[k][c];
+    }
+    out->a[r][c] = sum;
+  }
+}
+
+__global__ void matvec_pair_bias_gpu(const Matrix *A1, const Vector *x1,
+                                     const Matrix *A2, const Vector *x2,
+                                     const Vector *bias, Vector *out) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < A1->rows) {
+    double sum = bias->v[tid];
+    for (int j = 0; j < A1->cols; ++j) {
+      sum += A1->a[tid][j] * x1->v[j]
+           + A2->a[tid][j] * x2->v[j];
+    }
+    out->v[tid] = sum;
+  }
+}
+
+__global__ void elemwise_affine_fused_gpu(const Vector *alpha,
+                                           const Vector *value,
+                                           const Vector *beta, Vector *out) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < alpha->n) {
+    out->v[tid] = alpha->v[tid] * value->v[tid] + beta->v[tid];
+  }
+}
+
 __global__ void relu_relax_full_gpu(const Vector *lower, const Vector *upper,
                                     Vector *alpha_l, Vector *beta_l,
                                     Vector *alpha_u, Vector *beta_u) {
@@ -1195,48 +1235,34 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
     // ---------------------------------------------------------
     // [Pre-activation 계산] 원본: pre.lower_A = W_pos*lower_A + W_neg*upper_A
     // ---------------------------------------------------------
-    matmul_gpu<<<matrix_blocks, 256>>>(d_W_pos, lower_A, tmp_A);
-    matmul_gpu<<<matrix_blocks, 256>>>(d_W_neg, upper_A, tmp_B);
-    set_matrix_shape(tmp_A, weight_rows, in_dim);
-    set_matrix_shape(tmp_B, weight_rows, in_dim);
-    mat_add_gpu<<<matrix_blocks, 256>>>(tmp_A, tmp_B, pre_lower_A);
+    matmul_pair_add_gpu<<<matrix_blocks, 256>>>(
+        d_W_pos, lower_A, d_W_neg, upper_A, pre_lower_A);
     set_matrix_shape(pre_lower_A, weight_rows, in_dim);
     
     // 원본: pre.upper_A = W_pos*upper_A + W_neg*lower_A
-    matmul_gpu<<<matrix_blocks, 256>>>(d_W_pos, upper_A, tmp_A);
-    matmul_gpu<<<matrix_blocks, 256>>>(d_W_neg, lower_A, tmp_B);
-    set_matrix_shape(tmp_A, weight_rows, in_dim);
-    set_matrix_shape(tmp_B, weight_rows, in_dim);
-    mat_add_gpu<<<matrix_blocks, 256>>>(tmp_A, tmp_B, pre_upper_A);
+    matmul_pair_add_gpu<<<matrix_blocks, 256>>>(
+        d_W_pos, upper_A, d_W_neg, lower_A, pre_upper_A);
     set_matrix_shape(pre_upper_A, weight_rows, in_dim);
 
     // ---------------------------------------------------------
     // [편향(Bias) 계산] 원본: pre.lower_c = W_pos*lower_c + W_neg*upper_c + b
     // ---------------------------------------------------------
     const int vector_blocks = (weight_rows + 255) / 256;
-    matvec_gpu<<<vector_blocks, 256>>>(d_W_pos, lower_c, tmp_v0);
-    matvec_gpu<<<vector_blocks, 256>>>(d_W_neg, upper_c, tmp_v1);
-    set_vector_size(tmp_v0, weight_rows); set_vector_size(tmp_v1, weight_rows);
-    vec_add_gpu<<<vector_blocks, 256>>>(tmp_v0, tmp_v1, pre_lower_c);
+    cudaMemcpy(tmp_v1,&net.b[l],sizeof(Vector),cudaMemcpyHostToDevice);
+    matvec_pair_bias_gpu<<<vector_blocks, 256>>>(
+        d_W_pos, lower_c, d_W_neg, upper_c, tmp_v1, pre_lower_c);
     // pre_lower_c is reused as the next kernel's input, so its header must
     // be valid before that kernel reads pre_lower_c->n.
     set_vector_size(pre_lower_c, weight_rows);
     
     // CPU에 있는 net.b[l]만 어쩔 수 없이 아주 잠깐 복사해옴 (크기가 작아 부담 적음)
-    cudaMemcpy(tmp_v1, &net.b[l], sizeof(Vector), cudaMemcpyHostToDevice);
     // pre.lower_c = pre.lower_c + b (덮어쓰기 In-place 연산!)
-    vec_add_gpu<<<vector_blocks, 256>>>(pre_lower_c, tmp_v1, pre_lower_c);
     set_vector_size(pre_lower_c, weight_rows);
     
     // 원본: pre.upper_c = W_pos*upper_c + W_neg*lower_c + b
-    matvec_gpu<<<vector_blocks, 256>>>(d_W_pos, upper_c, tmp_v0);
-    matvec_gpu<<<vector_blocks, 256>>>(d_W_neg, lower_c, tmp_v1);
-    set_vector_size(tmp_v0, weight_rows); set_vector_size(tmp_v1, weight_rows);
-    vec_add_gpu<<<vector_blocks, 256>>>(tmp_v0, tmp_v1, pre_upper_c);
+    matvec_pair_bias_gpu<<<vector_blocks, 256>>>(
+        d_W_pos, upper_c, d_W_neg, lower_c, tmp_v1, pre_upper_c);
     // Same requirement for the in-place bias addition below.
-    set_vector_size(pre_upper_c, weight_rows);
-    cudaMemcpy(tmp_v1, &net.b[l], sizeof(Vector), cudaMemcpyHostToDevice);
-    vec_add_gpu<<<vector_blocks, 256>>>(pre_upper_c, tmp_v1, pre_upper_c);
     set_vector_size(pre_upper_c, weight_rows);
 
     // ---------------------------------------------------------
@@ -1276,15 +1302,12 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
     set_matrix_shape(lower_A, weight_rows, in_dim); set_matrix_shape(upper_A, weight_rows, in_dim);
     
     // 원본: post.lower_c = (pre.lower_c * alpha_l) + beta_l
-    elemwise_mul_gpu<<<vector_blocks, 256>>>(alpha_l, pre_lower_c, lower_c);
-    // lower_c/upper_c become inputs to the in-place bias-add kernels.
+    elemwise_affine_fused_gpu<<<vector_blocks, 256>>>(
+        alpha_l, pre_lower_c, beta_l, lower_c);
     set_vector_size(lower_c, weight_rows);
-    vec_add_gpu<<<vector_blocks, 256>>>(lower_c, beta_l, lower_c);
-    
-    elemwise_mul_gpu<<<vector_blocks, 256>>>(alpha_u, pre_upper_c, upper_c);
+    elemwise_affine_fused_gpu<<<vector_blocks, 256>>>(
+        alpha_u, pre_upper_c, beta_u, upper_c);
     set_vector_size(upper_c, weight_rows);
-    vec_add_gpu<<<vector_blocks, 256>>>(upper_c, beta_u, upper_c);
-    set_vector_size(lower_c, weight_rows); set_vector_size(upper_c, weight_rows);
 
     out.layer_bounds[l].dim = weight_rows;
     cudaMemcpy(&out.layer_bounds[l].alpha_lower, alpha_l, sizeof(Vector), cudaMemcpyDeviceToHost);
