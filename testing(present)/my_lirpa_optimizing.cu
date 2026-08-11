@@ -1396,6 +1396,30 @@ __global__ void backward_bias_fused_gpu(const Matrix *positive,
   }
 }
 
+// Compute lower and upper backward matrix products with one launch.  The
+// two products share the same immutable weight matrix and output coordinates.
+__global__ void backward_matmul_pair_gpu(
+    const Matrix *lower_in, const Matrix *upper_in, const Matrix *weight,
+    Matrix *lower_out, Matrix *upper_out) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = lower_in->rows * weight->cols;
+  if (tid < total) {
+    const int r = tid / weight->cols;
+    const int c = tid % weight->cols;
+    double lower_sum = 0.0;
+    double upper_sum = 0.0;
+    for (int k = 0; k < lower_in->cols; ++k) {
+      const double lower_value = lower_in->a[r][k];
+      const double upper_value = upper_in->a[r][k];
+      const double weight_value = weight->a[k][c];
+      if (lower_value != 0.0) lower_sum += lower_value * weight_value;
+      if (upper_value != 0.0) upper_sum += upper_value * weight_value;
+    }
+    lower_out->a[r][c] = lower_sum;
+    upper_out->a[r][c] = upper_sum;
+  }
+}
+
 // GPU-resident backward pass. Host copies are limited to the relaxation
 // coefficients (produced by the forward pass) and the final affine result.
 void backward_bound_gpu(const FullyConnectedNetwork &net,
@@ -1463,10 +1487,9 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
                                                    upper_coeff);
     set_matrix_shape(upper_coeff, m_rows, m_cols);
 
-    matmul_gpu<<<(m_rows * w_cols + 255) / 256, 256>>>(lower_coeff,
-                                                        g_pool.d_weight[l], new_lower_M);
-    matmul_gpu<<<(m_rows * w_cols + 255) / 256, 256>>>(upper_coeff,
-                                                        g_pool.d_weight[l], new_upper_M);
+    backward_matmul_pair_gpu<<<(m_rows * w_cols + 255) / 256, 256>>>(
+        lower_coeff, upper_coeff, g_pool.d_weight[l], new_lower_M,
+        new_upper_M);
     set_matrix_shape(new_lower_M, m_rows, w_cols);
     set_matrix_shape(new_upper_M, m_rows, w_cols);
 
