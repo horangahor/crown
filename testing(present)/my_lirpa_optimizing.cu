@@ -124,6 +124,7 @@ struct GpuPool {
   Matrix* d_weight[MAX_LAYERS]{};     // 2MB * 16 ==> 32
   Matrix* d_weight_pos[MAX_LAYERS]{}; // 2MB * 16 ==> 32
   Matrix* d_weight_neg[MAX_LAYERS]{}; // 2MB * 16 ==> 32
+  Vector* d_bias[MAX_LAYERS]{};
   const FullyConnectedNetwork* cached_network = nullptr;
   bool initialized = false;
 
@@ -143,6 +144,7 @@ struct GpuPool {
       cudaMalloc(&d_fwd_beta_lower[i], sizeof(Vector));
       cudaMalloc(&d_fwd_alpha_upper[i], sizeof(Vector));
       cudaMalloc(&d_fwd_beta_upper[i], sizeof(Vector));
+      cudaMalloc(&d_bias[i], sizeof(Vector));
     }
     for (int i = 0; i < NUM_BWD_MAT; ++i)
       cudaMalloc(&d_bwd_mat[i], sizeof(Matrix));
@@ -170,6 +172,8 @@ struct GpuPool {
       d_fwd_beta_lower[i] = nullptr;
       d_fwd_alpha_upper[i] = nullptr;
       d_fwd_beta_upper[i] = nullptr;
+      cudaFree(d_bias[i]);
+      d_bias[i] = nullptr;
     }
     for (int i = 0; i < NUM_BWD_MAT; ++i)
       cudaFree(d_bwd_mat[i]);
@@ -471,6 +475,37 @@ __global__ void matvec_gpu(const Matrix *A, const Vector *x, Vector *y) {
   }
 }
 
+// Device-resident bias variant used by the normal network forward pass.
+__global__ void matvec_bias_gpu(const Matrix *A, const Vector *x,
+                                const Vector *bias, Vector *y) {
+  const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+  if (tid == 0) y->n = A->rows;
+  if (tid < A->rows) {
+    double sum = bias->v[tid];
+    for (int j = 0; j < A->cols; ++j) {
+      sum += A->a[tid][j] * x->v[j];
+    }
+    y->v[tid] = sum;
+  }
+}
+
+Vector matvec_bias_device_matrix(const Matrix *d_A, int rows, int cols,
+                                 const Vector *d_bias, const Vector &x) {
+  require(cols == x.n, "matvec_bias_device_matrix shape mismatch.");
+  ensure_pool();
+  Vector y = make_zero_vector(rows);
+
+  cudaMemcpy(g_pool.d_vec[0], &x, sizeof(Vector), cudaMemcpyHostToDevice);
+
+  const int blocksPerGrid = (rows + 255) / 256;
+  matvec_bias_gpu<<<blocksPerGrid, 256>>>(d_A, g_pool.d_vec[0], d_bias,
+                                          g_pool.d_vec[1]);
+
+  cudaMemcpy(&y, g_pool.d_vec[1], sizeof(Vector), cudaMemcpyDeviceToHost);
+  y.n = rows;
+  return y;
+}
+
 Vector matvec(const Matrix &A, const Vector &x) {
   require(A.cols == x.n, "matvec shape mismatch.");
   ensure_pool();
@@ -614,6 +649,7 @@ void prepare_network_on_gpu(const FullyConnectedNetwork &net) {
     cudaMemcpy(g_pool.d_weight[l], &net.W[l], sizeof(Matrix), cudaMemcpyHostToDevice);
     cudaMemcpy(g_pool.d_weight_pos[l], &net.W[l], sizeof(Matrix), cudaMemcpyHostToDevice);
     cudaMemcpy(g_pool.d_weight_neg[l], &net.W[l], sizeof(Matrix), cudaMemcpyHostToDevice);
+    cudaMemcpy(g_pool.d_bias[l], &net.b[l], sizeof(Vector), cudaMemcpyHostToDevice);
 
     //미리 가중치 양수/음수 부분만 남겨서 메모리 풀에 저장
     //나중에 forward 같은 데에서 계속 이걸 계산할 필요가 사라짐
@@ -1287,9 +1323,9 @@ Vector network_forward(const FullyConnectedNetwork &net, const Vector &x) {
   prepare_network_on_gpu(net);
   Vector f = x;
   for (int l = 0; l < net.num_layers; ++l) {
-    Vector s = vec_add(matvec_device_matrix(g_pool.d_weight[l],
-                                             net.W[l].rows, net.W[l].cols, f),
-                       net.b[l]);
+    Vector s = matvec_bias_device_matrix(g_pool.d_weight[l],
+                                         net.W[l].rows, net.W[l].cols,
+                                         g_pool.d_bias[l], f);
     f = apply_activation(s, net.act[l]);
   }
   return f;
@@ -1327,8 +1363,6 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
   Vector *const beta_l = g_pool.d_fwd_vec[7];      // 원본: beta_l
   Vector *const alpha_u = g_pool.d_fwd_vec[8];     // 원본: alpha_u
   Vector *const beta_u = g_pool.d_fwd_vec[9];      // 원본: beta_u
-  Vector *const tmp_v0 = g_pool.d_fwd_vec[10];     // 임시 벡터 도마 1
-  Vector *const tmp_v1 = g_pool.d_fwd_vec[11];     // 임시 벡터 도마 2
   Vector *const d_xl = g_pool.d_fwd_vec[12];       // 입력 박스 최솟값 (x0 - eps)
   Vector *const d_xu = g_pool.d_fwd_vec[13];       // 입력 박스 최댓값 (x0 + eps)
 
@@ -1367,9 +1401,9 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
     // [편향(Bias) 계산] 원본: pre.lower_c = W_pos*lower_c + W_neg*upper_c + b
     // ---------------------------------------------------------
     const int vector_blocks = (weight_rows + 255) / 256;
-    cudaMemcpy(tmp_v1,&net.b[l],sizeof(Vector),cudaMemcpyHostToDevice);
+    const Vector *d_bias = g_pool.d_bias[l];
     matvec_pair_bias_gpu<<<vector_blocks, 256>>>(
-        d_W_pos, lower_c, d_W_neg, upper_c, tmp_v1, pre_lower_c);
+        d_W_pos, lower_c, d_W_neg, upper_c, d_bias, pre_lower_c);
     // pre_lower_c is reused as the next kernel's input, so its header must
     // be valid before that kernel reads pre_lower_c->n.
     
@@ -1378,7 +1412,7 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
     
     // 원본: pre.upper_c = W_pos*upper_c + W_neg*lower_c + b
     matvec_pair_bias_gpu<<<vector_blocks, 256>>>(
-        d_W_pos, upper_c, d_W_neg, lower_c, tmp_v1, pre_upper_c);
+        d_W_pos, upper_c, d_W_neg, lower_c, d_bias, pre_upper_c);
     // Same requirement for the in-place bias addition below.
 
     // ---------------------------------------------------------
@@ -1666,7 +1700,6 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
   Vector *term_ln = g_pool.d_bwd_vec[7];
   Vector *new_lower_p = g_pool.d_bwd_vec[10];
   Vector *new_upper_p = g_pool.d_bwd_vec[11];
-  Vector *bias = g_pool.d_bwd_vec[12];
 
   cudaMemcpy(lower_M, &initial_lower_M, sizeof(Matrix), cudaMemcpyHostToDevice);
   cudaMemcpy(upper_M, &initial_upper_M, sizeof(Matrix), cudaMemcpyHostToDevice);
@@ -1699,7 +1732,7 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
         lower_coeff, upper_coeff, g_pool.d_weight[l], new_lower_M,
         new_upper_M);
 
-    cudaMemcpy(bias, &net.b[l], sizeof(Vector), cudaMemcpyHostToDevice);
+    const Vector *bias = g_pool.d_bias[l];
     affine_term_pair_fused_gpu<<<(w_rows + 255) / 256, 256>>>(
         alpha_l, beta_l, alpha_u, beta_u, bias, term_lp, term_ln);
 
