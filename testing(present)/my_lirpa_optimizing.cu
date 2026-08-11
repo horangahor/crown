@@ -879,6 +879,56 @@ __global__ void elemwise_affine_fused_gpu(const Vector *alpha,
   }
 }
 
+__global__ void elemwise_affine_pair_gpu(
+    const Vector *lower_alpha, const Vector *lower_value,
+    const Vector *lower_beta, const Vector *upper_alpha,
+    const Vector *upper_value, const Vector *upper_beta,
+    Vector *lower_out, Vector *upper_out) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < lower_alpha->n) {
+    lower_out->v[tid] = lower_alpha->v[tid] * lower_value->v[tid]
+                      + lower_beta->v[tid];
+    upper_out->v[tid] = upper_alpha->v[tid] * upper_value->v[tid]
+                      + upper_beta->v[tid];
+  }
+}
+
+__global__ void rowwise_scale_pair_gpu(
+    const Matrix *lower_in, const Vector *lower_scale,
+    const Matrix *upper_in, const Vector *upper_scale,
+    Matrix *lower_out, Matrix *upper_out) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = lower_in->rows * lower_in->cols;
+  if (tid < total) {
+    const int r = tid / lower_in->cols;
+    const int c = tid % lower_in->cols;
+    lower_out->a[r][c] = lower_in->a[r][c] * lower_scale->v[r];
+    upper_out->a[r][c] = upper_in->a[r][c] * upper_scale->v[r];
+  }
+}
+
+__global__ void affine_minmax_pair_gpu(
+    const Matrix *lower_A, const Vector *lower_c,
+    const Matrix *upper_A, const Vector *upper_c,
+    const Vector *xl, const Vector *xu,
+    Vector *lower_out, Vector *upper_out) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < lower_A->rows) {
+    double lower_sum = lower_c->v[tid];
+    double upper_sum = upper_c->v[tid];
+    for (int j = 0; j < lower_A->cols; ++j) {
+      const double lower_value = lower_A->a[tid][j];
+      const double upper_value = upper_A->a[tid][j];
+      lower_sum += pos(lower_value) * xl->v[j]
+                 + neg(lower_value) * xu->v[j];
+      upper_sum += pos(upper_value) * xu->v[j]
+                 + neg(upper_value) * xl->v[j];
+    }
+    lower_out->v[tid] = lower_sum;
+    upper_out->v[tid] = upper_sum;
+  }
+}
+
 __global__ void relu_relax_full_gpu(const Vector *lower, const Vector *upper,
                                     Vector *alpha_l, Vector *beta_l,
                                     Vector *alpha_u, Vector *beta_u) {
@@ -1268,8 +1318,9 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
     // ---------------------------------------------------------
     // [구체적 수치로 변환] 원본: pre_lower = affine_min(pre.lower_A, ...)
     // ---------------------------------------------------------
-    affine_min_gpu<<<vector_blocks, 256>>>(pre_lower_A, pre_lower_c, d_xl, d_xu, pre_lower);
-    affine_max_gpu<<<vector_blocks, 256>>>(pre_upper_A, pre_upper_c, d_xl, d_xu, pre_upper);
+    affine_minmax_pair_gpu<<<vector_blocks, 256>>>(
+        pre_lower_A, pre_lower_c, pre_upper_A, pre_upper_c,
+        d_xl, d_xu, pre_lower, pre_upper);
     set_vector_size(pre_lower, weight_rows); set_vector_size(pre_upper, weight_rows);
     set_vector_size(alpha_l, weight_rows); set_vector_size(beta_l, weight_rows);
     set_vector_size(alpha_u, weight_rows); set_vector_size(beta_u, weight_rows);
@@ -1297,16 +1348,16 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
     // [Post-activation 갱신] 원본: post.lower_A = pre.lower_A * alpha_l
     // 여기서 생성된 post.lower_A를 다음 루프를 위해 current.lower_A(lower_A) 자리에 덮어쓰기
     // ---------------------------------------------------------
-    rowwise_scale_gpu<<<matrix_blocks, 256>>>(pre_lower_A, alpha_l, lower_A);
-    rowwise_scale_gpu<<<matrix_blocks, 256>>>(pre_upper_A, alpha_u, upper_A);
+    rowwise_scale_pair_gpu<<<matrix_blocks, 256>>>(
+        pre_lower_A, alpha_l, pre_upper_A, alpha_u, lower_A, upper_A);
     set_matrix_shape(lower_A, weight_rows, in_dim); set_matrix_shape(upper_A, weight_rows, in_dim);
     
     // 원본: post.lower_c = (pre.lower_c * alpha_l) + beta_l
-    elemwise_affine_fused_gpu<<<vector_blocks, 256>>>(
-        alpha_l, pre_lower_c, beta_l, lower_c);
+    elemwise_affine_pair_gpu<<<vector_blocks, 256>>>(
+        alpha_l, pre_lower_c, beta_l,
+        alpha_u, pre_upper_c, beta_u,
+        lower_c, upper_c);
     set_vector_size(lower_c, weight_rows);
-    elemwise_affine_fused_gpu<<<vector_blocks, 256>>>(
-        alpha_u, pre_upper_c, beta_u, upper_c);
     set_vector_size(upper_c, weight_rows);
 
     out.layer_bounds[l].dim = weight_rows;
@@ -1359,6 +1410,24 @@ __global__ void split_pos_neg_gpu(const Matrix *in, Matrix *positive,
   }
 }
 
+__global__ void split_pos_neg_pair_gpu(
+    const Matrix *lower_in, const Matrix *upper_in,
+    Matrix *lower_pos, Matrix *lower_neg,
+    Matrix *upper_pos, Matrix *upper_neg) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = lower_in->rows * lower_in->cols;
+  if (tid < total) {
+    const int r = tid / lower_in->cols;
+    const int c = tid % lower_in->cols;
+    const double lower_value = lower_in->a[r][c];
+    const double upper_value = upper_in->a[r][c];
+    lower_pos->a[r][c] = lower_value > 0.0 ? lower_value : 0.0;
+    lower_neg->a[r][c] = lower_value < 0.0 ? lower_value : 0.0;
+    upper_pos->a[r][c] = upper_value > 0.0 ? upper_value : 0.0;
+    upper_neg->a[r][c] = upper_value < 0.0 ? upper_value : 0.0;
+  }
+}
+
 __global__ void build_coeff_fused_gpu(const Matrix *in, const Vector *positive_scale,
                                       const Vector *negative_scale, Matrix *out) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1397,6 +1466,17 @@ __global__ void affine_term_fused_gpu(const Vector *alpha, const Vector *beta,
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid < alpha->n) {
     out->v[tid] = alpha->v[tid] * bias->v[tid] + beta->v[tid];
+  }
+}
+
+__global__ void affine_term_pair_fused_gpu(
+    const Vector *alpha_l, const Vector *beta_l,
+    const Vector *alpha_u, const Vector *beta_u,
+    const Vector *bias, Vector *lower_out, Vector *upper_out) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < alpha_l->n) {
+    lower_out->v[tid] = alpha_l->v[tid] * bias->v[tid] + beta_l->v[tid];
+    upper_out->v[tid] = alpha_u->v[tid] * bias->v[tid] + beta_u->v[tid];
   }
 }
 
@@ -1517,8 +1597,8 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
     set_vector_size(alpha_l, w_rows); set_vector_size(beta_l, w_rows);
     set_vector_size(alpha_u, w_rows); set_vector_size(beta_u, w_rows);
 
-    split_pos_neg_gpu<<<matrix_blocks, 256>>>(lower_M, lower_pos, lower_neg);
-    split_pos_neg_gpu<<<matrix_blocks, 256>>>(upper_M, upper_pos, upper_neg);
+    split_pos_neg_pair_gpu<<<matrix_blocks, 256>>>(
+        lower_M, upper_M, lower_pos, lower_neg, upper_pos, upper_neg);
     set_matrix_shape(lower_pos, m_rows, m_cols); set_matrix_shape(lower_neg, m_rows, m_cols);
     set_matrix_shape(upper_pos, m_rows, m_cols); set_matrix_shape(upper_neg, m_rows, m_cols);
 
@@ -1535,10 +1615,8 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
 
     cudaMemcpy(bias, &net.b[l], sizeof(Vector), cudaMemcpyHostToDevice);
     set_vector_size(bias, w_rows);
-    affine_term_fused_gpu<<<(w_rows + 255) / 256, 256>>>(alpha_l, beta_l,
-                                                          bias, term_lp);
-    affine_term_fused_gpu<<<(w_rows + 255) / 256, 256>>>(alpha_u, beta_u,
-                                                          bias, term_ln);
+    affine_term_pair_fused_gpu<<<(w_rows + 255) / 256, 256>>>(
+        alpha_l, beta_l, alpha_u, beta_u, bias, term_lp, term_ln);
     set_vector_size(term_lp, w_rows); set_vector_size(term_ln, w_rows);
 
     backward_bias_pair_fused_gpu<<<vector_blocks, 256>>>(
