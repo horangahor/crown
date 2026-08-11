@@ -1416,6 +1416,28 @@ __global__ void backward_bias_fused_gpu(const Matrix *positive,
   }
 }
 
+__global__ void backward_bias_pair_fused_gpu(
+    const Matrix *lower_pos, const Matrix *lower_neg,
+    const Matrix *upper_pos, const Matrix *upper_neg,
+    const Vector *lower_positive_term, const Vector *lower_negative_term,
+    const Vector *upper_positive_term, const Vector *upper_negative_term,
+    const Vector *lower_old_p, const Vector *upper_old_p,
+    Vector *lower_out, Vector *upper_out) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < lower_pos->rows) {
+    double lower_sum = lower_old_p->v[tid];
+    double upper_sum = upper_old_p->v[tid];
+    for (int j = 0; j < lower_pos->cols; ++j) {
+      lower_sum += lower_pos->a[tid][j] * lower_positive_term->v[j]
+                 + lower_neg->a[tid][j] * lower_negative_term->v[j];
+      upper_sum += upper_pos->a[tid][j] * upper_positive_term->v[j]
+                 + upper_neg->a[tid][j] * upper_negative_term->v[j];
+    }
+    lower_out->v[tid] = lower_sum;
+    upper_out->v[tid] = upper_sum;
+  }
+}
+
 // Compute lower and upper backward matrix products with one launch.  The
 // two products share the same immutable weight matrix and output coordinates.
 __global__ void backward_matmul_pair_gpu(
@@ -1519,13 +1541,11 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
                                                           bias, term_ln);
     set_vector_size(term_lp, w_rows); set_vector_size(term_ln, w_rows);
 
-    backward_bias_fused_gpu<<<vector_blocks, 256>>>(lower_pos, lower_neg,
-                                                     term_lp, term_ln,
-                                                     lower_p, new_lower_p);
+    backward_bias_pair_fused_gpu<<<vector_blocks, 256>>>(
+        lower_pos, lower_neg, upper_pos, upper_neg,
+        term_lp, term_ln, term_ln, term_lp,
+        lower_p, upper_p, new_lower_p, new_upper_p);
     set_vector_size(new_lower_p, m_rows);
-    backward_bias_fused_gpu<<<vector_blocks, 256>>>(upper_pos, upper_neg,
-                                                     term_ln, term_lp,
-                                                     upper_p, new_upper_p);
     set_vector_size(new_upper_p, m_rows);
 
     // The newly computed buffers become the current state for the next
