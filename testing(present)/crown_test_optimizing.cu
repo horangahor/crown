@@ -185,7 +185,7 @@ int main(int argc, char** argv){
     // 여기서 선언시 BackwardBoundResult 빈 공간(4MB 할당 + 자잘한 벡터들까지 해서 넉넉히 0.25MB )
     // 내부 함수에 진입해서 보면 거의 64MB가 필요함 (함수 주석 참고) <== 근데 64MB 안되서 128MB로 함
     // 왜인지는 모르겠다 너무 함수가 복잡해져서..
-    BackwardBoundResult bwd = lirpa_backward_bound(*net, x0, eps);
+    BackwardBoundResult bwd = lirpa_backward_bound(*net, x0, eps, false);
 
     // 시간 측정 종료
     auto t_end = std::chrono::high_resolution_clock::now();

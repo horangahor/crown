@@ -1335,8 +1335,10 @@ Vector network_forward(const FullyConnectedNetwork &net, const Vector &x) {
 // CROWN 알고리즘 (my_lirpa.cu와 동일한 로직)
 // ============================================================
 
-ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
-                                       const Vector &x0, double eps) {
+// materialze_host_result : 호스트(cpu)로 전달(memcpy)해줄지 결정 , true면 전달 false면 전달x
+ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
+                                            const Vector &x0, double eps,
+                                            bool materialize_host_results) {
   require(x0.n == network_input_dim(net),
           "lirpa_forward_bound input dimension mismatch.");
   prepare_network_on_gpu(net);
@@ -1462,30 +1464,39 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
         alpha_u, pre_upper_c, beta_u,
         lower_c, upper_c);
 
-    out.layer_bounds[l].dim = weight_rows;
-    cudaMemcpy(&out.layer_bounds[l].alpha_lower, alpha_l, sizeof(Vector), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&out.layer_bounds[l].beta_lower, beta_l, sizeof(Vector), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&out.layer_bounds[l].alpha_upper, alpha_u, sizeof(Vector), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&out.layer_bounds[l].beta_upper, beta_u, sizeof(Vector), cudaMemcpyDeviceToHost);
-    out.layer_bounds[l].alpha_lower.n = out.layer_bounds[l].beta_lower.n = weight_rows;
-    out.layer_bounds[l].alpha_upper.n = out.layer_bounds[l].beta_upper.n = weight_rows;
+    if (materialize_host_results) {
+      out.layer_bounds[l].dim = weight_rows;
+      cudaMemcpy(&out.layer_bounds[l].alpha_lower, alpha_l, sizeof(Vector), cudaMemcpyDeviceToHost);
+      cudaMemcpy(&out.layer_bounds[l].beta_lower, beta_l, sizeof(Vector), cudaMemcpyDeviceToHost);
+      cudaMemcpy(&out.layer_bounds[l].alpha_upper, alpha_u, sizeof(Vector), cudaMemcpyDeviceToHost);
+      cudaMemcpy(&out.layer_bounds[l].beta_upper, beta_u, sizeof(Vector), cudaMemcpyDeviceToHost);
+      out.layer_bounds[l].alpha_lower.n = out.layer_bounds[l].beta_lower.n = weight_rows;
+      out.layer_bounds[l].alpha_upper.n = out.layer_bounds[l].beta_upper.n = weight_rows;
+    }
   }
   // ---------------------------------------------------------
   // 3. [최종 도출] 다 끝난 lower_A, lower_c 등을 최종 결과에 담아서 리턴
   // ---------------------------------------------------------
-  cudaMemcpy(&out.final_affine.lower_A, lower_A, sizeof(Matrix), cudaMemcpyDeviceToHost);
-  cudaMemcpy(&out.final_affine.upper_A, upper_A, sizeof(Matrix), cudaMemcpyDeviceToHost);
-  cudaMemcpy(&out.final_affine.lower_c, lower_c, sizeof(Vector), cudaMemcpyDeviceToHost);
-  cudaMemcpy(&out.final_affine.upper_c, upper_c, sizeof(Vector), cudaMemcpyDeviceToHost);
-  const int out_dim = network_output_dim(net);
-  out.final_affine.lower_A.rows = out.final_affine.upper_A.rows = out_dim;
-  out.final_affine.lower_A.cols = out.final_affine.upper_A.cols = in_dim;
-  out.final_affine.lower_c.n = out.final_affine.upper_c.n = out_dim;
+  if (materialize_host_results) {
+    cudaMemcpy(&out.final_affine.lower_A, lower_A, sizeof(Matrix), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&out.final_affine.upper_A, upper_A, sizeof(Matrix), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&out.final_affine.lower_c, lower_c, sizeof(Vector), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&out.final_affine.upper_c, upper_c, sizeof(Vector), cudaMemcpyDeviceToHost);
+    const int out_dim = network_output_dim(net);
+    out.final_affine.lower_A.rows = out.final_affine.upper_A.rows = out_dim;
+    out.final_affine.lower_A.cols = out.final_affine.upper_A.cols = in_dim;
+    out.final_affine.lower_c.n = out.final_affine.upper_c.n = out_dim;
   
   // 최종 점수(수치) 도출
-  out.final_lower = affine_min(out.final_affine.lower_A, out.final_affine.lower_c, x0, eps);
-  out.final_upper = affine_max(out.final_affine.upper_A, out.final_affine.upper_c, x0, eps);
+    out.final_lower = affine_min(out.final_affine.lower_A, out.final_affine.lower_c, x0, eps);
+    out.final_upper = affine_max(out.final_affine.upper_A, out.final_affine.upper_c, x0, eps);
+  }
   return out;
+}
+
+ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
+                                       const Vector &x0, double eps) {
+  return lirpa_forward_bound_impl(net, x0, eps, true);
 }
 
 __global__ void colwise_scale_gpu(const Matrix *A, const Vector *s,
@@ -1803,14 +1814,18 @@ void backward_one_layer(Matrix &lower_M, Vector &lower_p, Matrix &upper_M,
   upper_p = new_upper_p;
 }
 
+// materialize_forward_results : forward의 결과를 
 BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const Vector &x0,
-                     double eps, const Matrix *output_lower_M = nullptr,
+                     double eps, bool materialize_forward_results = true,
+                     const Matrix *output_lower_M = nullptr,
                      const Vector *output_lower_p = nullptr,
                      const Matrix *output_upper_M = nullptr,
-                     const Vector *output_upper_p = nullptr) {
+                     const Vector *output_upper_p = nullptr
+                     ) {
 
   //std::cout << "clear lirpa_forward!\n" << std::endl;
-  const ForwardBoundResult fwd = lirpa_forward_bound(net, x0, eps);
+  const ForwardBoundResult fwd =
+      lirpa_forward_bound_impl(net, x0, eps, materialize_forward_results);
 
   const int output_dim = network_output_dim(net);
   Matrix lower_M;
@@ -1843,8 +1858,12 @@ BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const
   out.final_upper = affine_max(out.final_affine.upper_A,
                                out.final_affine.upper_c, x0, eps);
   out.num_layer_bounds = fwd.num_layer_bounds;
-  for (int i = 0; i < fwd.num_layer_bounds; ++i) {
-    out.layer_bounds[i] = fwd.layer_bounds[i];
+
+  // forward에서 얻은 중간 계산 결과 스킵
+  if (materialize_forward_results) {
+    for (int i = 0; i < fwd.num_layer_bounds; ++i) {
+      out.layer_bounds[i] = fwd.layer_bounds[i];
+    }
   }
   return out;
 }
