@@ -1372,6 +1372,26 @@ __global__ void build_coeff_fused_gpu(const Matrix *in, const Vector *positive_s
   }
 }
 
+__global__ void build_coeff_pair_fused_gpu(
+    const Matrix *lower_in, const Matrix *upper_in,
+    const Vector *alpha_l, const Vector *alpha_u,
+    Matrix *lower_out, Matrix *upper_out) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = lower_in->rows * lower_in->cols;
+  if (tid < total) {
+    const int r = tid / lower_in->cols;
+    const int c = tid % lower_in->cols;
+    const double lower_value = lower_in->a[r][c];
+    const double upper_value = upper_in->a[r][c];
+    lower_out->a[r][c] = lower_value > 0.0
+        ? lower_value * alpha_l->v[c]
+        : lower_value * alpha_u->v[c];
+    upper_out->a[r][c] = upper_value > 0.0
+        ? upper_value * alpha_u->v[c]
+        : upper_value * alpha_l->v[c];
+  }
+}
+
 __global__ void affine_term_fused_gpu(const Vector *alpha, const Vector *beta,
                                       const Vector *bias, Vector *out) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1480,11 +1500,9 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
     set_matrix_shape(lower_pos, m_rows, m_cols); set_matrix_shape(lower_neg, m_rows, m_cols);
     set_matrix_shape(upper_pos, m_rows, m_cols); set_matrix_shape(upper_neg, m_rows, m_cols);
 
-    build_coeff_fused_gpu<<<matrix_blocks, 256>>>(lower_M, alpha_l, alpha_u,
-                                                   lower_coeff);
+    build_coeff_pair_fused_gpu<<<matrix_blocks, 256>>>(
+        lower_M, upper_M, alpha_l, alpha_u, lower_coeff, upper_coeff);
     set_matrix_shape(lower_coeff, m_rows, m_cols);
-    build_coeff_fused_gpu<<<matrix_blocks, 256>>>(upper_M, alpha_u, alpha_l,
-                                                   upper_coeff);
     set_matrix_shape(upper_coeff, m_rows, m_cols);
 
     backward_matmul_pair_gpu<<<(m_rows * w_cols + 255) / 256, 256>>>(
