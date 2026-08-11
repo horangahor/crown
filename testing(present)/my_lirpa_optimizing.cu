@@ -1424,8 +1424,6 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
   Vector *beta_u = g_pool.d_bwd_vec[5];
   Vector *term_lp = g_pool.d_bwd_vec[6];
   Vector *term_ln = g_pool.d_bwd_vec[7];
-  Vector *term_up = g_pool.d_bwd_vec[8];
-  Vector *term_un = g_pool.d_bwd_vec[9];
   Vector *tmp0 = g_pool.d_bwd_vec[10];
   Vector *tmp1 = g_pool.d_bwd_vec[11];
   Vector *bias = g_pool.d_bwd_vec[12];
@@ -1479,12 +1477,7 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
                                                           bias, term_lp);
     affine_term_fused_gpu<<<(w_rows + 255) / 256, 256>>>(alpha_u, beta_u,
                                                           bias, term_ln);
-    affine_term_fused_gpu<<<(w_rows + 255) / 256, 256>>>(alpha_u, beta_u,
-                                                          bias, term_up);
-    affine_term_fused_gpu<<<(w_rows + 255) / 256, 256>>>(alpha_l, beta_l,
-                                                          bias, term_un);
     set_vector_size(term_lp, w_rows); set_vector_size(term_ln, w_rows);
-    set_vector_size(term_up, w_rows); set_vector_size(term_un, w_rows);
 
     backward_bias_fused_gpu<<<vector_blocks, 256>>>(lower_pos, lower_neg,
                                                      term_lp, term_ln,
@@ -1492,7 +1485,7 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
     set_vector_size(new_p, m_rows);
     cudaMemcpy(lower_p, new_p, sizeof(Vector), cudaMemcpyDeviceToDevice);
     backward_bias_fused_gpu<<<vector_blocks, 256>>>(upper_pos, upper_neg,
-                                                     term_up, term_un,
+                                                     term_ln, term_lp,
                                                      upper_p, new_p);
     set_vector_size(new_p, m_rows);
     cudaMemcpy(upper_p, new_p, sizeof(Vector), cudaMemcpyDeviceToDevice);
