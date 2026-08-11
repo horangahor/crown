@@ -1323,6 +1323,56 @@ __global__ void colwise_scale_gpu(const Matrix *A, const Vector *s,
   }
 }
 
+__global__ void split_pos_neg_gpu(const Matrix *in, Matrix *positive,
+                                  Matrix *negative) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = in->rows * in->cols;
+  if (tid < total) {
+    const int r = tid / in->cols;
+    const int c = tid % in->cols;
+    const double v = in->a[r][c];
+    positive->a[r][c] = v > 0.0 ? v : 0.0;
+    negative->a[r][c] = v < 0.0 ? v : 0.0;
+  }
+}
+
+__global__ void build_coeff_fused_gpu(const Matrix *in, const Vector *positive_scale,
+                                      const Vector *negative_scale, Matrix *out) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = in->rows * in->cols;
+  if (tid < total) {
+    const int r = tid / in->cols;
+    const int c = tid % in->cols;
+    const double v = in->a[r][c];
+    out->a[r][c] = v > 0.0 ? v * positive_scale->v[c]
+                           : v * negative_scale->v[c];
+  }
+}
+
+__global__ void affine_term_fused_gpu(const Vector *alpha, const Vector *beta,
+                                      const Vector *bias, Vector *out) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < alpha->n) {
+    out->v[tid] = alpha->v[tid] * bias->v[tid] + beta->v[tid];
+  }
+}
+
+__global__ void backward_bias_fused_gpu(const Matrix *positive,
+                                        const Matrix *negative,
+                                        const Vector *positive_term,
+                                        const Vector *negative_term,
+                                        const Vector *old_p, Vector *out) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < positive->rows) {
+    double sum = old_p->v[tid];
+    for (int j = 0; j < positive->cols; ++j) {
+      sum += positive->a[tid][j] * positive_term->v[j]
+           + negative->a[tid][j] * negative_term->v[j];
+    }
+    out->v[tid] = sum;
+  }
+}
+
 // GPU-resident backward pass. Host copies are limited to the relaxation
 // coefficients (produced by the forward pass) and the final affine result.
 void backward_bound_gpu(const FullyConnectedNetwork &net,
@@ -1381,24 +1431,16 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
     set_vector_size(alpha_l, w_rows); set_vector_size(beta_l, w_rows);
     set_vector_size(alpha_u, w_rows); set_vector_size(beta_u, w_rows);
 
-    positive_part_gpu<<<matrix_blocks, 256>>>(lower_M, lower_pos);
-    negative_part_gpu<<<matrix_blocks, 256>>>(lower_M, lower_neg);
-    positive_part_gpu<<<matrix_blocks, 256>>>(upper_M, upper_pos);
-    negative_part_gpu<<<matrix_blocks, 256>>>(upper_M, upper_neg);
+    split_pos_neg_gpu<<<matrix_blocks, 256>>>(lower_M, lower_pos, lower_neg);
+    split_pos_neg_gpu<<<matrix_blocks, 256>>>(upper_M, upper_pos, upper_neg);
     set_matrix_shape(lower_pos, m_rows, m_cols); set_matrix_shape(lower_neg, m_rows, m_cols);
     set_matrix_shape(upper_pos, m_rows, m_cols); set_matrix_shape(upper_neg, m_rows, m_cols);
 
-    colwise_scale_gpu<<<matrix_blocks, 256>>>(lower_pos, alpha_l, new_lower_M);
-    set_matrix_shape(new_lower_M, m_rows, m_cols);
-    colwise_scale_gpu<<<matrix_blocks, 256>>>(lower_neg, alpha_u, lower_coeff);
+    build_coeff_fused_gpu<<<matrix_blocks, 256>>>(lower_M, alpha_l, alpha_u,
+                                                   lower_coeff);
     set_matrix_shape(lower_coeff, m_rows, m_cols);
-    mat_add_gpu<<<matrix_blocks, 256>>>(new_lower_M, lower_coeff, lower_coeff);
-    set_matrix_shape(lower_coeff, m_rows, m_cols);
-    colwise_scale_gpu<<<matrix_blocks, 256>>>(upper_pos, alpha_u, new_upper_M);
-    set_matrix_shape(new_upper_M, m_rows, m_cols);
-    colwise_scale_gpu<<<matrix_blocks, 256>>>(upper_neg, alpha_l, upper_coeff);
-    set_matrix_shape(upper_coeff, m_rows, m_cols);
-    mat_add_gpu<<<matrix_blocks, 256>>>(new_upper_M, upper_coeff, upper_coeff);
+    build_coeff_fused_gpu<<<matrix_blocks, 256>>>(upper_M, alpha_u, alpha_l,
+                                                   upper_coeff);
     set_matrix_shape(upper_coeff, m_rows, m_cols);
 
     matmul_gpu<<<(m_rows * w_cols + 255) / 256, 256>>>(lower_coeff,
@@ -1410,32 +1452,26 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
 
     cudaMemcpy(bias, &net.b[l], sizeof(Vector), cudaMemcpyHostToDevice);
     set_vector_size(bias, w_rows);
-    elemwise_mul_gpu<<<(w_rows + 255) / 256, 256>>>(alpha_l, bias, term_lp);
-    set_vector_size(term_lp, w_rows);
-    vec_add_gpu<<<(w_rows + 255) / 256, 256>>>(term_lp, beta_l, term_lp);
-    elemwise_mul_gpu<<<(w_rows + 255) / 256, 256>>>(alpha_u, bias, term_ln);
-    set_vector_size(term_ln, w_rows);
-    vec_add_gpu<<<(w_rows + 255) / 256, 256>>>(term_ln, beta_u, term_ln);
-    elemwise_mul_gpu<<<(w_rows + 255) / 256, 256>>>(alpha_u, bias, term_up);
-    set_vector_size(term_up, w_rows);
-    vec_add_gpu<<<(w_rows + 255) / 256, 256>>>(term_up, beta_u, term_up);
-    elemwise_mul_gpu<<<(w_rows + 255) / 256, 256>>>(alpha_l, bias, term_un);
-    set_vector_size(term_un, w_rows);
-    vec_add_gpu<<<(w_rows + 255) / 256, 256>>>(term_un, beta_l, term_un);
+    affine_term_fused_gpu<<<(w_rows + 255) / 256, 256>>>(alpha_l, beta_l,
+                                                          bias, term_lp);
+    affine_term_fused_gpu<<<(w_rows + 255) / 256, 256>>>(alpha_u, beta_u,
+                                                          bias, term_ln);
+    affine_term_fused_gpu<<<(w_rows + 255) / 256, 256>>>(alpha_u, beta_u,
+                                                          bias, term_up);
+    affine_term_fused_gpu<<<(w_rows + 255) / 256, 256>>>(alpha_l, beta_l,
+                                                          bias, term_un);
+    set_vector_size(term_lp, w_rows); set_vector_size(term_ln, w_rows);
+    set_vector_size(term_up, w_rows); set_vector_size(term_un, w_rows);
 
-    matvec_gpu<<<vector_blocks, 256>>>(lower_pos, term_lp, tmp0);
-    matvec_gpu<<<vector_blocks, 256>>>(lower_neg, term_ln, tmp1);
-    set_vector_size(tmp0, m_rows); set_vector_size(tmp1, m_rows);
-    vec_add_gpu<<<vector_blocks, 256>>>(tmp0, tmp1, new_p);
+    backward_bias_fused_gpu<<<vector_blocks, 256>>>(lower_pos, lower_neg,
+                                                     term_lp, term_ln,
+                                                     lower_p, new_p);
     set_vector_size(new_p, m_rows);
-    vec_add_gpu<<<vector_blocks, 256>>>(new_p, lower_p, new_p);
     cudaMemcpy(lower_p, new_p, sizeof(Vector), cudaMemcpyDeviceToDevice);
-    matvec_gpu<<<vector_blocks, 256>>>(upper_pos, term_up, tmp0);
-    matvec_gpu<<<vector_blocks, 256>>>(upper_neg, term_un, tmp1);
-    set_vector_size(tmp0, m_rows); set_vector_size(tmp1, m_rows);
-    vec_add_gpu<<<vector_blocks, 256>>>(tmp0, tmp1, new_p);
+    backward_bias_fused_gpu<<<vector_blocks, 256>>>(upper_pos, upper_neg,
+                                                     term_up, term_un,
+                                                     upper_p, new_p);
     set_vector_size(new_p, m_rows);
-    vec_add_gpu<<<vector_blocks, 256>>>(new_p, upper_p, new_p);
     cudaMemcpy(upper_p, new_p, sizeof(Vector), cudaMemcpyDeviceToDevice);
     cudaMemcpy(lower_M, new_lower_M, sizeof(Matrix), cudaMemcpyDeviceToDevice);
     cudaMemcpy(upper_M, new_upper_M, sizeof(Matrix), cudaMemcpyDeviceToDevice);
