@@ -114,6 +114,10 @@ struct GpuPool {
   // 
   Matrix* d_fwd_mat[NUM_FWD_MAT]{};
   Vector* d_fwd_vec[NUM_FWD_VEC]{};
+  Vector* d_fwd_alpha_lower[MAX_LAYERS]{};
+  Vector* d_fwd_beta_lower[MAX_LAYERS]{};
+  Vector* d_fwd_alpha_upper[MAX_LAYERS]{};
+  Vector* d_fwd_beta_upper[MAX_LAYERS]{};
   Matrix* d_bwd_mat[NUM_BWD_MAT]{};
   Vector* d_bwd_vec[NUM_BWD_VEC]{};
   // 불변 가중치 메모리 풀에 올려놓기
@@ -134,6 +138,12 @@ struct GpuPool {
       cudaMalloc(&d_fwd_mat[i], sizeof(Matrix));
     for (int i = 0; i < NUM_FWD_VEC; ++i)
       cudaMalloc(&d_fwd_vec[i], sizeof(Vector));
+    for (int i = 0; i < MAX_LAYERS; ++i) {
+      cudaMalloc(&d_fwd_alpha_lower[i], sizeof(Vector));
+      cudaMalloc(&d_fwd_beta_lower[i], sizeof(Vector));
+      cudaMalloc(&d_fwd_alpha_upper[i], sizeof(Vector));
+      cudaMalloc(&d_fwd_beta_upper[i], sizeof(Vector));
+    }
     for (int i = 0; i < NUM_BWD_MAT; ++i)
       cudaMalloc(&d_bwd_mat[i], sizeof(Matrix));
     for (int i = 0; i < NUM_BWD_VEC; ++i)
@@ -151,6 +161,16 @@ struct GpuPool {
       cudaFree(d_fwd_mat[i]);
     for (int i = 0; i < NUM_FWD_VEC; ++i)
       cudaFree(d_fwd_vec[i]);
+    for (int i = 0; i < MAX_LAYERS; ++i) {
+      cudaFree(d_fwd_alpha_lower[i]);
+      cudaFree(d_fwd_beta_lower[i]);
+      cudaFree(d_fwd_alpha_upper[i]);
+      cudaFree(d_fwd_beta_upper[i]);
+      d_fwd_alpha_lower[i] = nullptr;
+      d_fwd_beta_lower[i] = nullptr;
+      d_fwd_alpha_upper[i] = nullptr;
+      d_fwd_beta_upper[i] = nullptr;
+    }
     for (int i = 0; i < NUM_BWD_MAT; ++i)
       cudaFree(d_bwd_mat[i]);
     for (int i = 0; i < NUM_BWD_VEC; ++i)
@@ -948,6 +968,26 @@ __global__ void affine_minmax_pair_gpu(
   }
 }
 
+__global__ void cache_relaxation_layer_gpu(
+    const Vector *alpha_l, const Vector *beta_l,
+    const Vector *alpha_u, const Vector *beta_u,
+    Vector *cached_alpha_l, Vector *cached_beta_l,
+    Vector *cached_alpha_u, Vector *cached_beta_u) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid == 0) {
+    cached_alpha_l->n = alpha_l->n;
+    cached_beta_l->n = beta_l->n;
+    cached_alpha_u->n = alpha_u->n;
+    cached_beta_u->n = beta_u->n;
+  }
+  if (tid < alpha_l->n) {
+    cached_alpha_l->v[tid] = alpha_l->v[tid];
+    cached_beta_l->v[tid] = beta_l->v[tid];
+    cached_alpha_u->v[tid] = alpha_u->v[tid];
+    cached_beta_u->v[tid] = beta_u->v[tid];
+  }
+}
+
 __global__ void relu_relax_full_gpu(const Vector *lower, const Vector *upper,
                                     Vector *alpha_l, Vector *beta_l,
                                     Vector *alpha_u, Vector *beta_u) {
@@ -1367,6 +1407,14 @@ ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
       cudaMemcpy(alpha_u, &h_alpha_u, sizeof(Vector), cudaMemcpyHostToDevice);
       cudaMemcpy(beta_u, &h_beta_u, sizeof(Vector), cudaMemcpyHostToDevice);
     }
+
+    // Preserve each layer's relaxation coefficients on the GPU so the
+    // backward pass can consume them without a host round trip.
+    cache_relaxation_layer_gpu<<<vector_blocks, 256>>>(
+        alpha_l, beta_l, alpha_u, beta_u,
+        g_pool.d_fwd_alpha_lower[l], g_pool.d_fwd_beta_lower[l],
+        g_pool.d_fwd_alpha_upper[l], g_pool.d_fwd_beta_upper[l]);
+
     // ---------------------------------------------------------
     // [Post-activation 갱신] 원본: post.lower_A = pre.lower_A * alpha_l
     // 여기서 생성된 post.lower_A를 다음 루프를 위해 current.lower_A(lower_A) 자리에 덮어쓰기
@@ -1592,8 +1640,8 @@ __global__ void backward_matmul_pair_gpu(
   }
 }
 
-// GPU-resident backward pass. Host copies are limited to the relaxation
-// coefficients (produced by the forward pass) and the final affine result.
+// GPU-resident backward pass. Relaxation coefficients stay on the GPU between
+// forward and backward; host copies are limited to inputs and final results.
 void backward_bound_gpu(const FullyConnectedNetwork &net,
                         const ForwardBoundResult &fwd,
                         const Matrix &initial_lower_M,
@@ -1614,10 +1662,6 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
   Matrix *new_upper_M = g_pool.d_bwd_mat[9];
   Vector *lower_p = g_pool.d_bwd_vec[0];
   Vector *upper_p = g_pool.d_bwd_vec[1];
-  Vector *alpha_l = g_pool.d_bwd_vec[2];
-  Vector *beta_l = g_pool.d_bwd_vec[3];
-  Vector *alpha_u = g_pool.d_bwd_vec[4];
-  Vector *beta_u = g_pool.d_bwd_vec[5];
   Vector *term_lp = g_pool.d_bwd_vec[6];
   Vector *term_ln = g_pool.d_bwd_vec[7];
   Vector *new_lower_p = g_pool.d_bwd_vec[10];
@@ -1640,10 +1684,10 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
     const int matrix_blocks = (matrix_elems + 255) / 256;
     const int vector_blocks = (m_rows + 255) / 256;
 
-    cudaMemcpy(alpha_l, &fwd.layer_bounds[l].alpha_lower, sizeof(Vector), cudaMemcpyHostToDevice);
-    cudaMemcpy(beta_l, &fwd.layer_bounds[l].beta_lower, sizeof(Vector), cudaMemcpyHostToDevice);
-    cudaMemcpy(alpha_u, &fwd.layer_bounds[l].alpha_upper, sizeof(Vector), cudaMemcpyHostToDevice);
-    cudaMemcpy(beta_u, &fwd.layer_bounds[l].beta_upper, sizeof(Vector), cudaMemcpyHostToDevice);
+    const Vector *alpha_l = g_pool.d_fwd_alpha_lower[l];
+    const Vector *beta_l = g_pool.d_fwd_beta_lower[l];
+    const Vector *alpha_u = g_pool.d_fwd_alpha_upper[l];
+    const Vector *beta_u = g_pool.d_fwd_beta_upper[l];
 
     split_pos_neg_pair_gpu<<<matrix_blocks, 256>>>(
         lower_M, upper_M, lower_pos, lower_neg, upper_pos, upper_neg);
