@@ -1424,10 +1424,9 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
   Vector *beta_u = g_pool.d_bwd_vec[5];
   Vector *term_lp = g_pool.d_bwd_vec[6];
   Vector *term_ln = g_pool.d_bwd_vec[7];
-  Vector *tmp0 = g_pool.d_bwd_vec[10];
-  Vector *tmp1 = g_pool.d_bwd_vec[11];
+  Vector *new_lower_p = g_pool.d_bwd_vec[10];
+  Vector *new_upper_p = g_pool.d_bwd_vec[11];
   Vector *bias = g_pool.d_bwd_vec[12];
-  Vector *new_p = g_pool.d_bwd_vec[13];
 
   cudaMemcpy(lower_M, &initial_lower_M, sizeof(Matrix), cudaMemcpyHostToDevice);
   cudaMemcpy(upper_M, &initial_upper_M, sizeof(Matrix), cudaMemcpyHostToDevice);
@@ -1481,16 +1480,19 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
 
     backward_bias_fused_gpu<<<vector_blocks, 256>>>(lower_pos, lower_neg,
                                                      term_lp, term_ln,
-                                                     lower_p, new_p);
-    set_vector_size(new_p, m_rows);
-    cudaMemcpy(lower_p, new_p, sizeof(Vector), cudaMemcpyDeviceToDevice);
+                                                     lower_p, new_lower_p);
+    set_vector_size(new_lower_p, m_rows);
     backward_bias_fused_gpu<<<vector_blocks, 256>>>(upper_pos, upper_neg,
                                                      term_ln, term_lp,
-                                                     upper_p, new_p);
-    set_vector_size(new_p, m_rows);
-    cudaMemcpy(upper_p, new_p, sizeof(Vector), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(lower_M, new_lower_M, sizeof(Matrix), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(upper_M, new_upper_M, sizeof(Matrix), cudaMemcpyDeviceToDevice);
+                                                     upper_p, new_upper_p);
+    set_vector_size(new_upper_p, m_rows);
+
+    // The newly computed buffers become the current state for the next
+    // layer.  Swapping pointers avoids copying full matrices/vectors on GPU.
+    std::swap(lower_M, new_lower_M);
+    std::swap(upper_M, new_upper_M);
+    std::swap(lower_p, new_lower_p);
+    std::swap(upper_p, new_upper_p);
   }
   cudaMemcpy(&final_lower_M, lower_M, sizeof(Matrix), cudaMemcpyDeviceToHost);
   cudaMemcpy(&final_upper_M, upper_M, sizeof(Matrix), cudaMemcpyDeviceToHost);
