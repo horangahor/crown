@@ -5,6 +5,7 @@
 #include<chrono>
 #include "my_lirpa_optimizing.cu"
 #include<fstream>
+#include <nvtx3/nvToolsExt.h>
 
 const char* MODEL_PATH = "C:/Users/user/Desktop/cuda/jnunnv_v1_0/jnunnv/models/Custom/Baseline mMIMO FC H hard short 80 HTHNN_LAY2_491 RELU 20241018 PRUNED 0.93_NO_SIGMOID_custom.bin";
 
@@ -171,6 +172,9 @@ int main(int argc, char** argv){
     // Immutable weights are uploaded and decomposed before timed verification.
     prepare_network_on_gpu(*net);
 
+    // NVTX : 코드에 “이 구간이 실제 검증 시간이다”라는 표시를 넣는 기능
+    nvtxRangePushA("CROWN_VERIFY");
+
     // 시간 측정 시작 (신경망 정방향 통과 및 CROWN)
     auto t_start = std::chrono::high_resolution_clock::now();
 
@@ -185,6 +189,9 @@ int main(int argc, char** argv){
 
     // 시간 측정 종료
     auto t_end = std::chrono::high_resolution_clock::now();
+
+    // NVTX 구간 종료
+    nvtxRangePop();
     double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
     std::cout << "calc success" << std::endl;
