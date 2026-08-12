@@ -15,6 +15,8 @@
 #include "../lirpa_backward_only_iteration_array.cpp"
 //#include "../lirpa_forward_backward_fc_array.cpp"
 
+// 컴파일 : cl /EHsc /utf-8 /F2147483648 crown_test_cpu_iteration.cpp /Fe:crown_test_cpu_iteration.exe
+
 const char* MODEL_PATH = "C:/Users/user/Desktop/cuda/jnunnv_v1_0/jnunnv/models/Custom/Baseline mMIMO FC H hard short 80 HTHNN_LAY2_491 RELU 20241018 PRUNED 0.93_NO_SIGMOID_custom.bin";
 
 FullyConnectedNetwork* load_custom_network(const char* filepath){
@@ -158,13 +160,13 @@ int main(int argc, char** argv){
     int out_dim = bwd.final_lower.n;
     std::cout << "Output Dimension: " << out_dim << "\n\n";
 
-    std::cout << "[Index] | Lower Bound | Upper Bound | Normal Pred (y)\n";
+    std::cout << "[Index] | Lower Bound | Upper Bound | inference (y)\n";
     std::cout << "---------------------------------------------------\n";
     for (int i = 0; i < out_dim; ++i) {
         std::cout << "[" << std::setw(3) << i << "]   |  " 
-                  << std::setw(12) << bwd.final_lower.v[i] << "  |  "
-                  << std::setw(12) << bwd.final_upper.v[i] << "  |  "
-                  << std::setw(12) << y.v[i] << "\n";
+                  << std::setw(9) << bwd.final_lower.v[i] << "  |  "
+                  << std::setw(9) << bwd.final_upper.v[i] << "  |  "
+                  << std::setw(9) << y.v[i] << "\n";
     }
     std::cout << "========================================\n";
 

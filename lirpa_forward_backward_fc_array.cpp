@@ -12,7 +12,7 @@
 namespace {
 
 constexpr int MAX_LAYERS = 16;
-constexpr int MAX_DIM = 64;
+constexpr int MAX_DIM = 512;
 
 enum class ActivationType {
     Relu,
@@ -1001,6 +1001,7 @@ void run_xor_demo(double eps) {
 
 }  // namespace
 
+/*
 int main(int argc, char** argv) {
     try {
         double eps = 0.02;
@@ -1016,3 +1017,4 @@ int main(int argc, char** argv) {
     }
     return 0;
 }
+*/
