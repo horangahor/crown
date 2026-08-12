@@ -73,7 +73,7 @@ struct ForwardBoundResult {
   Vector final_lower;
   Vector final_upper;
   int num_layer_bounds = 0;
-  LayerBound layer_bounds[MAX_LAYERS]{};
+  LayerBound layer_bounds[MAX_LAYERS]{}; // 순전파 과정에서 얻은 중간 upper, lower bound
 };
 
 struct BackwardBoundResult {
@@ -1689,6 +1689,8 @@ __global__ void backward_matmul_pair_gpu(
 
 // GPU-resident backward pass. Relaxation coefficients stay on the GPU between
 // forward and backward; host copies are limited to inputs and final results.
+// 단지 전체 레이어를 루프로 돌면서 커널 퓨전(Kernel Fusion)과 포인터 스왑을 통해 
+// 메모리 할당/복사를 완전히 없앤 극자적 최적화(Zero-Memcpy) 버전
 void backward_bound_gpu(const FullyConnectedNetwork &net,
                         const ForwardBoundResult &fwd,
                         const Matrix &initial_lower_M,
@@ -1714,11 +1716,15 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
   Vector *new_lower_p = g_pool.d_bwd_vec[10];
   Vector *new_upper_p = g_pool.d_bwd_vec[11];
 
+  // GPU에서 사용하기 위해 초기값을 GPU로 복사
   cudaMemcpy(lower_M, &initial_lower_M, sizeof(Matrix), cudaMemcpyHostToDevice);
   cudaMemcpy(upper_M, &initial_upper_M, sizeof(Matrix), cudaMemcpyHostToDevice);
   cudaMemcpy(lower_p, &initial_lower_p, sizeof(Vector), cudaMemcpyHostToDevice);
   cudaMemcpy(upper_p, &initial_upper_p, sizeof(Vector), cudaMemcpyHostToDevice);
 
+  // Backward는 출력층(마지막 레이어)부터 입력층(0번 레이어)까지 역순으로 
+  // 원래 lirpa_backward_bound 에서 루프 하던 걸 여기서 역전파 하도록 바꿈
+  // 왜 이렇게 하냐면..
   for (int l = net.num_layers - 1; l >= 0; --l) {
     // The number of specification rows stays constant while propagating
     // backward; only the matrix column dimension changes per layer.
@@ -1730,25 +1736,37 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
     const int matrix_blocks = (matrix_elems + 255) / 256;
     const int vector_blocks = (m_rows + 255) / 256;
 
+    // forward에서 계산된 alpha_l, beta_l, alpha_u, beta_u (GPU 메모리에 보관하고 있던걸 가져옴)
+    // 즉 backward_one_layer에서 인자로 받았던 부분을, 이미 GPU에 올려둔 부분을 사용해 해결함
     const Vector *alpha_l = g_pool.d_fwd_alpha_lower[l];
     const Vector *beta_l = g_pool.d_fwd_beta_lower[l];
     const Vector *alpha_u = g_pool.d_fwd_alpha_upper[l];
     const Vector *beta_u = g_pool.d_fwd_beta_upper[l];
 
+    // 1. 하한(lower_M)/상한(upper_M) 행렬을 양수/음수 행렬로 분리 
+    // (CPU의 positive_part, negative_part 함수 역할을 한 번에 융합 처리)
     split_pos_neg_pair_gpu<<<matrix_blocks, 256>>>(
         lower_M, upper_M, lower_pos, lower_neg, upper_pos, upper_neg);
 
+    // 2. 분리된 행렬과 Forward에서 구한 alpha, beta를 곱해 CROWN 계수 생성
+    // (CPU의 lower_s_coeff, upper_s_coeff 연산과 100% 동일)
     build_coeff_pair_fused_gpu<<<matrix_blocks, 256>>>(
         lower_M, upper_M, alpha_l, alpha_u, lower_coeff, upper_coeff);
 
+    // 3. 계수 행렬과 가중치(Weight)를 행렬곱 연산하여 이전 레이어로 넘길 새로운 M 생성
+    // (CPU의 matmul(lower_s_coeff, W)와 동일. 현재 연산 시간의 90%를 차지하는 병목 구간)
     backward_matmul_pair_gpu<<<(m_rows * w_cols + 255) / 256, 256>>>(
         lower_coeff, upper_coeff, g_pool.d_weight[l], new_lower_M,
         new_upper_M);
 
+    // 4. 편향(bias)과 이완(relaxation) 오차(beta)를 반영하기 위한 상수항(term) 계산
+    // (CPU의 vec_add(elemwise_mul(alpha, b), beta) 와 동일)
     const Vector *bias = g_pool.d_bias[l];
     affine_term_pair_fused_gpu<<<(w_rows + 255) / 256, 256>>>(
         alpha_l, beta_l, alpha_u, beta_u, bias, term_lp, term_ln);
 
+    // 5. 앞에서 구한 행렬과 상수항을 내적(matvec)하고 누적 더하기(vec_add)를 한 번에 융합
+    // (CPU의 matvec 후 vec_add 하는 복잡한 로직을 단일 커널로 압축)
     backward_bias_pair_fused_gpu<<<vector_blocks, 256>>>(
         lower_pos, lower_neg, upper_pos, upper_neg,
         term_lp, term_ln, term_ln, term_lp,
@@ -1756,11 +1774,16 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
 
     // The newly computed buffers become the current state for the next
     // layer.  Swapping pointers avoids copying full matrices/vectors on GPU.
+    // 6. 새로 계산된 M과 p를 다음 레이어 연산의 입력으로 사용하기 위해 포인터만 쓱 교체
+    // (CPU처럼 cudaMemcpy나 새로 할당할 필요가 없는 Zero-Memcpy 아키텍처의 핵심)
+    // 스왑해줘야 new_lower_M을 다음 역전파의 lower_M으로 사용할 수 있음
     std::swap(lower_M, new_lower_M);
     std::swap(upper_M, new_upper_M);
     std::swap(lower_p, new_lower_p);
     std::swap(upper_p, new_upper_p);
   }
+
+  // 최종 결과물만 GPU에서 호스트(CPU)로 복사해서 돌려줌
   cudaMemcpy(&final_lower_M, lower_M, sizeof(Matrix), cudaMemcpyDeviceToHost);
   cudaMemcpy(&final_upper_M, upper_M, sizeof(Matrix), cudaMemcpyDeviceToHost);
   cudaMemcpy(&final_lower_p, lower_p, sizeof(Vector), cudaMemcpyDeviceToHost);
@@ -1778,6 +1801,8 @@ void backward_one_layer(Matrix &lower_M, Vector &lower_p, Matrix &upper_M,
               beta_u.n == W.rows,
           "backward_one_layer relaxation shape mismatch.");
 
+
+  // 이 부분이 1번 과정 (split_pos_neg ...)
   const Matrix lower_M_pos = positive_part(lower_M);
   const Matrix lower_M_neg = negative_part(lower_M);
   const Matrix upper_M_pos = positive_part(upper_M);
@@ -1786,6 +1811,7 @@ void backward_one_layer(Matrix &lower_M, Vector &lower_p, Matrix &upper_M,
   Matrix lower_s_coeff = make_zero_matrix(lower_M.rows, lower_M.cols);
   Matrix upper_s_coeff = make_zero_matrix(upper_M.rows, upper_M.cols);
 
+  // lower, upper 의 조정된 계수? (아마 2번 과정..)
   for (int i = 0; i < lower_M.rows; ++i) {
     for (int j = 0; j < lower_M.cols; ++j) {
       lower_s_coeff.a[i][j] = lower_M_pos.a[i][j] * alpha_l.v[j] +
@@ -1795,20 +1821,26 @@ void backward_one_layer(Matrix &lower_M, Vector &lower_p, Matrix &upper_M,
     }
   }
 
+  // 랑 가중치를 곱하면 (3번 과정)
   const Matrix new_lower_M = matmul(lower_s_coeff, W);
   const Matrix new_upper_M = matmul(upper_s_coeff, W);
 
+  // 4번 과정
   const Vector term_lp = vec_add(elemwise_mul(alpha_l, b), beta_l);
   const Vector term_ln = vec_add(elemwise_mul(alpha_u, b), beta_u);
+  // 5번 과정
   const Vector new_lower_p = vec_add(
       vec_add(matvec(lower_M_pos, term_lp), matvec(lower_M_neg, term_ln)),
       lower_p);
 
+  // 4번 과정
   const Vector term_up = vec_add(elemwise_mul(alpha_u, b), beta_u);
   const Vector term_un = vec_add(elemwise_mul(alpha_l, b), beta_l);
+  // 5번 과정
   const Vector new_upper_p = vec_add(
       vec_add(matvec(upper_M_pos, term_up), matvec(upper_M_neg, term_un)),
       upper_p);
+  // 이부분이 각각 커널 퓨전으로 통합됨
 
   lower_M = new_lower_M;
   lower_p = new_lower_p;
@@ -1830,10 +1862,10 @@ BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const
       lirpa_forward_bound_impl(net, x0, eps, materialize_forward_results);
 
   const int output_dim = network_output_dim(net);
-  Matrix lower_M;
-  Matrix upper_M;
-  Vector lower_p;
-  Vector upper_p;
+  Matrix lower_M; // lower bound 선형 방정식 계수
+  Matrix upper_M; // upper bound 선형 방정식 계수
+  Vector lower_p; // lower bound 선형 방정식 y절편
+  Vector upper_p; // upper bound 선형 방정식 y절편
 
   if (output_lower_M) { lower_M = *output_lower_M; }
   else { lower_M = make_eye(output_dim); }
@@ -1852,9 +1884,18 @@ BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const
           "Output spec vector row mismatch.");
 
   BackwardBoundResult out;
+  
+  // 과거에는 바로 이 위치에서 for (int l = net.num_layers - 1; l >= 0; --l) 
+  // 루프를 돌면서 backward_one_layer(...) 를 층(layer) 개수만큼 반복 호출
+  // 내부적으로 커널 퓨전(Kernel Fusion)과 Zero-Memcpy 루프가 적용된
+  // 단일 함수 backward_bound_gpu()를 딱 한 번만 호출하여 병목 제거
+
+  // 초기 lower_M,p / upper_M,p를 준다.
+  // 나중에 lower_M,p / upper_M,p ==> out.final에 값 덮어쓰기
   backward_bound_gpu(net, fwd, lower_M, lower_p, upper_M, upper_p,
                      out.final_affine.lower_A, out.final_affine.lower_c,
                      out.final_affine.upper_A, out.final_affine.upper_c);
+
   out.final_lower = affine_min(out.final_affine.lower_A,
                                out.final_affine.lower_c, x0, eps);
   out.final_upper = affine_max(out.final_affine.upper_A,
