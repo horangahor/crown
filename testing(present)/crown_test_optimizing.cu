@@ -201,7 +201,7 @@ int main(int argc, char** argv){
     int out_dim = bwd.final_lower.n;
     std::cout << "Output Dimension: " << out_dim << "\n\n";
 
-    std::cout << "[Index] | Lower Bound | Upper Bound | Normal Pred (y)\n";
+    std::cout << "[Index] | Lower Bound | Upper Bound | inference (y)\n";
     std::cout << "---------------------------------------------------\n";
     for (int i = 0; i < out_dim; ++i) {
         std::cout << "[" << std::setw(3) << i << "]   |  " 
@@ -217,50 +217,47 @@ int main(int argc, char** argv){
         double lower;
         double upper;
         double pred;
-        double range;
     };
 
     // 구조체를 element 로 하는 벡터
     std::vector<NodeResult> results;
     for (int i = 0; i < out_dim; ++i) {
-        results.push_back({i, bwd.final_lower.v[i], bwd.final_upper.v[i], y.v[i], bwd.final_upper.v[i] - bwd.final_lower.v[i]});
+        results.push_back({i, bwd.final_lower.v[i], bwd.final_upper.v[i], y.v[i]});
     }
 
     int print_count = std::min(8, out_dim);
 
     // 신경망 출력값(Normal Pred) 정렬
     std::sort(results.begin(), results.end(), [](const NodeResult& a, const NodeResult& b) {
-        return a.pred > b.pred;
+      return a.pred > b.pred;
     });
 
     std::cout << "\n[8 Nodes - Sorted by Normal Pred]\n";
-    std::cout << "[Index] | Lower Bound | Upper Bound | Normal Pred (y) | Range (Upper - Lower)\n";
+    std::cout << "[Index] | Lower Bound | Upper Bound | inference (y) \n";
     std::cout << "-----------------------------------------------------------------------\n";
     for (int i = 0; i < print_count; ++i) {
         const auto& r = results[i];
         std::cout << "[" << std::setw(3) << r.index << "]   |  " 
                   << std::setw(9) << r.lower << "  |  "
                   << std::setw(9) << r.upper << "  |  "
-                  << std::setw(9) << r.pred << "      |  "
-                  << std::setw(9) << r.range << "\n";
+                  << std::setw(9) << r.pred << "\n";
     }
     std::cout << "=======================================================================\n";
 
     // 신경망 정렬 (범위)
-    std::sort(results.begin(), results.end(), [](const NodeResult& a, const NodeResult& b) {
-        return a.range < b.range;
-    });
+    //std::sort(results.begin(), results.end(), [](const NodeResult& a, const NodeResult& b) {
+    //    return a.range < b.range;
+    //});
 
     std::cout << "\n[8 Nodes - Sorted by Range]\n";
-    std::cout << "[Index] | Lower Bound | Upper Bound | Normal Pred (y) | Range (Upper - Lower)\n";
+    std::cout << "[Index] | Lower Bound | Upper Bound | inference (y) \n";
     std::cout << "-----------------------------------------------------------------------\n";
     for (int i = 0; i < print_count; ++i) {
         const auto& r = results[i];
         std::cout << "[" << std::setw(3) << r.index << "]   |  " 
                   << std::setw(9) << r.lower << "  |  "
                   << std::setw(9) << r.upper << "  |  "
-                  << std::setw(9) << r.pred << "      |  "
-                  << std::setw(9) << r.range << "\n";
+                  << std::setw(9) << r.pred << "\n";
     }
     std::cout << "=======================================================================\n";
 
