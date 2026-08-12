@@ -43,8 +43,8 @@ enum class ActivationType {
 
 // 거의 2MB 의 크기를 가짐 (512 * 512 * 8byte)
 struct Matrix {
-  int rows = 0;
-  int cols = 0;
+  int rows = 0;                 // 4 btye
+  int cols = 0;                 // 4 byte
   double a[MAX_DIM][MAX_DIM]{}; // 8 * 512 * 512 ==> 2MB
 };
 
@@ -110,7 +110,7 @@ constexpr int NUM_BWD_VEC = 14;
 
 struct GpuPool {
   Matrix* d_mat[NUM_POOL_MAT];        // 2MB * 3 ==> 6MB
-  Vector* d_vec[NUM_POOL_VEC];        // 
+  Vector* d_vec[NUM_POOL_VEC];        // 4KB * 6 ==> 24KB
   // 
   Matrix* d_fwd_mat[NUM_FWD_MAT]{};
   Vector* d_fwd_vec[NUM_FWD_VEC]{};
@@ -131,27 +131,28 @@ struct GpuPool {
   // 1번만 실행되도록
   void init() {
     if (initialized) return;
-    for (int i = 0; i < NUM_POOL_MAT; i++)
-      cudaMalloc(&d_mat[i], sizeof(Matrix));
-    for (int i = 0; i < NUM_POOL_VEC; i++)
-      cudaMalloc(&d_vec[i], sizeof(Vector));
-    for (int i = 0; i < NUM_FWD_MAT; ++i)
-      cudaMalloc(&d_fwd_mat[i], sizeof(Matrix));
-    for (int i = 0; i < NUM_FWD_VEC; ++i)
-      cudaMalloc(&d_fwd_vec[i], sizeof(Vector));
-    for (int i = 0; i < MAX_LAYERS; ++i) {
-      cudaMalloc(&d_fwd_alpha_lower[i], sizeof(Vector));
-      cudaMalloc(&d_fwd_beta_lower[i], sizeof(Vector));
-      cudaMalloc(&d_fwd_alpha_upper[i], sizeof(Vector));
-      cudaMalloc(&d_fwd_beta_upper[i], sizeof(Vector));
-      cudaMalloc(&d_bias[i], sizeof(Vector));
+    for (int i = 0; i < NUM_POOL_MAT; i++) // NUM_POOL_MAT : 3
+      cudaMalloc(&d_mat[i], sizeof(Matrix)); // 6MB
+    for (int i = 0; i < NUM_POOL_VEC; i++) // NUM_POOL_VEC : 6
+      cudaMalloc(&d_vec[i], sizeof(Vector)); // 24kb
+    for (int i = 0; i < NUM_FWD_MAT; ++i) // NUM_FWD_MAT : 6
+      cudaMalloc(&d_fwd_mat[i], sizeof(Matrix)); // 12MB
+    for (int i = 0; i < NUM_FWD_VEC; ++i)   // NUM_FWD_VEC : 14
+      cudaMalloc(&d_fwd_vec[i], sizeof(Vector)); // 56kb
+    for (int i = 0; i < MAX_LAYERS; ++i) {  // Max_Layers : 16
+      cudaMalloc(&d_fwd_alpha_lower[i], sizeof(Vector)); // 4KB * 16 = 64KB
+      cudaMalloc(&d_fwd_beta_lower[i], sizeof(Vector)); // 4KB * 16 = 64KB
+      cudaMalloc(&d_fwd_alpha_upper[i], sizeof(Vector)); // 4KB * 16 = 64KB
+      cudaMalloc(&d_fwd_beta_upper[i], sizeof(Vector)); // 4KB * 16 = 64kb
+      cudaMalloc(&d_bias[i], sizeof(Vector)); // 4KB * 16 = 64kb
     }
-    for (int i = 0; i < NUM_BWD_MAT; ++i)
-      cudaMalloc(&d_bwd_mat[i], sizeof(Matrix));
-    for (int i = 0; i < NUM_BWD_VEC; ++i)
-      cudaMalloc(&d_bwd_vec[i], sizeof(Vector));
+    for (int i = 0; i < NUM_BWD_MAT; ++i) // NUM_BWD_MAT : 10
+      cudaMalloc(&d_bwd_mat[i], sizeof(Matrix)); // 20MB
+    for (int i = 0; i < NUM_BWD_VEC; ++i) // NUM_BWD_VEC : 14
+      cudaMalloc(&d_bwd_vec[i], sizeof(Vector)); // 56kb
     initialized = true;
   }
+  // 6MB + 12MB + 20MB + 24KB + 56KB + 64KB*5 + 56kb ==> 약 38MB + 456kb
 
   void destroy() {
     if (!initialized) return;
@@ -636,12 +637,13 @@ void prepare_network_on_gpu(const FullyConnectedNetwork &net) {
   if (g_pool.cached_network == &net) return;
 
   // GPU 메모리 할당 및 주소 저장
-  for (int l = 0; l < net.num_layers; ++l) {
-    if (g_pool.d_weight[l] == nullptr) {
-      cudaMalloc(&g_pool.d_weight[l], sizeof(Matrix));
-      cudaMalloc(&g_pool.d_weight_pos[l], sizeof(Matrix));
-      cudaMalloc(&g_pool.d_weight_neg[l], sizeof(Matrix));
+  for (int l = 0; l < net.num_layers; ++l) { // 가중치 레이어 3개
+    if (g_pool.d_weight[l] == nullptr) {        
+      cudaMalloc(&g_pool.d_weight[l], sizeof(Matrix)); // 2MB * 3  
+      cudaMalloc(&g_pool.d_weight_pos[l], sizeof(Matrix)); // 2MB * 3
+      cudaMalloc(&g_pool.d_weight_neg[l], sizeof(Matrix)); // 2MB * 3
     }
+    // 6MB + 6MB + 6MB => 18MB
 
     // Seed pos/neg buffers with metadata (rows/cols); their value arrays are
     // overwritten by the kernels below.
