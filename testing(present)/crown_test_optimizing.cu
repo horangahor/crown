@@ -9,6 +9,8 @@
 
 const char* MODEL_PATH = "C:/Users/user/Desktop/cuda/jnunnv_v1_0/jnunnv/models/Custom/Baseline mMIMO FC H hard short 80 HTHNN_LAY2_491 RELU 20241018 PRUNED 0.93_NO_SIGMOID_custom.bin";
 
+// 컴파일 : nvcc -Xcompiler "/utf-8" -Xlinker "/STACK:134217728" -arch=sm_89 crown_test_optimizing.cu -o crown_test_optimizing.exe
+
 // jnunnv_v1_0/CustomToLirpa.py 참조
 // 모델.bin 의 구조
 // 매직(4바이트)버전(4)가중치 레이어 개수(4) 레이어별 노드 수(4 * (m+1))
