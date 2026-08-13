@@ -1448,6 +1448,7 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
 
     // Preserve each layer's relaxation coefficients on the GPU so the
     // backward pass can consume them without a host round trip.
+    // GPU 메모리에 계산결과 저장
     cache_relaxation_layer_gpu<<<vector_blocks, 256>>>(
         alpha_l, beta_l, alpha_u, beta_u,
         g_pool.d_fwd_alpha_lower[l], g_pool.d_fwd_beta_lower[l],
@@ -1465,7 +1466,10 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
         alpha_l, pre_lower_c, beta_l,
         alpha_u, pre_upper_c, beta_u,
         lower_c, upper_c);
+    // 여기까지가 다음 루프를 위한 업데이트 
+    //==========================================================================
 
+    // forward 중간 결과 저장 안함 (D to H 안함) , 대신 GPU 메모리에 남아있음(backward 계산에 활용)
     if (materialize_host_results) {
       out.layer_bounds[l].dim = weight_rows;
       cudaMemcpy(&out.layer_bounds[l].alpha_lower, alpha_l, sizeof(Vector), cudaMemcpyDeviceToHost);
@@ -1479,6 +1483,8 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
   // ---------------------------------------------------------
   // 3. [최종 도출] 다 끝난 lower_A, lower_c 등을 최종 결과에 담아서 리턴
   // ---------------------------------------------------------
+
+  // backward 과정에서 최종 결과 필요없으므로 D to H memcpy 안함
   if (materialize_host_results) {
     cudaMemcpy(&out.final_affine.lower_A, lower_A, sizeof(Matrix), cudaMemcpyDeviceToHost);
     cudaMemcpy(&out.final_affine.upper_A, upper_A, sizeof(Matrix), cudaMemcpyDeviceToHost);
