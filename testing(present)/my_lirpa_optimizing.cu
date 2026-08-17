@@ -26,6 +26,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <nvtx3/nvToolsExt.h>
 
 
 // Relaxation : 선형 근사를 통한 사잇값 계산
@@ -648,10 +649,12 @@ void prepare_network_on_gpu(const FullyConnectedNetwork &net) {
     // Seed pos/neg buffers with metadata (rows/cols); their value arrays are
     // overwritten by the kernels below.
     // 가중치 GPU 메모리에 복사
+    //nvtxRangePushA("memcpy W,B");
     cudaMemcpy(g_pool.d_weight[l], &net.W[l], sizeof(Matrix), cudaMemcpyHostToDevice);
     cudaMemcpy(g_pool.d_weight_pos[l], &net.W[l], sizeof(Matrix), cudaMemcpyHostToDevice);
     cudaMemcpy(g_pool.d_weight_neg[l], &net.W[l], sizeof(Matrix), cudaMemcpyHostToDevice);
     cudaMemcpy(g_pool.d_bias[l], &net.b[l], sizeof(Vector), cudaMemcpyHostToDevice);
+    //nvtxRangePop();
 
     //미리 가중치 양수/음수 부분만 남겨서 메모리 풀에 저장
     //나중에 forward 같은 데에서 계속 이걸 계산할 필요가 사라짐
