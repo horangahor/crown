@@ -1844,9 +1844,9 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
   int blocksPerGrid = (out_dim + 255) / 256;
   
   // 3. GPU 안에서 최종 정답 계산
-  // 커널 퓨전 가능할듯
-  affine_min_gpu<<<blocksPerGrid, 256>>>(lower_M, lower_p, d_xl, d_xu, d_final_lower);
-  affine_max_gpu<<<blocksPerGrid, 256>>>(upper_M, upper_p, d_xl, d_xu, d_final_upper);
+  // 커널 퓨전 완료 (affine_min과 affine_max를 하나의 커널로 병합)
+  affine_minmax_pair_gpu<<<blocksPerGrid, 256>>>(
+      lower_M, lower_p, upper_M, upper_p, d_xl, d_xu, d_final_lower, d_final_upper);
   
   // 4. 길이 16짜리 최종 결과 벡터만 CPU로 D2H 복사 (통신 비용 극소화)
   final_lower = make_zero_vector(out_dim);
