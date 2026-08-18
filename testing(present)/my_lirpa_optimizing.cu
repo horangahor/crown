@@ -1729,8 +1729,11 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
                         const Vector &initial_lower_p,
                         const Matrix &initial_upper_M,
                         const Vector &initial_upper_p,
+                        const Vector &x0, double eps,
+                        Vector &final_lower, Vector &final_upper,
                         Matrix &final_lower_M, Vector &final_lower_p,
-                        Matrix &final_upper_M, Vector &final_upper_p) {
+                        Matrix &final_upper_M, Vector &final_upper_p,
+                        bool output_matrices) {
   Matrix *lower_M = g_pool.d_bwd_mat[0];
   Matrix *upper_M = g_pool.d_bwd_mat[1];
   Matrix *lower_pos = g_pool.d_bwd_mat[2];
@@ -1815,11 +1818,51 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
     std::swap(upper_p, new_upper_p);
   }
 
-  // 최종 결과물만 GPU에서 호스트(CPU)로 복사해서 돌려줌
-  cudaMemcpy(&final_lower_M, lower_M, sizeof(Matrix), cudaMemcpyDeviceToHost);
-  cudaMemcpy(&final_upper_M, upper_M, sizeof(Matrix), cudaMemcpyDeviceToHost);
-  cudaMemcpy(&final_lower_p, lower_p, sizeof(Vector), cudaMemcpyDeviceToHost);
-  cudaMemcpy(&final_upper_p, upper_p, sizeof(Vector), cudaMemcpyDeviceToHost);
+  // =================================================================
+  // [Kernel Fusion] 거대한 계수 행렬을 CPU로 가져오지 않고 GPU에서 affine_min/max 바로 계산
+  // =================================================================
+  
+  // 1. x0, eps를 사용해 xl, xu를 CPU에서 빠르게 만듦
+  Vector xl = make_zero_vector(x0.n);
+  Vector xu = make_zero_vector(x0.n);
+  // 여기서 vec_sub, vec_add 를 안쓰고 cpu 로 했음..
+  for (int i = 0; i < x0.n; ++i) {
+    xl.v[i] = x0.v[i] - eps;
+    xu.v[i] = x0.v[i] + eps;
+  }
+  
+  // 2. GPU 메모리 풀의 남는 공간을 활용해 xl, xu 업로드 (크기가 작아서 순식간)
+  Vector *d_xl = g_pool.d_bwd_vec[2];
+  Vector *d_xu = g_pool.d_bwd_vec[3];
+  Vector *d_final_lower = g_pool.d_bwd_vec[4];
+  Vector *d_final_upper = g_pool.d_bwd_vec[5];
+  
+  cudaMemcpy(d_xl, &xl, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_xu, &xu, sizeof(Vector), cudaMemcpyHostToDevice);
+  
+  int out_dim = initial_lower_M.rows;
+  int blocksPerGrid = (out_dim + 255) / 256;
+  
+  // 3. GPU 안에서 최종 정답 계산
+  // 커널 퓨전 가능할듯
+  affine_min_gpu<<<blocksPerGrid, 256>>>(lower_M, lower_p, d_xl, d_xu, d_final_lower);
+  affine_max_gpu<<<blocksPerGrid, 256>>>(upper_M, upper_p, d_xl, d_xu, d_final_upper);
+  
+  // 4. 길이 16짜리 최종 결과 벡터만 CPU로 D2H 복사 (통신 비용 극소화)
+  final_lower = make_zero_vector(out_dim);
+  final_upper = make_zero_vector(out_dim);
+  cudaMemcpy(&final_lower, d_final_lower, sizeof(Vector), cudaMemcpyDeviceToHost);
+  cudaMemcpy(&final_upper, d_final_upper, sizeof(Vector), cudaMemcpyDeviceToHost);
+  final_lower.n = out_dim;
+  final_upper.n = out_dim;
+
+  // 만약 사용자가 행렬 원본을 원할 경우에만(materialize_host_results=true) 복사해줌
+  if (output_matrices) {
+    cudaMemcpy(&final_lower_M, lower_M, sizeof(Matrix), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&final_upper_M, upper_M, sizeof(Matrix), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&final_lower_p, lower_p, sizeof(Vector), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&final_upper_p, upper_p, sizeof(Vector), cudaMemcpyDeviceToHost);
+  }
 }
 
 // 이거 대신 backward_bound_gpu를 사용함 (로직은 동일, 다만 GPU, CPU구현에서 차이)
@@ -1924,14 +1967,13 @@ BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const
 
   // 초기 lower_M,p / upper_M,p를 준다.
   // 나중에 lower_M,p / upper_M,p ==> out.final에 값 덮어쓰기
+  // 커널 퓨전 덕분에 out.final_lower, upper 까지 여기서 한번에 계산됨
   backward_bound_gpu(net, fwd, lower_M, lower_p, upper_M, upper_p,
+                     x0, eps, out.final_lower, out.final_upper,
                      out.final_affine.lower_A, out.final_affine.lower_c,
-                     out.final_affine.upper_A, out.final_affine.upper_c);
+                     out.final_affine.upper_A, out.final_affine.upper_c,
+                     materialize_forward_results);
 
-  out.final_lower = affine_min(out.final_affine.lower_A,
-                               out.final_affine.lower_c, x0, eps);
-  out.final_upper = affine_max(out.final_affine.upper_A,
-                               out.final_affine.upper_c, x0, eps);
   out.num_layer_bounds = fwd.num_layer_bounds;
 
   // forward에서 얻은 중간 계산 결과 스킵
