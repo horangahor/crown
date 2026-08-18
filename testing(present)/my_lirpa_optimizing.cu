@@ -1322,17 +1322,40 @@ Vector apply_activation(const Vector &s, const ActivationType act){
   return out;
 }
 
+// 신경망 순전파 (추론)
+// 인자로 신경망 , 입력값(256개)
 Vector network_forward(const FullyConnectedNetwork &net, const Vector &x) {
   require(x.n == network_input_dim(net),
           "network_forward input dimension mismatch.");
   prepare_network_on_gpu(net);
-  Vector f = x;
+  
+  // 1. 입력 데이터를 처음에 단 한 번만 GPU로 복사 (H2D)
+  cudaMemcpy(g_pool.d_vec[0], &x, sizeof(Vector), cudaMemcpyHostToDevice);
+  
+  // 사용할 입력, 출력 벡터 포인터 선언
+  Vector *d_in = g_pool.d_vec[0];
+  Vector *d_out = g_pool.d_vec[1];
+
   for (int l = 0; l < net.num_layers; ++l) {
-    Vector s = matvec_bias_device_matrix(g_pool.d_weight[l],
-                                         net.W[l].rows, net.W[l].cols,
-                                         g_pool.d_bias[l], f);
-    f = apply_activation(s, net.act[l]);
+    const int rows = net.W[l].rows;
+    const int blocksPerGrid = (rows + 255) / 256;
+    
+    // 2. GPU 내부에서 행렬곱 + Bias 덧셈 실행
+    matvec_bias_gpu<<<blocksPerGrid, 256>>>(g_pool.d_weight[l], d_in, g_pool.d_bias[l], d_out);
+    
+    // 3. GPU 내부에서 활성화 함수 적용
+    // 여기서 CPU 메모리에 있는 net.act[l]를 사용했는데, CUDA 커널 인자 방식을 이해해야함
+    apply_activation_gpu<<<blocksPerGrid, 256>>>(net.act[l], d_out);
+    
+    // 4. 다음 레이어의 입력을 현재 출력으로 스왑
+    std::swap(d_in, d_out);
   }
+  
+  // 5. 모든 레이어를 통과한 최종 결과만 단 한 번 CPU로 복사 (D2H)
+  // (마지막 루프에서 스왑되었으므로 최종 결과는 d_in에 있음)
+  Vector f = make_zero_vector(network_output_dim(net));
+  cudaMemcpy(&f, d_in, sizeof(Vector), cudaMemcpyDeviceToHost);
+  
   return f;
 }
 
