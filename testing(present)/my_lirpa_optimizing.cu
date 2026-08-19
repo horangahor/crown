@@ -264,10 +264,18 @@ Matrix make_eye_cpu(int n) {
 }
 
 __global__ void make_eye_gpu(Matrix *out, int n) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid == 0) {
+    out->rows = n;
+    out->cols = n;
+  }
   if (tid < n) {
     out->a[tid][tid] = 1.0;
   }
+}
+
+__global__ void set_vector_size_gpu(Vector *out, int n) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) out->n = n;
 }
 
 // 단위행렬 만들기
@@ -1400,12 +1408,12 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
   const int in_dim = network_input_dim(net);
   cudaMemset(lower_A, 0, sizeof(Matrix));
   cudaMemset(upper_A, 0, sizeof(Matrix));
-  set_matrix_shape(lower_A, in_dim, in_dim);
-  set_matrix_shape(upper_A, in_dim, in_dim);
   make_eye_gpu<<<(in_dim + 255) / 256, 256>>>(lower_A, in_dim);
   make_eye_gpu<<<(in_dim + 255) / 256, 256>>>(upper_A, in_dim);
-  cudaMemset(lower_c, 0, sizeof(Vector)); set_vector_size(lower_c, in_dim);
-  cudaMemset(upper_c, 0, sizeof(Vector)); set_vector_size(upper_c, in_dim);
+  cudaMemset(lower_c, 0, sizeof(Vector));        // 중복되는 형태 세팅 제거
+  cudaMemset(upper_c, 0, sizeof(Vector));
+  set_vector_size_gpu<<<1, 1>>>(lower_c, in_dim);
+  set_vector_size_gpu<<<1, 1>>>(upper_c, in_dim);
   Vector xl = x0, xu = x0;
   for (int i = 0; i < in_dim; ++i) { xl.v[i] -= eps; xu.v[i] += eps; }
   cudaMemcpy(d_xl, &xl, sizeof(Vector), cudaMemcpyHostToDevice);
@@ -1719,6 +1727,43 @@ __global__ void backward_matmul_pair_gpu(
   }
 }
 
+// Initialize the default output specification directly on the GPU.  The
+// caller can selectively keep host copies for user-supplied specifications.
+// 단위행렬 , 영벡터 복사 안하고 GPU에서 직접 만들기 (커널 퓨전 함수) (default가 true면 안건듦)
+__global__ void initialize_backward_state_gpu(
+    Matrix *lower_M, Matrix *upper_M, Vector *lower_p, Vector *upper_p,
+    int matrix_rows, int matrix_cols, int vector_n,
+    bool default_lower_M, bool default_upper_M,
+    bool default_lower_p, bool default_upper_p) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int matrix_elements = matrix_rows * matrix_cols;
+
+  if (tid == 0) {
+    if (default_lower_M) {
+      lower_M->rows = matrix_rows;
+      lower_M->cols = matrix_cols;
+    }
+    if (default_upper_M) {
+      upper_M->rows = matrix_rows;
+      upper_M->cols = matrix_cols;
+    }
+    if (default_lower_p) lower_p->n = vector_n;
+    if (default_upper_p) upper_p->n = vector_n;
+  }
+
+  if (tid < matrix_elements) {
+    const int r = tid / matrix_cols;
+    const int c = tid % matrix_cols;
+    if (default_lower_M) lower_M->a[r][c] = (r == c) ? 1.0 : 0.0;
+    if (default_upper_M) upper_M->a[r][c] = (r == c) ? 1.0 : 0.0;
+  }
+
+  if (tid < vector_n) {
+    if (default_lower_p) lower_p->v[tid] = 0.0;
+    if (default_upper_p) upper_p->v[tid] = 0.0;
+  }
+}
+
 // GPU-resident backward pass. Relaxation coefficients stay on the GPU between
 // forward and backward; host copies are limited to inputs and final results.
 // 단지 전체 레이어를 루프로 돌면서 커널 퓨전(Kernel Fusion)과 포인터 스왑을 통해 
@@ -1729,11 +1774,12 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
                         const Vector &initial_lower_p,
                         const Matrix &initial_upper_M,
                         const Vector &initial_upper_p,
-                        const Vector &x0, double eps,
                         Vector &final_lower, Vector &final_upper,
                         Matrix &final_lower_M, Vector &final_lower_p,
                         Matrix &final_upper_M, Vector &final_upper_p,
-                        bool output_matrices) {
+                        bool output_matrices, // 아웃풋 
+                        bool default_lower_M, bool default_lower_p,
+                        bool default_upper_M, bool default_upper_p) {
   Matrix *lower_M = g_pool.d_bwd_mat[0];
   Matrix *upper_M = g_pool.d_bwd_mat[1];
   Matrix *lower_pos = g_pool.d_bwd_mat[2];
@@ -1751,11 +1797,26 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
   Vector *new_lower_p = g_pool.d_bwd_vec[10];
   Vector *new_upper_p = g_pool.d_bwd_vec[11];
 
-  // GPU에서 사용하기 위해 초기값을 GPU로 복사
-  cudaMemcpy(lower_M, &initial_lower_M, sizeof(Matrix), cudaMemcpyHostToDevice);
-  cudaMemcpy(upper_M, &initial_upper_M, sizeof(Matrix), cudaMemcpyHostToDevice);
-  cudaMemcpy(lower_p, &initial_lower_p, sizeof(Vector), cudaMemcpyHostToDevice);
-  cudaMemcpy(upper_p, &initial_upper_p, sizeof(Vector), cudaMemcpyHostToDevice);
+  // 기본 identity/zero 출력 사양은 GPU에서 직접 생성한다. 사용자 지정
+  // 사양만 필요한 경우에 한해 기존 Host-to-Device 복사를 수행한다.
+  // 기본 초기화(단위행렬 등)를 memcpy를 쓰지 않고 GPU에서 직접 한다. (initialize_backward_state_gpu 커널)
+  const int matrix_rows = initial_lower_M.rows;
+  const int matrix_cols = initial_lower_M.cols;
+  const int vector_n = initial_lower_p.n;
+  const int init_elements = max(matrix_rows * matrix_cols, vector_n);
+  initialize_backward_state_gpu<<<(init_elements + 255) / 256, 256>>>(
+      lower_M, upper_M, lower_p, upper_p,
+      matrix_rows, matrix_cols, vector_n,
+      default_lower_M, default_upper_M, default_lower_p, default_upper_p);
+
+  if (!default_lower_M) // 사용자가 기본 행렬에 대해 초기화를 진행하지 않고 직접 넘겨준 경우 복사를 한다.
+    cudaMemcpy(lower_M, &initial_lower_M, sizeof(Matrix), cudaMemcpyHostToDevice);
+  if (!default_upper_M)
+    cudaMemcpy(upper_M, &initial_upper_M, sizeof(Matrix), cudaMemcpyHostToDevice);
+  if (!default_lower_p)
+    cudaMemcpy(lower_p, &initial_lower_p, sizeof(Vector), cudaMemcpyHostToDevice);
+  if (!default_upper_p)
+    cudaMemcpy(upper_p, &initial_upper_p, sizeof(Vector), cudaMemcpyHostToDevice);
 
   // Backward는 출력층(마지막 레이어)부터 입력층(0번 레이어)까지 역순으로 
   // 원래 lirpa_backward_bound 에서 루프 하던 걸 여기서 역전파 하도록 바꿈
@@ -1822,23 +1883,12 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
   // [Kernel Fusion] 거대한 계수 행렬을 CPU로 가져오지 않고 GPU에서 affine_min/max 바로 계산
   // =================================================================
   
-  // 1. x0, eps를 사용해 xl, xu를 CPU에서 빠르게 만듦
-  Vector xl = make_zero_vector(x0.n);
-  Vector xu = make_zero_vector(x0.n);
-  // 여기서 vec_sub, vec_add 를 안쓰고 cpu 로 했음..
-  for (int i = 0; i < x0.n; ++i) {
-    xl.v[i] = x0.v[i] - eps;
-    xu.v[i] = x0.v[i] + eps;
-  }
-  
-  // 2. GPU 메모리 풀의 남는 공간을 활용해 xl, xu 업로드 (크기가 작아서 순식간)
-  Vector *d_xl = g_pool.d_bwd_vec[2];
-  Vector *d_xu = g_pool.d_bwd_vec[3];
+  // forward 단계가 이미 GPU에 올려둔 입력 구간 벡터를 재사용한다.
+  // 따라서 backward에서 동일한 x_l/x_u를 다시 H2D 복사하지 않는다.
+  Vector *d_xl = g_pool.d_fwd_vec[12];      // xl 이 아마 입력 - eps (인자로 x0, eps 받을 필요 사라짐)
+  Vector *d_xu = g_pool.d_fwd_vec[13];      // xu 이 입력 + eps
   Vector *d_final_lower = g_pool.d_bwd_vec[4];
   Vector *d_final_upper = g_pool.d_bwd_vec[5];
-  
-  cudaMemcpy(d_xl, &xl, sizeof(Vector), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_xu, &xu, sizeof(Vector), cudaMemcpyHostToDevice);
   
   int out_dim = initial_lower_M.rows;
   int blocksPerGrid = (out_dim + 255) / 256;
@@ -1942,10 +1992,11 @@ BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const
   Vector lower_p; // lower bound 선형 방정식 y절편
   Vector upper_p; // upper bound 선형 방정식 y절편
 
+  // 여기서 initialize_backward_state_gpu가 직접 해당 형태를 만드는데, 왜 형태를 잡아줬냐면 크기 정보를 줘야 하기 때문임
   if (output_lower_M) { lower_M = *output_lower_M; }
-  else { lower_M = make_eye(output_dim); }
+  else { lower_M = make_eye_cpu(output_dim); }  // 단위행렬 만들기를 cpu로 바꿈
   if (output_upper_M) { upper_M = *output_upper_M; }
-  else { upper_M = make_eye(output_dim); }
+  else { upper_M = make_eye_cpu(output_dim); }  // 단위행렬 만들기를 cpu로 바꿈
   if (output_lower_p) { lower_p = *output_lower_p; }
   else { lower_p = make_zero_vector(lower_M.rows); }
   if (output_upper_p) { upper_p = *output_upper_p; }
@@ -1959,6 +2010,12 @@ BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const
           "Output spec vector row mismatch.");
 
   BackwardBoundResult out;
+
+  // 형태가 잡아졌다면(우리가 초기화를 했다면) 이부분에서 default... 는 true가 됨
+  const bool default_lower_M = (output_lower_M == nullptr);
+  const bool default_lower_p = (output_lower_p == nullptr);
+  const bool default_upper_M = (output_upper_M == nullptr);
+  const bool default_upper_p = (output_upper_p == nullptr);
   
   // 과거에는 바로 이 위치에서 for (int l = net.num_layers - 1; l >= 0; --l) 
   // 루프를 돌면서 backward_one_layer(...) 를 층(layer) 개수만큼 반복 호출
@@ -1969,10 +2026,12 @@ BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const
   // 나중에 lower_M,p / upper_M,p ==> out.final에 값 덮어쓰기
   // 커널 퓨전 덕분에 out.final_lower, upper 까지 여기서 한번에 계산됨
   backward_bound_gpu(net, fwd, lower_M, lower_p, upper_M, upper_p,
-                     x0, eps, out.final_lower, out.final_upper,
+                     out.final_lower, out.final_upper,   // 입력, eps은 forward 때 올려놨던 거 사용
                      out.final_affine.lower_A, out.final_affine.lower_c,
                      out.final_affine.upper_A, out.final_affine.upper_c,
-                     materialize_forward_results);
+                     materialize_forward_results,
+                     default_lower_M, default_lower_p,   // 여기부분이 true
+                     default_upper_M, default_upper_p);  // 여기부분이 true
 
   out.num_layer_bounds = fwd.num_layer_bounds;
 
