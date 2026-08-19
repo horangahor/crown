@@ -246,22 +246,66 @@ int main(int argc, char** argv){
     }
     std::cout << "=======================================================================\n";
 
-    // 신경망 정렬 (범위)
-    //std::sort(results.begin(), results.end(), [](const NodeResult& a, const NodeResult& b) {
-    //    return a.range < b.range;
-    //});
+    // 신경망 정렬 (하한)
+    std::sort(results.begin(), results.end(), [](const NodeResult& a, const NodeResult& b) {
+        return a.lower > b.lower;
+    });
 
-    std::cout << "\n[8 Nodes - Sorted by Range]\n";
+    // 상한을 내림차순으로 정렬하는 부분
+    std::vector<NodeResult> upper_results;
+    for (int i = 0; i < out_dim; ++i) {
+        upper_results.push_back({i, bwd.final_lower.v[i], bwd.final_upper.v[i], y.v[i]});
+    }
+
+    // 신경망 정렬 (상한)
+    std::sort(upper_results.begin(), upper_results.end(), [](const NodeResult& a, const NodeResult& b) {
+        return a.upper > b.upper;
+    });
+
+    // 내림차순으로 정렬된 lower 바운드 (8~16) 8개만 따로 출력
+    std::cout << "\n[8 Nodes - Sorted by lower Bound]\n";
     std::cout << "[Index] | Lower Bound | Upper Bound | inference (y) \n";
     std::cout << "-----------------------------------------------------------------------\n";
     for (int i = 0; i < print_count; ++i) {
         const auto& r = results[i];
+        std::cout << "[" << std::setw(3) << r.index << "]   |  " 
+                      << std::setw(9) << r.lower << "  |  "
+                      << std::setw(9) << r.upper << "  |  "
+                      << std::setw(9) << r.pred << "\n";
+    }
+    std::cout << "=======================================================================\n";
+
+    std::cout << "\n[8 Nodes - Sorted by upper Bound]\n";
+    std::cout << "[Index] | Lower Bound | Upper Bound | inference (y) \n";
+    std::cout << "-----------------------------------------------------------------------\n";
+    for (int i = 8; i < print_count+8; ++i) {
+        const auto& r = upper_results[i];
         std::cout << "[" << std::setw(3) << r.index << "]   |  " 
                   << std::setw(9) << r.lower << "  |  "
                   << std::setw(9) << r.upper << "  |  "
                   << std::setw(9) << r.pred << "\n";
     }
     std::cout << "=======================================================================\n";
+
+
+    // 최종 판단
+    if (results[7].lower > upper_results[8].upper )
+    {
+        std::cout << "\n[8 Nodes - Sorted by Bound]\n";
+        std::cout << "[Index] | Lower Bound | Upper Bound | inference (y) \n";
+        std::cout << "-----------------------------------------------------------------------\n";
+        for (int i = 0; i < print_count; ++i) {
+            const auto& r = results[i];
+            std::cout << "[" << std::setw(3) << r.index << "]   |  " 
+                      << std::setw(9) << r.lower << "  |  "
+                      << std::setw(9) << r.upper << "  |  "
+                      << std::setw(9) << r.pred << "\n";
+        }
+        std::cout << "=======================================================================\n";
+    }
+    else{
+        std::cout << "unable to determine";
+    }
 
     // 동적 할당 해제
     delete net;
