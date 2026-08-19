@@ -78,7 +78,7 @@ FullyConnectedNetwork* load_custom_network(const char* filepath){
         // 편향의 개수는 n_out
         int b_elements = n_out;
 
-        // <f8 은 float64 ==> C++의 double
+        // .bin 파일은 float64(double) 형식으로 저장됨 -> double로 읽고 float으로 변환
         std::vector<double> temp_W(w_elements);
         std::vector<double> temp_b(b_elements);
 
@@ -88,24 +88,20 @@ FullyConnectedNetwork* load_custom_network(const char* filepath){
         std::cout << "- Layer " << i << " Weight read: " << n_out << " x " << n_in << std::endl;
         std::cout << "- Layer " << i << " Bias read: " << n_out << std::endl;
         
-        // 1. 읽은 데이터를 FullyConnectedNetwork 구조체에 복사
-
         // 가중치는 행렬
         net->W[i].rows = n_out;
         net->W[i].cols = n_in;
-        // 2차원 행렬에 각각 가중치값 집어넣기 <== device에서 하도록 가능
+        // double -> float 변환하여 저장 (FP32 전환의 핵심)
         for (int r = 0; r < n_out; ++r) {
             for (int c = 0; c < n_in; ++c) {
-                // 바이너리(numpy row-major)에서 (r, c) 인덱스 찾기
-                net->W[i].a[r][c] = temp_W[r * n_in + c];
+                net->W[i].a[r][c] = static_cast<float>(temp_W[r * n_in + c]);
             }
         }
 
         // 편향은 벡터
         net->b[i].n = n_out;
-        // 편향 값 집어넣기 <== device에서 하도록 가능 
         for (int r = 0; r < n_out; ++r) {
-            net->b[i].v[r] = temp_b[r];
+            net->b[i].v[r] = static_cast<float>(temp_b[r]);
         }
 
         // 2. 활성화 함수 설정 (CustomToLirpa.py 규칙 적용)
@@ -132,10 +128,13 @@ Vector load_test_data(const char* filepath, int expected_dim) {
         return x0;
     }
 
-    // 64비트 실수(double) 배열로 통째로 읽기
-    file.read((char*)x0.v, sizeof(double) * expected_dim);
+    // .bin 파일은 float64(double) 형식으로 저장됨 -> double로 읽고 float으로 변환
+    std::vector<double> temp(expected_dim);
+    file.read((char*)temp.data(), sizeof(double) * expected_dim);
     file.close();
-
+    for (int i = 0; i < expected_dim; ++i) {
+        x0.v[i] = static_cast<float>(temp[i]);
+    }
     return x0;
 }
 

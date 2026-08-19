@@ -42,16 +42,16 @@ enum class ActivationType {
   Linear,
 };
 
-// 거의 2MB 의 크기를 가짐 (512 * 512 * 8byte)
+// float 전환 후 약 1MB 크기 (512 * 512 * 4byte)
 struct Matrix {
-  int rows = 0;                 // 4 btye
-  int cols = 0;                 // 4 byte
-  double a[MAX_DIM][MAX_DIM]{}; // 8 * 512 * 512 ==> 2MB
+  int rows = 0;                // 4 byte
+  int cols = 0;                // 4 byte
+  float a[MAX_DIM][MAX_DIM]{}; // 4 * 512 * 512 ==> 1MB (double 대비 절반)
 };
 
 struct Vector {
-  int n = 0;           // 4byte
-  double v[MAX_DIM]{}; // 8byte * 512(2^9)  ==> 4KB
+  int n = 0;          // 4byte
+  float v[MAX_DIM]{}; // 4byte * 512 ==> 2KB (double 대비 절반)
 };
 
 struct AffineBound {
@@ -209,20 +209,33 @@ void gpu_pool_cleanup() {
 // 기본 유틸리티
 // ============================================================
 
-__host__ __device__ inline double pos(double x) { return x > 0.0 ? x : 0.0; }
-__host__ __device__ inline double neg(double x) { return x < 0.0 ? x : 0.0; }
-__host__ __device__ inline double relu(double x) { return x > 0.0 ? x : 0.0; }
+__host__ __device__ inline float pos(float x) { return x > 0.0f ? x : 0.0f; }
+__host__ __device__ inline float neg(float x) { return x < 0.0f ? x : 0.0f; }
+__host__ __device__ inline float relu(float x) { return x > 0.0f ? x : 0.0f; }
 
-__host__ __device__ inline double sigmoid(double x) {
-  if (x >= 0.0) {
-    return 1.0 / (1.0 + exp(-x));
+// GPU 커널용 float sigmoid
+__host__ __device__ inline float sigmoid(float x) {
+  if (x >= 0.0f) {
+    return 1.0f / (1.0f + expf(-x));
   }
-  const double ex = exp(x);
-  return ex / (1.0 + ex);
+  const float ex = expf(x);
+  return ex / (1.0f + ex);
 }
 
-__host__ __device__ inline double sigmoid_prime(double x) {
-  const double s = sigmoid(x);
+// GPU 커널용 float sigmoid_prime
+__host__ __device__ inline float sigmoid_prime(float x) {
+  const float s = sigmoid(x);
+  return s * (1.0f - s);
+}
+
+// CPU 전용 double sigmoid (bisect_root / sigmoid_relax 에서만 사용)
+static double sigmoid_double(double x) {
+  if (x >= 0.0) return 1.0 / (1.0 + std::exp(-x));
+  const double ex = std::exp(x);
+  return ex / (1.0 + ex);
+}
+static double sigmoid_prime_double(double x) {
+  const double s = sigmoid_double(x);
   return s * (1.0 - s);
 }
 
@@ -258,7 +271,7 @@ Vector make_zero_vector(int n) {
 Matrix make_eye_cpu(int n) {
   Matrix out = make_zero_matrix(n, n);
   for (int i = 0; i < n; ++i) {
-    out.a[i][i] = 1.0;
+    out.a[i][i] = 1.0f;
   }
   return out;
 }
@@ -270,7 +283,7 @@ __global__ void make_eye_gpu(Matrix *out, int n) {
     out->cols = n;
   }
   if (tid < n) {
-    out->a[tid][tid] = 1.0;
+    out->a[tid][tid] = 1.0f;
   }
 }
 
@@ -395,9 +408,9 @@ __global__ void matmul_gpu(const Matrix *A, const Matrix *B, Matrix *C) {
   if (tid < total_elements) {
     int r = tid / B->cols;
     int c = tid % B->cols;
-    double sum = 0.0;
+    float sum = 0.0f;
     for (int k = 0; k < A->cols; ++k) {
-      if (A->a[r][k] == 0.0) {
+      if (A->a[r][k] == 0.0f) {
         continue;
       }
       sum += A->a[r][k] * B->a[k][c];
@@ -477,7 +490,7 @@ Matrix matmul_device_lhs(const Matrix *d_A, int a_rows, int a_cols,
 __global__ void matvec_gpu(const Matrix *A, const Vector *x, Vector *y) {
   int tid = blockDim.x * blockIdx.x + threadIdx.x;
   if (tid < A->rows) {
-    double sum = 0.0;
+    float sum = 0.0f;
     for (int j = 0; j < A->cols; ++j) {
       sum += A->a[tid][j] * x->v[j];
     }
@@ -491,7 +504,7 @@ __global__ void matvec_bias_gpu(const Matrix *A, const Vector *x,
   const int tid = blockDim.x * blockIdx.x + threadIdx.x;
   if (tid == 0) y->n = A->rows;
   if (tid < A->rows) {
-    double sum = bias->v[tid];
+    float sum = bias->v[tid];
     for (int j = 0; j < A->cols; ++j) {
       sum += A->a[tid][j] * x->v[j];
     }
@@ -750,7 +763,7 @@ Vector elemwise_mul(const Vector &a, const Vector &b) {
 }
 
 // CPU 원본 (비교용)
-Vector make_eps_vec_cpu(int n, double eps) {
+Vector make_eps_vec_cpu(int n, float eps) {
   Vector out = make_zero_vector(n);
   for (int i = 0; i < n; ++i) {
     out.v[i] = eps;
@@ -759,14 +772,14 @@ Vector make_eps_vec_cpu(int n, double eps) {
 }
 
 // 엡실론 벡터 만들기 (Vector 1개 사용)
-__global__ void make_eps_vec_gpu(Vector *out, int n, double eps) {
+__global__ void make_eps_vec_gpu(Vector *out, int n, float eps) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid < n) {
     out->v[tid] = eps;
   }
 }
 
-Vector make_eps_vec(int n, double eps) {
+Vector make_eps_vec(int n, float eps) {
   ensure_pool();
   Vector out = make_zero_vector(n);
 
@@ -789,9 +802,9 @@ __global__ void affine_min_gpu(const Matrix *A, const Vector *c,
                                Vector *out) {
   int tid = blockDim.x * blockIdx.x + threadIdx.x;
   if (tid < A->rows) {
-    double sum = c->v[tid];
+    float sum = c->v[tid];
     for (int j = 0; j < A->cols; ++j) {
-      double aij = A->a[tid][j];
+      float aij = A->a[tid][j];
       sum += pos(aij) * xl->v[j] + neg(aij) * xu->v[j];
     }
     out->v[tid] = sum;
@@ -799,7 +812,7 @@ __global__ void affine_min_gpu(const Matrix *A, const Vector *c,
 }
 
 Vector affine_min(const Matrix &A, const Vector &c, const Vector &x0,
-                  double eps) {
+                  float eps) {
   require(A.rows == c.n && A.cols == x0.n, "affine_min shape mismatch.");
   ensure_pool();
 
@@ -833,9 +846,9 @@ __global__ void affine_max_gpu(const Matrix *A, const Vector *c,
                                Vector *out) {
   int tid = blockDim.x * blockIdx.x + threadIdx.x;
   if (tid < A->rows) {
-    double sum = c->v[tid];
+    float sum = c->v[tid];
     for (int j = 0; j < A->cols; ++j) {
-      double aij = A->a[tid][j];
+      float aij = A->a[tid][j];
       sum += pos(aij) * xu->v[j] + neg(aij) * xl->v[j];
     }
     out->v[tid] = sum;
@@ -843,7 +856,7 @@ __global__ void affine_max_gpu(const Matrix *A, const Vector *c,
 }
 
 Vector affine_max(const Matrix &A, const Vector &c, const Vector &x0,
-                  double eps) {
+                  float eps) {
   require(A.rows == c.n && A.cols == x0.n, "affine_max shape mismatch.");
   ensure_pool();
 
@@ -876,23 +889,23 @@ __global__ void relu_relax_gpu(const Vector *lower, const Vector *upper,
                                Vector *beta_u) {
   int tid = blockDim.x * blockIdx.x + threadIdx.x;
   if (tid < lower->n) {
-    double l = lower->v[tid];
-    double u = upper->v[tid];
+    float l = lower->v[tid];
+    float u = upper->v[tid];
     assert(l <= u);
 
-    if (l >= 0.0) {
-      alpha_l->v[tid] = 1.0;
-      alpha_u->v[tid] = 1.0;
-    } else if (u <= 0.0) {
+    if (l >= 0.0f) {
+      alpha_l->v[tid] = 1.0f;
+      alpha_u->v[tid] = 1.0f;
+    } else if (u <= 0.0f) {
       // keep zeros
     } else {
-      double denom = u - l;
+      float denom = u - l;
       alpha_u->v[tid] = u / denom;
       beta_u->v[tid] = -u * l / denom;
 
-      bool use_identity_lower = fabs(l) < fabs(u);
-      alpha_l->v[tid] = use_identity_lower ? 1.0 : 0.0;
-      beta_l->v[tid] = 0.0;
+      bool use_identity_lower = fabsf(l) < fabsf(u);
+      alpha_l->v[tid] = use_identity_lower ? 1.0f : 0.0f;
+      beta_l->v[tid] = 0.0f;
     }
   }
 }
@@ -920,7 +933,7 @@ __global__ void matmul_pair_add_gpu(const Matrix *A1, const Matrix *B1,
   if (tid < total) {
     const int r = tid / B1->cols;
     const int c = tid % B1->cols;
-    double sum = 0.0;
+    float sum = 0.0f;
     for (int k = 0; k < A1->cols; ++k) {
       sum += A1->a[r][k] * B1->a[k][c]
            + A2->a[r][k] * B2->a[k][c];
@@ -935,7 +948,7 @@ __global__ void matvec_pair_bias_gpu(const Matrix *A1, const Vector *x1,
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid == 0) out->n = A1->rows;
   if (tid < A1->rows) {
-    double sum = bias->v[tid];
+    float sum = bias->v[tid];
     for (int j = 0; j < A1->cols; ++j) {
       sum += A1->a[tid][j] * x1->v[j]
            + A2->a[tid][j] * x2->v[j];
@@ -1002,11 +1015,11 @@ __global__ void affine_minmax_pair_gpu(
     upper_out->n = upper_A->rows;
   }
   if (tid < lower_A->rows) {
-    double lower_sum = lower_c->v[tid];
-    double upper_sum = upper_c->v[tid];
+    float lower_sum = lower_c->v[tid];
+    float upper_sum = upper_c->v[tid];
     for (int j = 0; j < lower_A->cols; ++j) {
-      const double lower_value = lower_A->a[tid][j];
-      const double upper_value = upper_A->a[tid][j];
+      const float lower_value = lower_A->a[tid][j];
+      const float upper_value = upper_A->a[tid][j];
       lower_sum += pos(lower_value) * xl->v[j]
                  + neg(lower_value) * xu->v[j];
       upper_sum += pos(upper_value) * xu->v[j]
@@ -1048,19 +1061,19 @@ __global__ void relu_relax_full_gpu(const Vector *lower, const Vector *upper,
     beta_u->n = lower->n;
   }
   if (tid >= lower->n) return;
-  const double l = lower->v[tid];
-  const double u = upper->v[tid];
-  if (l >= 0.0) {
-    alpha_l->v[tid] = 1.0; beta_l->v[tid] = 0.0;
-    alpha_u->v[tid] = 1.0; beta_u->v[tid] = 0.0;
-  } else if (u <= 0.0) {
-    alpha_l->v[tid] = 0.0; beta_l->v[tid] = 0.0;
-    alpha_u->v[tid] = 0.0; beta_u->v[tid] = 0.0;
+  const float l = lower->v[tid];
+  const float u = upper->v[tid];
+  if (l >= 0.0f) {
+    alpha_l->v[tid] = 1.0f; beta_l->v[tid] = 0.0f;
+    alpha_u->v[tid] = 1.0f; beta_u->v[tid] = 0.0f;
+  } else if (u <= 0.0f) {
+    alpha_l->v[tid] = 0.0f; beta_l->v[tid] = 0.0f;
+    alpha_u->v[tid] = 0.0f; beta_u->v[tid] = 0.0f;
   } else {
-    const double slope = u / (u - l);
+    const float slope = u / (u - l);
     alpha_u->v[tid] = slope; beta_u->v[tid] = -u * l / (u - l);
-    alpha_l->v[tid] = fabs(l) < fabs(u) ? 1.0 : 0.0;
-    beta_l->v[tid] = 0.0;
+    alpha_l->v[tid] = fabsf(l) < fabsf(u) ? 1.0f : 0.0f;
+    beta_l->v[tid] = 0.0f;
   }
 }
 
@@ -1074,8 +1087,8 @@ __global__ void linear_relax_full_gpu(Vector *alpha_l, Vector *beta_l,
     beta_u->n = n;
   }
   if (tid < n) {
-    alpha_l->v[tid] = 1.0; beta_l->v[tid] = 0.0;
-    alpha_u->v[tid] = 1.0; beta_u->v[tid] = 0.0;
+    alpha_l->v[tid] = 1.0f; beta_l->v[tid] = 0.0f;
+    alpha_u->v[tid] = 1.0f; beta_u->v[tid] = 0.0f;
   }
 }
 
@@ -1126,6 +1139,7 @@ void relu_relax(const Vector &lower, const Vector &upper, Vector &alpha_l,
 // sigmoid_relax (CPU - my_lirpa.cu와 동일, GPU 포팅 불필요)
 // ============================================================
 
+// bisect_root 와 sigmoid_relax는 수학적 정밀도가 필요하므로 double 유지
 double bisect_root(double lo, double hi,
                    const std::function<double(double)> &fn, int max_iter = 80,
                    double tol = 1e-12) {
@@ -1177,55 +1191,59 @@ void sigmoid_relax(const Vector &lower, const Vector &upper, Vector &alpha_l,
   alpha_u = make_zero_vector(lower.n);
   beta_u = make_zero_vector(lower.n);
 
+  // sigmoid_relax는 수학적 정확도를 위해 내부 계산은 double로 수행하고
+  // 최종 결과만 float Vector에 저장한다.
   for (int i = 0; i < lower.n; ++i) {
-    const double l = lower.v[i];
-    const double u = upper.v[i];
+    const double l = static_cast<double>(lower.v[i]);
+    const double u = static_cast<double>(upper.v[i]);
     require(l <= u, "Invalid interval in sigmoid_relax.");
 
     if (std::abs(u - l) < 1e-14) {
-      const double slope = sigmoid_prime(l);
-      const double intercept = sigmoid(l) - slope * l;
-      alpha_l.v[i] = slope; beta_l.v[i] = intercept;
-      alpha_u.v[i] = slope; beta_u.v[i] = intercept;
+      const double slope = sigmoid_prime_double(l);
+      const double intercept = sigmoid_double(l) - slope * l;
+      alpha_l.v[i] = static_cast<float>(slope);
+      beta_l.v[i]  = static_cast<float>(intercept);
+      alpha_u.v[i] = static_cast<float>(slope);
+      beta_u.v[i]  = static_cast<float>(intercept);
       continue;
     }
 
     if (l >= 0.0) {
-      const double slope_sec = (sigmoid(u) - sigmoid(l)) / (u - l);
-      alpha_l.v[i] = slope_sec;
-      beta_l.v[i] = sigmoid(u) - slope_sec * u;
+      const double slope_sec = (sigmoid_double(u) - sigmoid_double(l)) / (u - l);
+      alpha_l.v[i] = static_cast<float>(slope_sec);
+      beta_l.v[i]  = static_cast<float>(sigmoid_double(u) - slope_sec * u);
       const double x0 = 0.5 * (l + u);
-      const double slope_tan = sigmoid_prime(x0);
-      alpha_u.v[i] = slope_tan;
-      beta_u.v[i] = sigmoid(x0) - slope_tan * x0;
+      const double slope_tan = sigmoid_prime_double(x0);
+      alpha_u.v[i] = static_cast<float>(slope_tan);
+      beta_u.v[i]  = static_cast<float>(sigmoid_double(x0) - slope_tan * x0);
     } else if (u <= 0.0) {
       const double x0 = 0.5 * (l + u);
-      const double slope_tan = sigmoid_prime(x0);
-      alpha_l.v[i] = slope_tan;
-      beta_l.v[i] = sigmoid(x0) - slope_tan * x0;
-      const double slope_sec = (sigmoid(u) - sigmoid(l)) / (u - l);
-      alpha_u.v[i] = slope_sec;
-      beta_u.v[i] = sigmoid(u) - slope_sec * u;
+      const double slope_tan = sigmoid_prime_double(x0);
+      alpha_l.v[i] = static_cast<float>(slope_tan);
+      beta_l.v[i]  = static_cast<float>(sigmoid_double(x0) - slope_tan * x0);
+      const double slope_sec = (sigmoid_double(u) - sigmoid_double(l)) / (u - l);
+      alpha_u.v[i] = static_cast<float>(slope_sec);
+      beta_u.v[i]  = static_cast<float>(sigmoid_double(u) - slope_sec * u);
     } else {
-      const double su = sigmoid(u);
+      const double su = sigmoid_double(u);
       const auto fn_lower = [su, u](double d) {
-        return (su - sigmoid(d)) / (u - d) - sigmoid_prime(d);
+        return (su - sigmoid_double(d)) / (u - d) - sigmoid_prime_double(d);
       };
       const double du = bisect_root(l, 0.0, fn_lower);
 
-      const double sl = sigmoid(l);
+      const double sl = sigmoid_double(l);
       const auto fn_upper = [sl, l](double d) {
-        return (sigmoid(d) - sl) / (d - l) - sigmoid_prime(d);
+        return (sigmoid_double(d) - sl) / (d - l) - sigmoid_prime_double(d);
       };
       const double dl = bisect_root(0.0, u, fn_upper);
 
-      const double slope_lower = sigmoid_prime(du);
-      alpha_l.v[i] = slope_lower;
-      beta_l.v[i] = sigmoid(du) - slope_lower * du;
+      const double slope_lower = sigmoid_prime_double(du);
+      alpha_l.v[i] = static_cast<float>(slope_lower);
+      beta_l.v[i]  = static_cast<float>(sigmoid_double(du) - slope_lower * du);
 
-      const double slope_upper = sigmoid_prime(dl);
-      alpha_u.v[i] = slope_upper;
-      beta_u.v[i] = sigmoid(dl) - slope_upper * dl;
+      const double slope_upper = sigmoid_prime_double(dl);
+      alpha_u.v[i] = static_cast<float>(slope_upper);
+      beta_u.v[i]  = static_cast<float>(sigmoid_double(dl) - slope_upper * dl);
     }
 
     double lower_violation = 0.0;
@@ -1234,12 +1252,14 @@ void sigmoid_relax(const Vector &lower, const Vector &upper, Vector &alpha_l,
     for (int k = 0; k < SAMPLES; ++k) {
       const double x = l + (u - l) * static_cast<double>(k) /
                                static_cast<double>(SAMPLES - 1);
-      const double y = sigmoid(x);
-      lower_violation = std::max(lower_violation, alpha_l.v[i] * x + beta_l.v[i] - y);
-      upper_violation = std::max(upper_violation, y - (alpha_u.v[i] * x + beta_u.v[i]));
+      const double y = sigmoid_double(x);
+      lower_violation = std::max(lower_violation,
+          static_cast<double>(alpha_l.v[i]) * x + static_cast<double>(beta_l.v[i]) - y);
+      upper_violation = std::max(upper_violation,
+          y - (static_cast<double>(alpha_u.v[i]) * x + static_cast<double>(beta_u.v[i])));
     }
-    if (lower_violation > 1e-10) { beta_l.v[i] -= lower_violation + 1e-10; }
-    if (upper_violation > 1e-10) { beta_u.v[i] += upper_violation + 1e-10; }
+    if (lower_violation > 1e-10) { beta_l.v[i] -= static_cast<float>(lower_violation + 1e-10); }
+    if (upper_violation > 1e-10) { beta_u.v[i] += static_cast<float>(upper_violation + 1e-10); }
   }
 }
 
@@ -1258,6 +1278,8 @@ ActivationType parse_activation(const std::string &name) {
   throw std::invalid_argument("Unsupported activation: " + name);
 }
 
+// make_network: 외부 파일 로딩과의 호환을 위해 double 인터페이스 유지
+// 내부에서 float으로 변환하여 저장
 FullyConnectedNetwork make_network(int num_layers, const int *layer_in_dim, const int *layer_out_dim,
              const double W_data[MAX_LAYERS][MAX_DIM][MAX_DIM],
              const double b_data[MAX_LAYERS][MAX_DIM],
@@ -1279,9 +1301,9 @@ FullyConnectedNetwork make_network(int num_layers, const int *layer_in_dim, cons
     net.act[l] = parse_activation(activations[l]);
 
     for (int i = 0; i < out_d; ++i) {
-      net.b[l].v[i] = b_data[l][i];
+      net.b[l].v[i] = static_cast<float>(b_data[l][i]);
       for (int j = 0; j < in_d; ++j) {
-        net.W[l].a[i][j] = W_data[l][i][j];
+        net.W[l].a[i][j] = static_cast<float>(W_data[l][i][j]);
       }
     }
 
@@ -1559,9 +1581,9 @@ __global__ void split_pos_neg_gpu(const Matrix *in, Matrix *positive,
   if (tid < total) {
     const int r = tid / in->cols;
     const int c = tid % in->cols;
-    const double v = in->a[r][c];
-    positive->a[r][c] = v > 0.0 ? v : 0.0;
-    negative->a[r][c] = v < 0.0 ? v : 0.0;
+    const float v = in->a[r][c];
+    positive->a[r][c] = v > 0.0f ? v : 0.0f;
+    negative->a[r][c] = v < 0.0f ? v : 0.0f;
   }
 }
 
@@ -1584,12 +1606,12 @@ __global__ void split_pos_neg_pair_gpu(
   if (tid < total) {
     const int r = tid / lower_in->cols;
     const int c = tid % lower_in->cols;
-    const double lower_value = lower_in->a[r][c];
-    const double upper_value = upper_in->a[r][c];
-    lower_pos->a[r][c] = lower_value > 0.0 ? lower_value : 0.0;
-    lower_neg->a[r][c] = lower_value < 0.0 ? lower_value : 0.0;
-    upper_pos->a[r][c] = upper_value > 0.0 ? upper_value : 0.0;
-    upper_neg->a[r][c] = upper_value < 0.0 ? upper_value : 0.0;
+    const float lower_value = lower_in->a[r][c];
+    const float upper_value = upper_in->a[r][c];
+    lower_pos->a[r][c] = lower_value > 0.0f ? lower_value : 0.0f;
+    lower_neg->a[r][c] = lower_value < 0.0f ? lower_value : 0.0f;
+    upper_pos->a[r][c] = upper_value > 0.0f ? upper_value : 0.0f;
+    upper_neg->a[r][c] = upper_value < 0.0f ? upper_value : 0.0f;
   }
 }
 
@@ -1600,9 +1622,9 @@ __global__ void build_coeff_fused_gpu(const Matrix *in, const Vector *positive_s
   if (tid < total) {
     const int r = tid / in->cols;
     const int c = tid % in->cols;
-    const double v = in->a[r][c];
-    out->a[r][c] = v > 0.0 ? v * positive_scale->v[c]
-                           : v * negative_scale->v[c];
+    const float v = in->a[r][c];
+    out->a[r][c] = v > 0.0f ? v * positive_scale->v[c]
+                            : v * negative_scale->v[c];
   }
 }
 
@@ -1621,12 +1643,12 @@ __global__ void build_coeff_pair_fused_gpu(
   if (tid < total) {
     const int r = tid / lower_in->cols;
     const int c = tid % lower_in->cols;
-    const double lower_value = lower_in->a[r][c];
-    const double upper_value = upper_in->a[r][c];
-    lower_out->a[r][c] = lower_value > 0.0
+    const float lower_value = lower_in->a[r][c];
+    const float upper_value = upper_in->a[r][c];
+    lower_out->a[r][c] = lower_value > 0.0f
         ? lower_value * alpha_l->v[c]
         : lower_value * alpha_u->v[c];
-    upper_out->a[r][c] = upper_value > 0.0
+    upper_out->a[r][c] = upper_value > 0.0f
         ? upper_value * alpha_u->v[c]
         : upper_value * alpha_l->v[c];
   }
@@ -1662,7 +1684,7 @@ __global__ void backward_bias_fused_gpu(const Matrix *positive,
                                         const Vector *old_p, Vector *out) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid < positive->rows) {
-    double sum = old_p->v[tid];
+    float sum = old_p->v[tid];
     for (int j = 0; j < positive->cols; ++j) {
       sum += positive->a[tid][j] * positive_term->v[j]
            + negative->a[tid][j] * negative_term->v[j];
@@ -1684,8 +1706,8 @@ __global__ void backward_bias_pair_fused_gpu(
     upper_out->n = upper_pos->rows;
   }
   if (tid < lower_pos->rows) {
-    double lower_sum = lower_old_p->v[tid];
-    double upper_sum = upper_old_p->v[tid];
+    float lower_sum = lower_old_p->v[tid];
+    float upper_sum = upper_old_p->v[tid];
     for (int j = 0; j < lower_pos->cols; ++j) {
       lower_sum += lower_pos->a[tid][j] * lower_positive_term->v[j]
                  + lower_neg->a[tid][j] * lower_negative_term->v[j];
@@ -1713,14 +1735,14 @@ __global__ void backward_matmul_pair_gpu(
   if (tid < total) {
     const int r = tid / weight->cols;
     const int c = tid % weight->cols;
-    double lower_sum = 0.0;
-    double upper_sum = 0.0;
+    float lower_sum = 0.0f;
+    float upper_sum = 0.0f;
     for (int k = 0; k < lower_in->cols; ++k) {
-      const double lower_value = lower_in->a[r][k];
-      const double upper_value = upper_in->a[r][k];
-      const double weight_value = weight->a[k][c];
-      if (lower_value != 0.0) lower_sum += lower_value * weight_value;
-      if (upper_value != 0.0) upper_sum += upper_value * weight_value;
+      const float lower_value = lower_in->a[r][k];
+      const float upper_value = upper_in->a[r][k];
+      const float weight_value = weight->a[k][c];
+      if (lower_value != 0.0f) lower_sum += lower_value * weight_value;
+      if (upper_value != 0.0f) upper_sum += upper_value * weight_value;
     }
     lower_out->a[r][c] = lower_sum;
     upper_out->a[r][c] = upper_sum;
@@ -1754,13 +1776,13 @@ __global__ void initialize_backward_state_gpu(
   if (tid < matrix_elements) {
     const int r = tid / matrix_cols;
     const int c = tid % matrix_cols;
-    if (default_lower_M) lower_M->a[r][c] = (r == c) ? 1.0 : 0.0;
-    if (default_upper_M) upper_M->a[r][c] = (r == c) ? 1.0 : 0.0;
+    if (default_lower_M) lower_M->a[r][c] = (r == c) ? 1.0f : 0.0f;
+    if (default_upper_M) upper_M->a[r][c] = (r == c) ? 1.0f : 0.0f;
   }
 
   if (tid < vector_n) {
-    if (default_lower_p) lower_p->v[tid] = 0.0;
-    if (default_upper_p) upper_p->v[tid] = 0.0;
+    if (default_lower_p) lower_p->v[tid] = 0.0f;
+    if (default_upper_p) upper_p->v[tid] = 0.0f;
   }
 }
 
@@ -1975,7 +1997,7 @@ void backward_one_layer(Matrix &lower_M, Vector &lower_p, Matrix &upper_M,
 
 // materialize_forward_results : forward의 결과를 
 BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const Vector &x0,
-                     double eps, bool materialize_forward_results = true,
+                     float eps, bool materialize_forward_results = true,
                      const Matrix *output_lower_M = nullptr,
                      const Vector *output_lower_p = nullptr,
                      const Matrix *output_upper_M = nullptr,
@@ -2048,7 +2070,7 @@ BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const
 class LiRPABackwardOnly {
 public:
   BackwardBoundResult bound(const FullyConnectedNetwork &net, const Vector &x0,
-                            double eps, const Matrix *output_lower_M = nullptr,
+                            float eps, const Matrix *output_lower_M = nullptr,
                             const Vector *output_lower_p = nullptr,
                             const Matrix *output_upper_M = nullptr,
                             const Vector *output_upper_p = nullptr) const {
@@ -2121,7 +2143,7 @@ private:
   }
 
   static LayerBound build_one_layer_relaxation(const FullyConnectedNetwork &net, int layer,
-                             const Vector &x0, double eps,
+                             const Vector &x0, float eps,
                              const LayerBound *previous_layer_bounds) {
     Matrix lower_M = net.W[layer];
     Matrix upper_M = net.W[layer];
@@ -2159,7 +2181,7 @@ private:
 FullyConnectedNetwork make_xor_network() {
   int layer_in[MAX_LAYERS]{};
   int layer_out[MAX_LAYERS]{};
-  double W_data[MAX_LAYERS][MAX_DIM][MAX_DIM]{};
+  double W_data[MAX_LAYERS][MAX_DIM][MAX_DIM]{}; // make_network API가 double 입력을 받으므로 유지
   double b_data[MAX_LAYERS][MAX_DIM]{};
   std::string acts[MAX_LAYERS];
 
@@ -2180,7 +2202,7 @@ FullyConnectedNetwork make_xor_network() {
 // 아래 3개의 함수는 테스트용 (임시 데이터셋 + temp 신경망)
 void self_test_relaxations() {
   std::mt19937_64 rng(0);
-  std::uniform_real_distribution<double> dist(-5.0, 5.0);
+  std::uniform_real_distribution<double> dist(-5.0, 5.0); // 테스트는 정밀도 유지를 위해 double
 
   for (int t = 0; t < 200; ++t) {
     double a = dist(rng);
@@ -2230,7 +2252,7 @@ int xor_expected_label(const Vector &x) {
   return a ^ b;
 }
 
-void run_xor_demo(double eps) {
+void run_xor_demo(float eps) {
   const FullyConnectedNetwork network = make_xor_network();
   const LiRPABackwardOnly backward_only_verifier;
 
