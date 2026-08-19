@@ -189,6 +189,10 @@ int main(int argc, char** argv){
     // 왜인지는 모르겠다 너무 함수가 복잡해져서..
     BackwardBoundResult bwd = lirpa_backward_bound(*net, x0, eps, false);
 
+    // 신경망 + foward 결과만 보면 7ms 초반 ~ 8ms 초반 정도
+    // const ForwardBoundResult bwd =
+    //   lirpa_forward_bound_impl(*net, x0, eps, true);
+
     // 시간 측정 종료
     auto t_end = std::chrono::high_resolution_clock::now();
 
