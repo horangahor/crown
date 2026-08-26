@@ -166,8 +166,8 @@ int main(int argc, char** argv){
     std::cout << "Starting CROWN Verification (eps = " << eps << ") mempool + warmup" << std::endl;
     std::cout << "========================================\n";
 
-    // 소수점 6자리까지 출력
-    std::cout << std::fixed << std::setprecision(6);
+    // 소수점 13자리까지 출력
+    std::cout << std::fixed << std::setprecision(13);
 
     ensure_pool();
     // Immutable weights are uploaded and decomposed before timed verification.
@@ -210,9 +210,9 @@ int main(int argc, char** argv){
     std::cout << "---------------------------------------------------\n";
     for (int i = 0; i < out_dim; ++i) {
         std::cout << "[" << std::setw(3) << i << "]   |  " 
-                  << std::setw(9) << bwd.final_lower.v[i] << "  |  "
-                  << std::setw(9) << bwd.final_upper.v[i] << "  |  "
-                  << std::setw(9) << y.v[i] << "\n";
+                  << std::setw(17) << bwd.final_lower.v[i] << "  |  "
+                  << std::setw(17) << bwd.final_upper.v[i] << "  |  "
+                  << std::setw(17) << y.v[i] << "\n";
     }
     std::cout << "========================================\n";
 
