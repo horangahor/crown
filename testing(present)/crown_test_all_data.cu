@@ -231,8 +231,11 @@ int main(int argc, char** argv) {
         for (int i = 0; i < N; ++i) {
             // 신경망 정방향 통과
             Vector y0 = network_forward(*net, dataset[i]);
-            // CROWN backward bound 계산
-            BackwardBoundResult bwd = lirpa_backward_bound(*net, dataset[i], eps_f, false);
+            // CROWN backward bound or forward bound 계산
+            // BackwardBoundResult bwd = lirpa_backward_bound(*net, dataset[i], eps_f, false);
+            const ForwardBoundResult bwd =
+            lirpa_forward_bound_impl(*net, dataset[i], eps_f, false, true);
+
             // Top-k 인증 판정
             if (certify_topk(y0, bwd.final_lower, bwd.final_upper, k))
                 ++t_count;

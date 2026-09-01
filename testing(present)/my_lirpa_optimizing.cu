@@ -1396,7 +1396,7 @@ Vector network_forward(const FullyConnectedNetwork &net, const Vector &x) {
 // materialze_host_result : 호스트(cpu)로 전달(memcpy)해줄지 결정 , true면 전달 false면 전달x
 ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
                                             const Vector &x0, double eps,
-                                            bool materialize_host_results) {
+                                            bool materialize_layer_bounds, bool materialize_final) {
   require(x0.n == network_input_dim(net),
           "lirpa_forward_bound input dimension mismatch.");
   prepare_network_on_gpu(net);
@@ -1526,7 +1526,7 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
     //==========================================================================
 
     // forward 중간 결과 저장 안함 (D to H 안함) , 대신 GPU 메모리에 남아있음(backward 계산에 활용)
-    if (materialize_host_results) {
+    if (materialize_layer_bounds) {
       out.layer_bounds[l].dim = weight_rows;
       cudaMemcpy(&out.layer_bounds[l].alpha_lower, alpha_l, sizeof(Vector), cudaMemcpyDeviceToHost);
       cudaMemcpy(&out.layer_bounds[l].beta_lower, beta_l, sizeof(Vector), cudaMemcpyDeviceToHost);
@@ -1541,7 +1541,7 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
   // ---------------------------------------------------------
 
   // backward 과정에서 최종 결과 필요없으므로 D to H memcpy 안함
-  if (materialize_host_results) {
+  if (materialize_final) {
     cudaMemcpy(&out.final_affine.lower_A, lower_A, sizeof(Matrix), cudaMemcpyDeviceToHost);
     cudaMemcpy(&out.final_affine.upper_A, upper_A, sizeof(Matrix), cudaMemcpyDeviceToHost);
     cudaMemcpy(&out.final_affine.lower_c, lower_c, sizeof(Vector), cudaMemcpyDeviceToHost);
@@ -1560,7 +1560,7 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
 
 ForwardBoundResult lirpa_forward_bound(const FullyConnectedNetwork &net,
                                        const Vector &x0, double eps) {
-  return lirpa_forward_bound_impl(net, x0, eps, true);
+  return lirpa_forward_bound_impl(net, x0, eps, true, true);
 }
 
 __global__ void colwise_scale_gpu(const Matrix *A, const Vector *s,
@@ -1854,7 +1854,7 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
     const int matrix_blocks = (matrix_elems + 255) / 256;
     const int vector_blocks = (m_rows + 255) / 256;
 
-    // forward에서 계산된 alpha_l, beta_l, alpha_u, beta_u (GPU 메모리에 보관하고 있던걸 가져옴)
+    // forward에서 계산된 alpha_l, beta_l, alpha_u, beta_u의 마지막 결과가 여기 이미 저장되어있음 (GPU 메모리에 보관하고 있던걸 가져옴)
     // 즉 backward_one_layer에서 인자로 받았던 부분을, 이미 GPU에 올려둔 부분을 사용해 해결함
     const Vector *alpha_l = g_pool.d_fwd_alpha_lower[l];
     const Vector *beta_l = g_pool.d_fwd_beta_lower[l];
@@ -1997,7 +1997,7 @@ void backward_one_layer(Matrix &lower_M, Vector &lower_p, Matrix &upper_M,
 
 // materialize_forward_results : forward의 결과를 
 BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const Vector &x0,
-                     float eps, bool materialize_forward_results = true,
+                     float eps, bool materialize_forward_layer_results = true,
                      const Matrix *output_lower_M = nullptr,
                      const Vector *output_lower_p = nullptr,
                      const Matrix *output_upper_M = nullptr,
@@ -2006,7 +2006,7 @@ BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const
 
   //std::cout << "clear lirpa_forward!\n" << std::endl;
   const ForwardBoundResult fwd =
-      lirpa_forward_bound_impl(net, x0, eps, materialize_forward_results);
+      lirpa_forward_bound_impl(net, x0, eps, materialize_forward_layer_results, false);
 
   const int output_dim = network_output_dim(net);
   Matrix lower_M; // lower bound 선형 방정식 계수
@@ -2051,14 +2051,14 @@ BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const
                      out.final_lower, out.final_upper,   // 입력, eps은 forward 때 올려놨던 거 사용
                      out.final_affine.lower_A, out.final_affine.lower_c,
                      out.final_affine.upper_A, out.final_affine.upper_c,
-                     materialize_forward_results,
+                     materialize_forward_layer_results,
                      default_lower_M, default_lower_p,   // 여기부분이 true
                      default_upper_M, default_upper_p);  // 여기부분이 true
 
   out.num_layer_bounds = fwd.num_layer_bounds;
 
   // forward에서 얻은 중간 계산 결과 스킵
-  if (materialize_forward_results) {
+  if (materialize_forward_layer_results) {
     for (int i = 0; i < fwd.num_layer_bounds; ++i) {
       out.layer_bounds[i] = fwd.layer_bounds[i];
     }
