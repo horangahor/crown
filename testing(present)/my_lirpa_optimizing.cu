@@ -105,7 +105,7 @@ struct FullyConnectedNetwork {
 constexpr int NUM_POOL_MAT = 3;
 constexpr int NUM_POOL_VEC = 6;
 constexpr int NUM_FWD_MAT = 6;
-constexpr int NUM_FWD_VEC = 14;
+constexpr int NUM_FWD_VEC = 16;
 constexpr int NUM_BWD_MAT = 10;
 constexpr int NUM_BWD_VEC = 14;
 
@@ -1411,8 +1411,6 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
   Matrix *const upper_A = g_pool.d_fwd_mat[1];     // 원본: current.upper_A 
   Matrix *const pre_lower_A = g_pool.d_fwd_mat[2]; // 원본: pre.lower_A
   Matrix *const pre_upper_A = g_pool.d_fwd_mat[3]; // 원본: pre.upper_A
-  Matrix *const tmp_A = g_pool.d_fwd_mat[4];       // 계산용 임시 도마 1
-  Matrix *const tmp_B = g_pool.d_fwd_mat[5];       // 계산용 임시 도마 2
   Vector *const lower_c = g_pool.d_fwd_vec[0];     // 원본: current.lower_c
   Vector *const upper_c = g_pool.d_fwd_vec[1];     // 원본: current.upper_c
   Vector *const pre_lower_c = g_pool.d_fwd_vec[2]; // 원본: pre.lower_c
@@ -1542,19 +1540,32 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
 
   // backward 과정에서 최종 결과 필요없으므로 D to H memcpy 안함
   if (materialize_final) {
-    cudaMemcpy(&out.final_affine.lower_A, lower_A, sizeof(Matrix), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&out.final_affine.upper_A, upper_A, sizeof(Matrix), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&out.final_affine.lower_c, lower_c, sizeof(Vector), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&out.final_affine.upper_c, upper_c, sizeof(Vector), cudaMemcpyDeviceToHost);
     const int out_dim = network_output_dim(net);
-    out.final_affine.lower_A.rows = out.final_affine.upper_A.rows = out_dim;
-    out.final_affine.lower_A.cols = out.final_affine.upper_A.cols = in_dim;
-    out.final_affine.lower_c.n = out.final_affine.upper_c.n = out_dim;
-  
-  // 최종 점수(수치) 도출
-    out.final_lower = affine_min(out.final_affine.lower_A, out.final_affine.lower_c, x0, eps);
-    out.final_upper = affine_max(out.final_affine.upper_A, out.final_affine.upper_c, x0, eps);
+    // out_dim이 작아도 (ex: 16) 범용적으로 처리
+    const int blocksPerGrid = (out_dim + 255) / 256;
+
+    // d_xl = x0 - eps, d_xu = x0 + eps
+    // forward 루프에서 이미 g_pool 에 올려둔 것 재사용 (H2D 불필요)
+    Vector *d_xl          = g_pool.d_fwd_vec[12];
+    Vector *d_xu          = g_pool.d_fwd_vec[13];
+    // d_fwd_vec[14], [15] : forward 풀 안의 미사용 슬롯 → 출력 버퍼로 사용
+    Vector *d_final_lower = g_pool.d_fwd_vec[14];
+    Vector *d_final_upper = g_pool.d_fwd_vec[15];
+
+    // GPU 안에서 affine_min/max 직접 계산
+    // 기존: 행렬 2개(~32KB) D2H → CPU에서 연산
+    // 현재: GPU 커널 → 16개 float(64B)만 D2H
+    affine_minmax_pair_gpu<<<blocksPerGrid, 256>>>(
+        lower_A, lower_c, upper_A, upper_c,
+        d_xl, d_xu, d_final_lower, d_final_upper);
+
+    out.final_lower = make_zero_vector(out_dim);
+    out.final_upper = make_zero_vector(out_dim);
+    cudaMemcpy(&out.final_lower, d_final_lower, sizeof(Vector), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&out.final_upper, d_final_upper, sizeof(Vector), cudaMemcpyDeviceToHost);
+    out.final_lower.n = out.final_upper.n = out_dim;
   }
+
   return out;
 }
 
@@ -1786,8 +1797,6 @@ __global__ void initialize_backward_state_gpu(
   }
 }
 
-// GPU-resident backward pass. Relaxation coefficients stay on the GPU between
-// forward and backward; host copies are limited to inputs and final results.
 // 단지 전체 레이어를 루프로 돌면서 커널 퓨전(Kernel Fusion)과 포인터 스왑을 통해 
 // 메모리 할당/복사를 완전히 없앤 극자적 최적화(Zero-Memcpy) 버전
 void backward_bound_gpu(const FullyConnectedNetwork &net,
