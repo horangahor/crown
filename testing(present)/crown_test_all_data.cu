@@ -176,16 +176,16 @@ bool certify_topk(const Vector& y0, const Vector& lb, const Vector& ub, int k = 
     for (int i = 0; i < k; ++i)    // 0 ~ 7
         for (int j = out_dim - k; j < out_dim; ++j)   // 16 - 8 = 8 , 8 ~ 15
             if (order_lb[i] == y_order[j]) { ++match; break; } // 가장 높은 lower bound 인덱스 8개랑 , 상위 8개의 추론값인 y0 인덱스가 몇개 포함되는지 구함
-    return (match => k - max_diff); // 8개 다 일치하면 해당 입력에 대해서는 강건성이 보장되었단 소리(epsilon으로 인한 CROWN 결과와 출력 값의 상위 8개 선택이 일치) true
+    return (match >= k - max_diff); // 8개 다 일치하면 해당 입력에 대해서는 강건성이 보장되었단 소리(epsilon으로 인한 CROWN 결과와 출력 값의 상위 8개 선택이 일치) true
 }
 // 즉 eps 를 바꿔가며 T/F 비율을 구해서 해당 신경망이 어디 eps까지 버틸 수 있는지 비율을 구하는 것임 (비율을 보고 관리자가 판단)
 
 int main(int argc, char** argv) {
 
-    const char* network_path = (argc > 1) ? argv[1] : MODEL_PATH;
-    const char* data_path    = (argc > 2) ? argv[2] : "test_data_all.bin";
-    int         k            = (argc > 3) ? std::atoi(argv[3]) : 8;
-    int         method       = (argc > 4) ? std::atoi(argv[4]) : 0; // 0: forward, 1: backward, // 추가 ? ==> 2: backward_only
+    int         method       = (argc > 1) ? std::atoi(argv[1]) : 0; // 0: forward, 1: backward, // 추가 ? ==> 2: backward_only
+    const char* network_path = (argc > 2) ? argv[2] : MODEL_PATH;
+    const char* data_path    = (argc > 3) ? argv[3] : "test_data_all.bin";
+    int         k            = (argc > 4) ? std::atoi(argv[4]) : 8;
     const char* output_csv   = (argc > 5) ? argv[5] : "results_cuda.csv";
 
     // 1. 모델 로드
@@ -220,12 +220,24 @@ int main(int argc, char** argv) {
     struct EpsResult { int T, F; double ratio; };
     std::vector<EpsResult> all_results;
 
+    const char* method_str;
+    if(method == 0){
+        method_str = "forward";
+    }else if(method == 1){
+        method_str = "backward";
+    }
+
     std::cout << "\n========================================" << std::endl;
-    std::cout << "Starting CROWN Sweep" << std::endl;
+    std::cout << "Starting " << method_str <<" CROWN Sweep" << std::endl;
     std::cout << "  data points : " << N               << std::endl;
     std::cout << "  k (top-k)   : " << k               << std::endl;
     std::cout << "  eps values  : " << eps_list.size() << std::endl;
     std::cout << "========================================\n" << std::endl;
+
+    const Vector* lb = nullptr;
+    const Vector* ub = nullptr;
+    ForwardBoundResult fwd;
+    BackwardBoundResult bwd;
 
     // 5. 전체 시간 측정 시작
     auto total_start = std::chrono::high_resolution_clock::now();
@@ -240,11 +252,23 @@ int main(int argc, char** argv) {
             // 신경망 정방향 통과
             Vector y0 = network_forward(*net, dataset[i]);
             // CROWN backward bound or forward bound 계산
-            BackwardBoundResult bwd = lirpa_backward_bound(*net, dataset[i], eps_f, false, false);
-            // ForwardBoundResult bwd = lirpa_forward_bound_impl(*net, dataset[i], eps_f, false, false, true);
+            switch(method){
+                case 0:
+                    fwd = lirpa_forward_bound_impl(*net, dataset[i], eps_f, false, false, true);
+                    lb = &fwd.final_lower;
+                    ub = &fwd.final_upper;
+                    break;
+                case 1:
+                    bwd = lirpa_backward_bound(*net, dataset[i], eps_f, false, false);
+                    lb = &bwd.final_lower;
+                    ub = &bwd.final_upper;
+                    break;
+                default:
+                    break;
+            }
             
             // Top-k 인증 판정
-            if (certify_topk(y0, bwd.final_lower, bwd.final_upper, k))
+            if (certify_topk(y0, *lb, *ub, k))
                 ++t_count;
             else
                 ++f_count;
