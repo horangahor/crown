@@ -6,21 +6,23 @@ pickle 데이터셋 -> crown_test_all_data.cu 용 이진 파일 변환기
 """
 
 import sys
+# pyrefly: ignore [missing-import]
 import numpy as np
 
 # 경로를 맨 앞(0)에 추가 <== 찾아보는 순위에 영향
 sys.path.insert(0, 'C:/Users/user/Desktop/cuda/jnunnv_v1_0/jnunnv/crown')
 
+# pyrefly: ignore [missing-import]
 from data_split import load_test_rows
 
 # 시스템 변수
 data_path   = sys.argv[1] if len(sys.argv) > 1 else (
-    '../wireless\mMIMO_AS_training_data_20000_80_H_HTH_ORG_1D-003.pickle'
+    "C:/Users/user/Desktop/cuda/wireless/mMIMO_AS_training_data_20000_80_H_HTH_ORG_1D-003.pickle"
 )
 no_test_files = int(sys.argv[2]) if len(sys.argv) > 2 else 2
 
-# 데이터 파일은 쉘 or cmd에서 스크립트를 실행한 경로를 기준으로 함
-output_path   = sys.argv[3] if len(sys.argv) > 3 else 'test_data_all.bin'
+# 데이터 파일은 절대경로로 지정하지 않으면 쉘 or cmd에서 스크립트를 실행한 경로를 기준으로 함
+output_path   = sys.argv[3] if len(sys.argv) > 3 else 'C:/Users/user/Desktop/cuda/crown/testing(present)/test_data_all.bin'
 
 print(f'Loading data from: {data_path}')
 print(f'no_test_files = {no_test_files}  =>  {20000 * no_test_files} samples')

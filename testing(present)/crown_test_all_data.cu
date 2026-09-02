@@ -8,7 +8,7 @@
 #include<fstream>
 #include <nvtx3/nvToolsExt.h>
 
-const char* MODEL_PATH = "C:/Users/user/Desktop/cuda/jnunnv_v1_0/jnunnv/models/Custom/Baseline mMIMO FC H hard short 80 HTHNN_LAY2_491 RELU 20241018 PRUNED 0.93_NO_SIGMOID_custom.bin";
+const char* MODEL_PATH = "C:/Users/user/Desktop/cuda/crown_sparse/Custom/Baseline mMIMO FC H hard short 80 HTHNN_LAY2_491 RELU 20241018 PRUNED 0.93_NO_SIGMOID_custom.bin";
 
 // 컴파일 : nvcc -Xcompiler "/utf-8" -Xlinker "/STACK:134217728" -arch=sm_89 crown_test_all_data.cu -o crown_test_all_data.exe
 
