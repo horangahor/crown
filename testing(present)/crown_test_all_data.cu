@@ -185,7 +185,8 @@ int main(int argc, char** argv) {
     const char* network_path = (argc > 1) ? argv[1] : MODEL_PATH;
     const char* data_path    = (argc > 2) ? argv[2] : "test_data_all.bin";
     int         k            = (argc > 3) ? std::atoi(argv[3]) : 8;
-    const char* output_csv   = (argc > 4) ? argv[4] : "results_cuda.csv";
+    int         method       = (argc > 4) ? std::atoi(argv[4]) : 0; // 0: forward, 1: backward, // 추가 ? ==> 2: backward_only
+    const char* output_csv   = (argc > 5) ? argv[5] : "results_cuda.csv";
 
     // 1. 모델 로드
     std::cout << "\n=== crown_test_all_data ===" << std::endl;
@@ -208,10 +209,9 @@ int main(int argc, char** argv) {
     }
     std::cout << "loaded " << N << " points (dim=" << net->layer_in_dim[0] << ")" << std::endl;
 
-    // 4. eps 리스트 (sparse.py와 완전히 동일)
+    // 4. eps 리스트 (sparse.py와 동일)
     const std::vector<double> eps_list = {
-        1e-6, 
-        //1e-5,
+        1e-6, //1e-5,
         //1e-4, 2e-4, 3e-4, 4e-4, 5e-4, 6e-4, 7e-4, 8e-4, 9e-4,
         //1e-3, 2e-3, 3e-3, 4e-3, 5e-3, 6e-3, 7e-3, 8e-3, 9e-3,
         //1e-2, 1e-1, 1.0
