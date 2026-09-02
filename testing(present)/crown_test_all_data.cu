@@ -204,10 +204,11 @@ int main(int argc, char** argv) {
 
     // 4. eps 리스트 (sparse.py와 완전히 동일)
     const std::vector<double> eps_list = {
-        1e-6, 1e-5,
-        1e-4, 2e-4, 3e-4, 4e-4, 5e-4, 6e-4, 7e-4, 8e-4, 9e-4,
-        1e-3, 2e-3, 3e-3, 4e-3, 5e-3, 6e-3, 7e-3, 8e-3, 9e-3,
-        1e-2, 1e-1, 1.0
+        1e-6, 
+        //1e-5,
+        //1e-4, 2e-4, 3e-4, 4e-4, 5e-4, 6e-4, 7e-4, 8e-4, 9e-4,
+        //1e-3, 2e-3, 3e-3, 4e-3, 5e-3, 6e-3, 7e-3, 8e-3, 9e-3,
+        //1e-2, 1e-1, 1.0
     };
 
     struct EpsResult { int T, F; double ratio; };
@@ -222,6 +223,7 @@ int main(int argc, char** argv) {
 
     // 5. 전체 시간 측정 시작
     auto total_start = std::chrono::high_resolution_clock::now();
+    nvtxRangePushA("CROWN_SWEEP");
 
     // 6. eps x 데이터 이중 루프 (sparse.py sweep() 와 완전히 동일)
     for (double eps : eps_list) {
@@ -232,10 +234,9 @@ int main(int argc, char** argv) {
             // 신경망 정방향 통과
             Vector y0 = network_forward(*net, dataset[i]);
             // CROWN backward bound or forward bound 계산
-            // BackwardBoundResult bwd = lirpa_backward_bound(*net, dataset[i], eps_f, false, false);
-            const ForwardBoundResult bwd =
-            lirpa_forward_bound_impl(*net, dataset[i], eps_f, false, false, true);
-
+            //BackwardBoundResult bwd = lirpa_backward_bound(*net, dataset[i], eps_f, false, false);
+            ForwardBoundResult bwd = lirpa_forward_bound_impl(*net, dataset[i], eps_f, false, false, true);
+            
             // Top-k 인증 판정
             if (certify_topk(y0, bwd.final_lower, bwd.final_upper, k))
                 ++t_count;
@@ -256,6 +257,7 @@ int main(int argc, char** argv) {
         double ratio = (total > 0) ? static_cast<double>(t_count) / total : 0.0;
         all_results.push_back({t_count, f_count, ratio});
     }
+    nvtxRangePop();
 
     auto total_end = std::chrono::high_resolution_clock::now();
     double total_elapsed = std::chrono::duration<double>(total_end - total_start).count();
