@@ -147,32 +147,38 @@ std::vector<Vector> load_all_data(const char* filepath, int input_dim, int& N_ou
 }
 
 // Top-k 강건성 인증 판정
-// sparse.py certify_topk_selection 과 완전히 동일 (max_diff=0 고정)
-bool certify_topk(const Vector& y0, const Vector& lb, const Vector& ub, int k = 8) {
+// sparse.py certify_topk_selection 함수 기반 구현 (max_diff CROWN과 매치되는 신경망 선택 안테나의 개수가 k-max_diff개 이상이면 봐줌(true))
+// 신경망 추론 값 : 신경망이 추론하고 선택한 상위 8개의 안테나
+// CROWN : 입력값에 대해 eps 만큼의 노이즈를 주었을 때 해당 신경망에서 나올 수 있는 출력값의 범위가 수학적으로 증명되어 있음 
+// (즉 lower bound 정렬로 8개 선택 가능시 해당 입력값 +- eps 내에서 수학적으로 상위 8개의 안테나가 항상 유지 된다는 소리)
+// CROWN 에서 노드 8개를 선택 가능한 경우(4번 과정), 신경망이 추론해 정렬한 결과와 CROWN lower bound의 인덱스가 매치하면 신경망이 같은 안테나를 선택했으므로
+// 실제 환경에서 해당 신경망의 입력에 noise가 추가되었을 때, 정답 8개 (== CROWN이 내놓은 상위 8개와 동일하다, 실험 때 lower bound 정렬이 noise 추가 안된 추론값의 정렬과 같으므로) 
+bool certify_topk(const Vector& y0, const Vector& lb, const Vector& ub, int k = 8, int max_diff = 0) {
     int out_dim = y0.n;
     // 1. clean_topk: y0 오름차순 정렬, 뒤 k개 = top-k
     std::vector<int> y_order(out_dim);
-    std::iota(y_order.begin(), y_order.end(), 0);
+    std::iota(y_order.begin(), y_order.end(), 0); // 0 ~ 15 까지 연속된 숫자를 채워줌 (index 반환용)
     std::sort(y_order.begin(), y_order.end(),
-              [&](int a, int b){ return y0.v[a] < y0.v[b]; });
+              [&](int a, int b){ return y0.v[a] < y0.v[b]; }); // 0~ 15번 노드의 추론 값, 인덱스가 매치 된 상황에서 오름차순 정렬
     // 2. order_lb: lb 내림차순 정렬
     std::vector<int> order_lb(out_dim);
-    std::iota(order_lb.begin(), order_lb.end(), 0);
+    std::iota(order_lb.begin(), order_lb.end(), 0); // 0 ~ 15 까지 연속된 숫자를 채워줌 (index 반환용)
     std::sort(order_lb.begin(), order_lb.end(),
-              [&](int a, int b){ return lb.v[a] > lb.v[b]; });
+              [&](int a, int b){ return lb.v[a] > lb.v[b]; }); // 0~ 15번 노드의 CROWN 하한값, 인덱스가 매치 된 상황에서 내림차순 정렬
     // 3. sorted_ub: ub 내림차순 정렬
     std::vector<float> sorted_ub(out_dim);
     for (int i = 0; i < out_dim; ++i) sorted_ub[i] = ub.v[i];
-    std::sort(sorted_ub.begin(), sorted_ub.end(), std::greater<float>());
+    std::sort(sorted_ub.begin(), sorted_ub.end(), std::greater<float>()); // 0~ 15번 노드의 CROWN 상한값, 인덱스가 매치 된 상황에서 내림차순 정렬
     // 4. gap_ok: lb[order_lb[k-1]] > sorted_ub[k]
     if (lb.v[order_lb[k - 1]] <= sorted_ub[k]) return false;
     // 5. guaranteed_topk (order_lb 앞 k개) 와 clean_topk 교집합 == k
     int match = 0;
-    for (int gi = 0; gi < k; ++gi)
-        for (int ci = out_dim - k; ci < out_dim; ++ci)
-            if (order_lb[gi] == y_order[ci]) { ++match; break; }
-    return (match == k);
+    for (int i = 0; i < k; ++i)    // 0 ~ 7
+        for (int j = out_dim - k; j < out_dim; ++j)   // 16 - 8 = 8 , 8 ~ 15
+            if (order_lb[i] == y_order[j]) { ++match; break; } // 가장 높은 lower bound 인덱스 8개랑 , 상위 8개의 추론값인 y0 인덱스가 몇개 포함되는지 구함
+    return (match => k - max_diff); // 8개 다 일치하면 해당 입력에 대해서는 강건성이 보장되었단 소리(epsilon으로 인한 CROWN 결과와 출력 값의 상위 8개 선택이 일치) true
 }
+// 즉 eps 를 바꿔가며 T/F 비율을 구해서 해당 신경망이 어디 eps까지 버틸 수 있는지 비율을 구하는 것임 (비율을 보고 관리자가 판단)
 
 int main(int argc, char** argv) {
 
@@ -234,8 +240,8 @@ int main(int argc, char** argv) {
             // 신경망 정방향 통과
             Vector y0 = network_forward(*net, dataset[i]);
             // CROWN backward bound or forward bound 계산
-            //BackwardBoundResult bwd = lirpa_backward_bound(*net, dataset[i], eps_f, false, false);
-            ForwardBoundResult bwd = lirpa_forward_bound_impl(*net, dataset[i], eps_f, false, false, true);
+            BackwardBoundResult bwd = lirpa_backward_bound(*net, dataset[i], eps_f, false, false);
+            // ForwardBoundResult bwd = lirpa_forward_bound_impl(*net, dataset[i], eps_f, false, false, true);
             
             // Top-k 인증 판정
             if (certify_topk(y0, bwd.final_lower, bwd.final_upper, k))
