@@ -211,10 +211,10 @@ int main(int argc, char** argv) {
 
     // 4. eps 리스트 (sparse.py와 동일)
     const std::vector<double> eps_list = {
-        1e-6, //1e-5,
-        //1e-4, 2e-4, 3e-4, 4e-4, 5e-4, 6e-4, 7e-4, 8e-4, 9e-4,
-        //1e-3, 2e-3, 3e-3, 4e-3, 5e-3, 6e-3, 7e-3, 8e-3, 9e-3,
-        //1e-2, 1e-1, 1.0
+        1e-6, 1e-5,
+        1e-4, 2e-4, 3e-4, 4e-4, 5e-4, 6e-4, 7e-4, 8e-4, 9e-4,
+        1e-3, 2e-3, 3e-3, 4e-3, 5e-3, 6e-3, 7e-3, 8e-3, 9e-3,
+        1e-2, 1e-1, 1.0
     };
 
     struct EpsResult { int T, F; double ratio; };
@@ -234,11 +234,6 @@ int main(int argc, char** argv) {
     std::cout << "  eps values  : " << eps_list.size() << std::endl;
     std::cout << "========================================\n" << std::endl;
 
-    const Vector* lb = nullptr;
-    const Vector* ub = nullptr;
-    ForwardBoundResult fwd;
-    BackwardBoundResult bwd;
-
     // 5. 전체 시간 측정 시작
     auto total_start = std::chrono::high_resolution_clock::now();
     nvtxRangePushA("CROWN_SWEEP");
@@ -253,26 +248,28 @@ int main(int argc, char** argv) {
             Vector y0 = network_forward(*net, dataset[i]);
             // CROWN backward bound or forward bound 계산
             switch(method){
-                case 0:
-                    fwd = lirpa_forward_bound_impl(*net, dataset[i], eps_f, false, false, true);
-                    lb = &fwd.final_lower;
-                    ub = &fwd.final_upper;
+                case 0: {
+                    ForwardBoundResult fwd = lirpa_forward_bound_impl(*net, dataset[i], eps_f, false, false, true);
+                    // Top-k 인증 판정
+                    if (certify_topk(y0, fwd.final_lower, fwd.final_upper, k))
+                        ++t_count;
+                    else
+                        ++f_count;
                     break;
-                case 1:
-                    bwd = lirpa_backward_bound(*net, dataset[i], eps_f, false, false);
-                    lb = &bwd.final_lower;
-                    ub = &bwd.final_upper;
+                }
+                case 1: {
+                    BackwardBoundResult bwd = lirpa_backward_bound(*net, dataset[i], eps_f, false, false);
+                    // Top-k 인증 판정
+                    if (certify_topk(y0, bwd.final_lower, bwd.final_upper, k))
+                        ++t_count;
+                    else
+                        ++f_count;
                     break;
+                }
                 default:
                     break;
             }
             
-            // Top-k 인증 판정
-            if (certify_topk(y0, *lb, *ub, k))
-                ++t_count;
-            else
-                ++f_count;
-
             // 1000개마다 진행상황 출력 (sparse.py 와 동일 포맷)
             if ((i + 1) % 1000 == 0) {
                 std::cout << "  eps=" << std::setw(10)
