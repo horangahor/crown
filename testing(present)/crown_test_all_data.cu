@@ -4,6 +4,7 @@
 #include<algorithm>
 #include<numeric>
 #include<chrono>
+#include<ctime>
 #include "my_lirpa_optimizing.cu"
 #include<fstream>
 #include <nvtx3/nvToolsExt.h>
@@ -238,38 +239,58 @@ int main(int argc, char** argv) {
     auto total_start = std::chrono::high_resolution_clock::now();
     nvtxRangePushA("CROWN_SWEEP");
 
+    // 단계별 누적 시간 (전체 eps × 데이터 합산)
+    double time_infer_total   = 0.0;
+    double time_bound_total   = 0.0;
+    double time_certify_total = 0.0;
+
     // 6. eps x 데이터 이중 루프 (sparse.py sweep() 와 완전히 동일)
     for (double eps : eps_list) {
         int t_count = 0, f_count = 0;
         float eps_f = static_cast<float>(eps);
 
         for (int i = 0; i < N; ++i) {
+            // ── [1] 추론 ──────────────────────────────────────────
             // 신경망 정방향 통과
+            auto t0 = std::chrono::high_resolution_clock::now();
             Vector y0 = network_forward(*net, dataset[i]);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            time_infer_total += std::chrono::duration<double>(t1 - t0).count();
+
+            // ── [2] Bound 계산 + [3] 검증 ────────────────────────
             // CROWN backward bound or forward bound 계산
+            // (각 case 안에서 직접 초기화 → NRVO 적용, 4MB+ 구조체 복사 0회)
             switch(method){
                 case 0: {
                     ForwardBoundResult fwd = lirpa_forward_bound_impl(*net, dataset[i], eps_f, false, false, true);
+                    auto t2 = std::chrono::high_resolution_clock::now();
+                    time_bound_total += std::chrono::duration<double>(t2 - t1).count();
                     // Top-k 인증 판정
                     if (certify_topk(y0, fwd.final_lower, fwd.final_upper, k))
                         ++t_count;
                     else
                         ++f_count;
+                    auto t3 = std::chrono::high_resolution_clock::now();
+                    time_certify_total += std::chrono::duration<double>(t3 - t2).count();
                     break;
                 }
                 case 1: {
                     BackwardBoundResult bwd = lirpa_backward_bound(*net, dataset[i], eps_f, false, false);
+                    auto t2 = std::chrono::high_resolution_clock::now();
+                    time_bound_total += std::chrono::duration<double>(t2 - t1).count();
                     // Top-k 인증 판정
                     if (certify_topk(y0, bwd.final_lower, bwd.final_upper, k))
                         ++t_count;
                     else
                         ++f_count;
+                    auto t3 = std::chrono::high_resolution_clock::now();
+                    time_certify_total += std::chrono::duration<double>(t3 - t2).count();
                     break;
                 }
                 default:
                     break;
             }
-            
+
             // 1000개마다 진행상황 출력 (sparse.py 와 동일 포맷)
             if ((i + 1) % 1000 == 0) {
                 std::cout << "  eps=" << std::setw(10)
@@ -302,6 +323,16 @@ int main(int argc, char** argv) {
     std::cout << "\ntotal elapsed: "
               << std::fixed << std::setprecision(2) << total_elapsed << "s" << std::endl;
 
+    // 단계별 시간 분석 출력
+    std::cout << "\n--- Phase Timing Breakdown (all eps x all data) ---" << std::endl;
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "  infer   : " << std::setw(8) << time_infer_total
+              << "s  (" << std::setprecision(1) << 100.0 * time_infer_total   / total_elapsed << "%)" << std::endl;
+    std::cout << "  bound   : " << std::setw(8) << std::setprecision(3) << time_bound_total
+              << "s  (" << std::setprecision(1) << 100.0 * time_bound_total   / total_elapsed << "%)" << std::endl;
+    std::cout << "  certify : " << std::setw(8) << std::setprecision(3) << time_certify_total
+              << "s  (" << std::setprecision(1) << 100.0 * time_certify_total / total_elapsed << "%)" << std::endl;
+
     // 8. CSV 저장 (sparse.py와 동일 컬럼: method, eps, T, F, ratio)
     std::ofstream csv_file(output_csv);
     if (csv_file.is_open()) {
@@ -319,7 +350,56 @@ int main(int argc, char** argv) {
         std::cerr << "Error: could not write to " << output_csv << std::endl;
     }
 
-    // 9. 메모리 해제
+    // 9. 타이밍 로그 CSV에 누적 기록 (실행할 때마다 append)
+    {
+        const char* timing_csv = "timing_log_crown.csv";
+        // 파일이 없으면 헤더 먼저 작성
+        bool write_header = false;
+        {
+            std::ifstream check(timing_csv);
+            write_header = !check.is_open();
+        }
+
+        std::ofstream log(timing_csv, std::ios::app);
+        if (log.is_open()) {
+            // 현재 시각
+            std::time_t now = std::time(nullptr);
+            char time_buf[64];
+            std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+
+            // 샘플 1개 × eps 1개당 평균 시간 (µs)
+            long long total_calls = (long long)N * (long long)eps_list.size();
+            double avg_infer_ms   = (total_calls > 0) ? time_infer_total   / total_calls * 1e3 : 0.0;
+            double avg_bound_ms   = (total_calls > 0) ? time_bound_total   / total_calls * 1e3 : 0.0;
+            double avg_certify_ms = (total_calls > 0) ? time_certify_total / total_calls * 1e3 : 0.0;
+
+            if (write_header) {
+                log << "timestamp,method,N,eps_count,"
+                    << "total_s,infer_s,bound_s,certify_s,"
+                    << "avg_infer_ms,avg_bound_ms,avg_certify_ms\n";
+            }
+
+            log << std::fixed;
+            log << time_buf         << ","
+                << method_str       << ","
+                << N                << ","
+                << eps_list.size()  << ","
+                << std::setprecision(4) << total_elapsed      << ","
+                << std::setprecision(4) << time_infer_total   << ","
+                << std::setprecision(4) << time_bound_total   << ","
+                << std::setprecision(4) << time_certify_total << ","
+                << std::setprecision(4) << avg_infer_ms       << ","
+                << std::setprecision(4) << avg_bound_ms       << ","
+                << std::setprecision(4) << avg_certify_ms     << "\n";
+
+            log.close();
+            std::cout << "timing log appended to " << timing_csv << std::endl;
+        } else {
+            std::cerr << "Warning: could not write to timing_log_crown.csv" << std::endl;
+        }
+    }
+
+    // 10. 메모리 해제
     delete net;
     return 0;
 }
