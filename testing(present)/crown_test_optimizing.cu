@@ -173,6 +173,13 @@ int main(int argc, char** argv){
     // Immutable weights are uploaded and decomposed before timed verification.
     prepare_network_on_gpu(*net);
 
+    //=================================================================
+    // warm up 하기 
+    network_forward(*net, x0);
+    //lirpa_backward_bound(*net, x0, eps, false, false);
+    lirpa_forward_bound_impl(*net, x0, eps, false, false, true);
+    // ================================================================
+
     // NVTX : 코드에 “이 구간이 실제 검증 시간이다”라는 표시를 넣는 기능
     nvtxRangePushA("CROWN_VERIFY");
 
@@ -186,11 +193,10 @@ int main(int argc, char** argv){
     // 여기서 선언시 BackwardBoundResult 빈 공간(4MB 할당 + 자잘한 벡터들까지 해서 넉넉히 0.25MB )
     // 내부 함수에 진입해서 보면 거의 64MB가 필요함 (함수 주석 참고) <== 근데 64MB 안되서 128MB로 함
     // 왜인지는 모르겠다 너무 함수가 복잡해져서..
-    BackwardBoundResult bwd = lirpa_backward_bound(*net, x0, eps, false, false);
+    //BackwardBoundResult bwd = lirpa_backward_bound(*net, x0, eps, false, false);
 
     // 신경망 + foward 결과만 보면 7ms 초반 ~ 8ms 초반 정도
-     const ForwardBoundResult fwd =
-       lirpa_forward_bound_impl(*net, x0, eps, false, false, true);
+    ForwardBoundResult bwd = lirpa_forward_bound_impl(*net, x0, eps, false, false, true);
 
     // 시간 측정 종료
     auto t_end = std::chrono::high_resolution_clock::now();
