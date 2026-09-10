@@ -254,8 +254,8 @@ int main(int argc, char** argv) {
             // 신경망 정방향 통과
             auto t0 = std::chrono::high_resolution_clock::now();
             Vector y0 = network_forward(*net, dataset[i]);
-            auto t1 = std::chrono::high_resolution_clock::now();
-            time_infer_total += std::chrono::duration<double>(t1 - t0).count();
+            auto t1 = std::chrono::high_resolution_clock::now(); // 추론 끝 시간
+            time_infer_total += std::chrono::duration<double>(t1 - t0).count(); // 추론 시간 누적
 
             // ── [2] Bound 계산 + [3] 검증 ────────────────────────
             // CROWN backward bound or forward bound 계산
@@ -263,28 +263,28 @@ int main(int argc, char** argv) {
             switch(method){
                 case 0: {
                     ForwardBoundResult fwd = lirpa_forward_bound_impl(*net, dataset[i], eps_f, false, false, true);
-                    auto t2 = std::chrono::high_resolution_clock::now();
-                    time_bound_total += std::chrono::duration<double>(t2 - t1).count();
+                    auto t2 = std::chrono::high_resolution_clock::now(); // bound 계산 끝 시간
+                    time_bound_total += std::chrono::duration<double>(t2 - t1).count(); // bound 시간 누적
                     // Top-k 인증 판정
                     if (certify_topk(y0, fwd.final_lower, fwd.final_upper, k))
                         ++t_count;
                     else
                         ++f_count;
-                    auto t3 = std::chrono::high_resolution_clock::now();
-                    time_certify_total += std::chrono::duration<double>(t3 - t2).count();
+                    auto t3 = std::chrono::high_resolution_clock::now(); // 검증 끝 시간
+                    time_certify_total += std::chrono::duration<double>(t3 - t2).count(); // 검증 시간 누적
                     break;
                 }
                 case 1: {
                     BackwardBoundResult bwd = lirpa_backward_bound(*net, dataset[i], eps_f, false, false);
-                    auto t2 = std::chrono::high_resolution_clock::now();
-                    time_bound_total += std::chrono::duration<double>(t2 - t1).count();
+                    auto t2 = std::chrono::high_resolution_clock::now();// bound 계산 끝 시간
+                    time_bound_total += std::chrono::duration<double>(t2 - t1).count();// bound 시간 누적
                     // Top-k 인증 판정
                     if (certify_topk(y0, bwd.final_lower, bwd.final_upper, k))
                         ++t_count;
                     else
                         ++f_count;
-                    auto t3 = std::chrono::high_resolution_clock::now();
-                    time_certify_total += std::chrono::duration<double>(t3 - t2).count();
+                    auto t3 = std::chrono::high_resolution_clock::now(); // 검증 끝 시간
+                    time_certify_total += std::chrono::duration<double>(t3 - t2).count();  // 검증 시간 누적
                     break;
                 }
                 default:
