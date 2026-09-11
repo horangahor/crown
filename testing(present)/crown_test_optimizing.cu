@@ -3,6 +3,7 @@
 #include<vector>
 #include<algorithm>
 #include<chrono>
+#include<ctime>
 #include "my_lirpa_optimizing.cu"
 #include<fstream>
 #include <nvtx3/nvToolsExt.h>
@@ -118,7 +119,7 @@ FullyConnectedNetwork* load_custom_network(const char* filepath){
 }
 
 // 테스트 데이터(.bin)를 읽어오는 함수 (Pickle을 bin으로 만드는 모듈 readPickle.py 참고)
-Vector load_test_data(const char* filepath, int expected_dim) {
+Vector load_test_data(const char* filepath, int expected_dim, int idx = 0) {
     Vector x0;
     x0.n = expected_dim;
     
@@ -127,6 +128,9 @@ Vector load_test_data(const char* filepath, int expected_dim) {
         std::cerr << "Error opening data file: " << filepath << std::endl;
         return x0;
     }
+
+    // idx번째 샘플로 이동 (샘플 1개 = expected_dim * sizeof(double) 바이트)
+    file.seekg(static_cast<long long>(idx) * expected_dim * sizeof(double), std::ios::beg);
 
     // .bin 파일은 float64(double) 형식으로 저장됨 -> double로 읽고 float으로 변환
     std::vector<double> temp(expected_dim);
@@ -140,15 +144,16 @@ Vector load_test_data(const char* filepath, int expected_dim) {
 
 int main(int argc, char** argv){
 
-    const char* network_path = (argc > 1) ? argv[1] : MODEL_PATH;
-    const char* data_path = (argc > 2) ? argv[2] : "test_data_1.bin";
 
     // atof , stof 둘 다 사용가능 
     // atof : 옛날 문자열 방식인 const char*를 바로 받음, 예외 처리시 0.0 반환
     // stof : 최신 문자열 방식(std::string)을 이용함, 예외 처리시 std::invalid_argument 반환 
     // 지금 argument 타입에 사용한 것은 char** 라서 argv[i]는 char* 타입
     // stof를 사용하면 string 객체를 만들어서 실수로 변환하는 미세한 오버헤드 발생 , 다만 확실한 예외처리 가능
-    double eps = (argc > 3) ? std::stof(argv[3]) : 1e-6;
+    const int data_idx = (argc > 1) ? std::atoi(argv[1]) : 0;
+    const char* network_path = (argc > 2) ? argv[2] : MODEL_PATH;
+    const char* data_path = (argc > 3) ? argv[3] : "test_data_all.bin";
+    double eps = (argc > 4) ? std::stof(argv[4]) : 1e-6;
     
     std::cout << "network read start " << std::endl;
     // 포인터로 받음
@@ -158,8 +163,8 @@ int main(int argc, char** argv){
     // 준비된 테스트 데이터 1개 (bin 파일 로드)
     std::cout << "\ndata read start: " << data_path << std::endl;
     // 입력층 차원(net->layer_in_dim[0])만큼 읽어옴 (예: 256)
-    Vector x0 = load_test_data(data_path, net->layer_in_dim[0]);
-    std::cout << "data read success (dim=" << x0.n << ")" << std::endl;
+    Vector x0 = load_test_data(data_path, net->layer_in_dim[0], data_idx);
+    std::cout << "data read success (dim=" << x0.n << ", idx=" << data_idx << ")" << std::endl;
 
     // CROWN 알고리즘 호출 및 출력
     std::cout << "\n========================================\n";
@@ -176,10 +181,13 @@ int main(int argc, char** argv){
     //=================================================================
     // warm up 하기 
     network_forward(*net, x0);
-    //lirpa_backward_bound(*net, x0, eps, false, false);
-    lirpa_forward_bound_impl(*net, x0, eps, false, false, true);
+    lirpa_backward_bound(*net, x0, eps, false, false);
+    //lirpa_forward_bound_impl(*net, x0, eps, false, false, true);
     // ================================================================
 
+
+    // =============================================================================================
+    // 단일 데이터에 대한 측정 시작
     // NVTX : 코드에 “이 구간이 실제 검증 시간이다”라는 표시를 넣는 기능
     nvtxRangePushA("CROWN_VERIFY");
 
@@ -188,25 +196,37 @@ int main(int argc, char** argv){
 
     // 1. 일반 예측값 확인 (신경망 정방향 통과)
     Vector y = network_forward(*net, x0);
+    auto t_infer = std::chrono::high_resolution_clock::now();
+    double time_infer = std::chrono::duration<double, std::milli>(t_infer - t_start).count();
 
     // 2. CROWN (Backward Bound) 호출
     // 여기서 선언시 BackwardBoundResult 빈 공간(4MB 할당 + 자잘한 벡터들까지 해서 넉넉히 0.25MB )
     // 내부 함수에 진입해서 보면 거의 64MB가 필요함 (함수 주석 참고) <== 근데 64MB 안되서 128MB로 함
     // 왜인지는 모르겠다 너무 함수가 복잡해져서..
-    //BackwardBoundResult bwd = lirpa_backward_bound(*net, x0, eps, false, false);
+    BackwardBoundResult bwd = lirpa_backward_bound(*net, x0, eps, false, false);
 
     // 신경망 + foward 결과만 보면 7ms 초반 ~ 8ms 초반 정도
-    ForwardBoundResult bwd = lirpa_forward_bound_impl(*net, x0, eps, false, false, true);
+    //ForwardBoundResult bwd = lirpa_forward_bound_impl(*net, x0, eps, false, false, true);
+    auto t_bound = std::chrono::high_resolution_clock::now();
+    double time_bound = std::chrono::duration<double, std::milli>(t_bound - t_infer).count();
+
 
     // 시간 측정 종료
     auto t_end = std::chrono::high_resolution_clock::now();
+    double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
     // NVTX 구간 종료
     nvtxRangePop();
-    double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    // 측정 끝
+    //================================================================================================
 
+    std::cout << std::fixed << std::setprecision(4); // 시간 초는 소수점 4자리까지 출력
     std::cout << "calc success" << std::endl;
     std::cout << "Elapsed time: " << elapsed_ms << " ms" << std::endl;
+    std::cout << "Inference time: " << time_infer << " ms" << std::endl;
+    std::cout << "Bound time: " << time_bound << " ms" << std::endl;
+
+    std::cout << std::fixed << std::setprecision(13); // 결과는 오차 검사를 위해 길게
 
     // 3. 출력 차원에 맞게 (보통 16개) 결과 출력
     int out_dim = bwd.final_lower.n;
@@ -314,6 +334,37 @@ int main(int argc, char** argv){
     }
     else{
         std::cout << "unable to determine";
+    }
+
+    // 단일 샘플 타이밍 CSV에 누적 기록 (실행할 때마다 append)
+    {
+        const char* timing_csv = "timing_log_crown_single.csv";
+        bool write_header = false;
+        {
+            std::ifstream check(timing_csv);
+            write_header = !check.is_open();
+        }
+        std::ofstream log(timing_csv, std::ios::app);
+        if (log.is_open()) {
+            std::time_t now = std::time(nullptr);
+            char time_buf[64];
+            std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+            if (write_header) {
+                log << "timestamp,data_idx,eps,total_ms,infer_ms,bound_ms\n";
+            }
+            log << std::fixed << std::setprecision(4);
+            log << time_buf   << ","
+                << data_idx   << ","
+                << std::scientific << std::setprecision(2) << eps << ","
+                << std::fixed << std::setprecision(4)
+                << elapsed_ms << ","
+                << time_infer << ","
+                << time_bound << "\n";
+            log.close();
+            std::cout << "timing log appended to " << timing_csv << std::endl;
+        } else {
+            std::cerr << "Warning: could not write to timing_log_crown_single.csv" << std::endl;
+        }
     }
 
     // 동적 할당 해제
