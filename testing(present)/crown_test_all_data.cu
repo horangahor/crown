@@ -235,7 +235,22 @@ int main(int argc, char** argv) {
     std::cout << "  eps values  : " << eps_list.size() << std::endl;
     std::cout << "========================================\n" << std::endl;
 
-    // 5. 전체 시간 측정 시작
+    // 5. Warmup (타이머 외부 — GPU JIT + 클럭 안정화)
+    {
+        std::cout << "Warming up GPU..." << std::endl;
+        float eps_warmup = static_cast<float>(eps_list[0]);
+        network_forward(*net, dataset[0]);
+        if (method == 0) {
+            lirpa_forward_bound_impl(*net, dataset[0], eps_warmup, false, false, true);
+        } else {
+            lirpa_backward_bound(*net, dataset[0], eps_warmup, false, false);
+        }
+        cudaDeviceSynchronize();
+        std::cout << "Warmup done." << std::endl;
+    }
+    // ===========================================================
+
+    // 6. 전체 시간 측정 시작
     auto total_start = std::chrono::high_resolution_clock::now();
     nvtxRangePushA("CROWN_SWEEP");
 
