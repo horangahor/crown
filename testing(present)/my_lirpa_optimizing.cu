@@ -1393,6 +1393,44 @@ Vector network_forward(const FullyConnectedNetwork &net, const Vector &x) {
 // CROWN 알고리즘 (my_lirpa.cu와 동일한 로직)
 // ============================================================
 
+// ==============================================================================
+// 단위행렬, 영벡터 복사 안하고 GPU에서 직접 만들기 (공용 커널 퓨전 함수)
+// Forward와 Backward 바운드 초기화에서 공용으로 사용합니다.
+// ==============================================================================
+__global__ void initialize_bound_state_gpu(
+    Matrix *lower_M, Matrix *upper_M, Vector *lower_p, Vector *upper_p,
+    int matrix_rows, int matrix_cols, int vector_n,
+    bool default_lower_M, bool default_upper_M,
+    bool default_lower_p, bool default_upper_p) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int matrix_elements = matrix_rows * matrix_cols;
+
+  if (tid == 0) {
+    if (default_lower_M) {
+      lower_M->rows = matrix_rows;
+      lower_M->cols = matrix_cols;
+    }
+    if (default_upper_M) {
+      upper_M->rows = matrix_rows;
+      upper_M->cols = matrix_cols;
+    }
+    if (default_lower_p) lower_p->n = vector_n;
+    if (default_upper_p) upper_p->n = vector_n;
+  }
+
+  if (tid < matrix_elements) {
+    const int r = tid / matrix_cols;
+    const int c = tid % matrix_cols;
+    if (default_lower_M) lower_M->a[r][c] = (r == c) ? 1.0f : 0.0f;
+    if (default_upper_M) upper_M->a[r][c] = (r == c) ? 1.0f : 0.0f;
+  }
+
+  if (tid < vector_n) {
+    if (default_lower_p) lower_p->v[tid] = 0.0f;
+    if (default_upper_p) upper_p->v[tid] = 0.0f;
+  }
+}
+
 // materialze_host_result : 호스트(cpu)로 전달(memcpy)해줄지 결정 , true면 전달 false면 전달x
 ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
                                             const Vector &x0, double eps,
@@ -1426,14 +1464,11 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
 
 
   const int in_dim = network_input_dim(net);
-  cudaMemset(lower_A, 0, sizeof(Matrix));
-  cudaMemset(upper_A, 0, sizeof(Matrix));
-  make_eye_gpu<<<(in_dim + 255) / 256, 256>>>(lower_A, in_dim);
-  make_eye_gpu<<<(in_dim + 255) / 256, 256>>>(upper_A, in_dim);
-  cudaMemset(lower_c, 0, sizeof(Vector));        // 중복되는 형태 세팅 제거
-  cudaMemset(upper_c, 0, sizeof(Vector));
-  set_vector_size_gpu<<<1, 1>>>(lower_c, in_dim);
-  set_vector_size_gpu<<<1, 1>>>(upper_c, in_dim);
+  const int eye_blocks = (in_dim * in_dim + 255) / 256;
+  initialize_bound_state_gpu<<<eye_blocks, 256>>>(
+      lower_A, upper_A, lower_c, upper_c,
+      in_dim, in_dim, in_dim,
+      true, true, true, true);
 
   // x0 + eps , x0 - eps 만들기
   Vector xl = x0, xu = x0;
@@ -1777,41 +1812,8 @@ __global__ void backward_matmul_pair_gpu(
 }
 
 // Initialize the default output specification directly on the GPU.  The
-// caller can selectively keep host copies for user-supplied specifications.
-// 단위행렬 , 영벡터 복사 안하고 GPU에서 직접 만들기 (커널 퓨전 함수) (default가 true면 안건듦)
-__global__ void initialize_backward_state_gpu(
-    Matrix *lower_M, Matrix *upper_M, Vector *lower_p, Vector *upper_p,
-    int matrix_rows, int matrix_cols, int vector_n,
-    bool default_lower_M, bool default_upper_M,
-    bool default_lower_p, bool default_upper_p) {
-  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  const int matrix_elements = matrix_rows * matrix_cols;
-
-  if (tid == 0) {
-    if (default_lower_M) {
-      lower_M->rows = matrix_rows;
-      lower_M->cols = matrix_cols;
-    }
-    if (default_upper_M) {
-      upper_M->rows = matrix_rows;
-      upper_M->cols = matrix_cols;
-    }
-    if (default_lower_p) lower_p->n = vector_n;
-    if (default_upper_p) upper_p->n = vector_n;
-  }
-
-  if (tid < matrix_elements) {
-    const int r = tid / matrix_cols;
-    const int c = tid % matrix_cols;
-    if (default_lower_M) lower_M->a[r][c] = (r == c) ? 1.0f : 0.0f;
-    if (default_upper_M) upper_M->a[r][c] = (r == c) ? 1.0f : 0.0f;
-  }
-
-  if (tid < vector_n) {
-    if (default_lower_p) lower_p->v[tid] = 0.0f;
-    if (default_upper_p) upper_p->v[tid] = 0.0f;
-  }
-}
+// (기존 initialize_backward_state_gpu 커널은 Forward/Backward 공용 사용을 위해
+//  위쪽의 initialize_bound_state_gpu로 통합 정의되었습니다.)
 
 // 단지 전체 레이어를 루프로 돌면서 커널 퓨전(Kernel Fusion)과 포인터 스왑을 통해 
 // 메모리 할당/복사를 완전히 없앤 극자적 최적화(Zero-Memcpy) 버전
@@ -1846,12 +1848,12 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
 
   // 기본 identity/zero 출력 사양은 GPU에서 직접 생성한다. 사용자 지정
   // 사양만 필요한 경우에 한해 기존 Host-to-Device 복사를 수행한다.
-  // 기본 초기화(단위행렬 등)를 memcpy를 쓰지 않고 GPU에서 직접 한다. (initialize_backward_state_gpu 커널)
+  // 기본 초기화(단위행렬 등)를 memcpy를 쓰지 않고 GPU에서 직접 한다. (initialize_bound_state_gpu 커널)
   const int matrix_rows = initial_lower_M.rows;
   const int matrix_cols = initial_lower_M.cols;
   const int vector_n = initial_lower_p.n;
   const int init_elements = max(matrix_rows * matrix_cols, vector_n);
-  initialize_backward_state_gpu<<<(init_elements + 255) / 256, 256>>>(
+  initialize_bound_state_gpu<<<(init_elements + 255) / 256, 256>>>(
       lower_M, upper_M, lower_p, upper_p,
       matrix_rows, matrix_cols, vector_n,
       default_lower_M, default_upper_M, default_lower_p, default_upper_p);
@@ -2123,35 +2125,8 @@ __global__ void compute_input_box_stream_gpu(const Vector* x0, const float* d_ep
   }
 }
 
-// 2. [출발선 긋기 커널 - Forward 초기화]
-//    "달리기 시합 시작하기 전, 출발선에 서서 준비하는 단계"
-//    대각선에만 1을 넣고(단위 행렬), 나머지는 0으로 깨끗하게 칠해둡니다.
-// make_eye_gpu는 memset을 사용하는데 cuda graph 캡처에서는 memset 사용 불가
-__global__ void init_forward_state_gpu(Matrix *lower_A, Matrix *upper_A,
-                                       Vector *lower_c, Vector *upper_c,
-                                       int in_dim) {
-  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid == 0) {
-    lower_A->rows = in_dim;
-    lower_A->cols = in_dim;
-    upper_A->rows = in_dim;
-    upper_A->cols = in_dim;
-    lower_c->n = in_dim;
-    upper_c->n = in_dim;
-  }
-  const int total = in_dim * in_dim;
-  if (tid < total) {
-    const int r = tid / in_dim;
-    const int c = tid % in_dim;
-    const float val = (r == c) ? 1.0f : 0.0f; // 대각선만 1, 나머지는 0
-    lower_A->a[r][c] = val;
-    upper_A->a[r][c] = val;
-  }
-  if (tid < in_dim) {
-    lower_c->v[tid] = 0.0f; // 편향(오프셋)은 0으로 시작
-    upper_c->v[tid] = 0.0f;
-  }
-}
+// 2. [출발선 긋기 커널 - 바운드 상태 초기화]
+//    별도 중복 커널 없이 공용 initialize_bound_state_gpu 커널을 재사용합니다.
 
 // 3. [초고속 택배 배달원 커널]
 //    "GPU 메모리 방 A에 있는 숫자들을 방 B로 순식간에 슝 복사해주는 착한 배달부"
@@ -2496,10 +2471,12 @@ private:
     compute_input_box_stream_gpu<<<(in_dim + 255) / 256, 256, 0, stream>>>(
         d_x0, d_eps, d_xl, d_xu, in_dim);
 
-    // 2단계: 출발선 긋기 (대각선 1, 나머지 0 단위 행렬 세팅)
+    // 2단계: 출발선 긋기 (공용 initialize_bound_state_gpu 커널 재사용)
     const int eye_blocks = (in_dim * in_dim + 255) / 256;
-    init_forward_state_gpu<<<eye_blocks, 256, 0, stream>>>(
-        d_lower_A, d_upper_A, d_lower_c, d_upper_c, in_dim);
+    initialize_bound_state_gpu<<<eye_blocks, 256, 0, stream>>>(
+        d_lower_A, d_upper_A, d_lower_c, d_upper_c,
+        in_dim, in_dim, in_dim,
+        true, true, true, true);
 
     // 3단계: 앞쪽 층부터 차례차례 CROWN Forward 공식 적용
     for (int l = 0; l < net.num_layers; ++l) {
@@ -2575,7 +2552,7 @@ private:
     const int init_elements = max(matrix_rows * matrix_cols, vector_n);
 
     // 2단계: 뒤에서 시작할 준비 (단위 행렬로 시작)
-    initialize_backward_state_gpu<<<(init_elements + 255) / 256, 256, 0, stream>>>(
+    initialize_bound_state_gpu<<<(init_elements + 255) / 256, 256, 0, stream>>>(
         d_bwd_lower_M, d_bwd_upper_M, d_bwd_lower_p, d_bwd_upper_p,
         matrix_rows, matrix_cols, vector_n,
         true, true, true, true);
