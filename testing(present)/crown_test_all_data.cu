@@ -188,6 +188,8 @@ int main(int argc, char** argv) {
     const char* data_path    = (argc > 3) ? argv[3] : "test_data_all.bin";
     int         k            = (argc > 4) ? std::atoi(argv[4]) : 8;
     const char* output_csv   = (argc > 5) ? argv[5] : "results_cuda.csv";
+    int         graph_mode   = (argc > 6) ? std::atoi(argv[6]) : 1;
+    // graph_mode: 0 = Baseline (No Graph), 1 = CUDA Graph (Separate Infer + Bound), 2 = CUDA Graph (Combined Fused)
 
     // 1. 모델 로드
     std::cout << "\n=== crown_test_all_data ===" << std::endl;
@@ -199,6 +201,13 @@ int main(int argc, char** argv) {
     ensure_pool();
     prepare_network_on_gpu(*net);
     std::cout << "GPU pool and weights ready" << std::endl;
+
+    // CUDA Graph 초기화 (mode > 0 일 때)
+    if (graph_mode > 0) {
+        std::cout << "Initializing CUDA Graph engine (mode=" << graph_mode << ")..." << std::endl;
+        init_crown_cuda_graph(*net, method, graph_mode);
+        std::cout << "CUDA Graph engine ready." << std::endl;
+    }
 
     // 3. 전체 데이터셋 로드
     int N = 0;
@@ -228,22 +237,37 @@ int main(int argc, char** argv) {
         method_str = "backward";
     }
 
+    std::string mode_desc;
+    if (graph_mode == 0) mode_desc = "Baseline (No Graph)";
+    else if (graph_mode == 1) mode_desc = "CUDA Graph (Separate Infer + Bound)";
+    else if (graph_mode == 2) mode_desc = "CUDA Graph (Combined Fused)";
+
     std::cout << "\n========================================" << std::endl;
     std::cout << "Starting " << method_str <<" CROWN Sweep" << std::endl;
-    std::cout << "  data points : " << N               << std::endl;
-    std::cout << "  k (top-k)   : " << k               << std::endl;
-    std::cout << "  eps values  : " << eps_list.size() << std::endl;
+    std::cout << "  Execution Mode: " << mode_desc          << std::endl;
+    std::cout << "  data points   : " << N                  << std::endl;
+    std::cout << "  k (top-k)     : " << k                  << std::endl;
+    std::cout << "  eps values    : " << eps_list.size()    << std::endl;
     std::cout << "========================================\n" << std::endl;
 
     // 5. Warmup (타이머 외부 — GPU JIT + 클럭 안정화)
     {
         std::cout << "Warming up GPU..." << std::endl;
         float eps_warmup = static_cast<float>(eps_list[0]);
-        network_forward(*net, dataset[0]);
-        if (method == 0) {
-            lirpa_forward_bound_impl(*net, dataset[0], eps_warmup, false, false, true);
+        if (graph_mode == 1) {
+            Vector y_warm, lb_warm, ub_warm;
+            run_crown_cuda_graph_infer(dataset[0], y_warm);
+            run_crown_cuda_graph_bound(dataset[0], eps_warmup, lb_warm, ub_warm, method, true);
+        } else if (graph_mode == 2) {
+            Vector y_warm, lb_warm, ub_warm;
+            run_crown_cuda_graph_combined(dataset[0], eps_warmup, y_warm, lb_warm, ub_warm, method);
         } else {
-            lirpa_backward_bound(*net, dataset[0], eps_warmup, false, false);
+            network_forward(*net, dataset[0]);
+            if (method == 0) {
+                lirpa_forward_bound_impl(*net, dataset[0], eps_warmup, false, false, true);
+            } else {
+                lirpa_backward_bound(*net, dataset[0], eps_warmup, false, false);
+            }
         }
         cudaDeviceSynchronize();
         std::cout << "Warmup done." << std::endl;
@@ -263,47 +287,82 @@ int main(int argc, char** argv) {
     for (double eps : eps_list) {
         int t_count = 0, f_count = 0;
         float eps_f = static_cast<float>(eps);
+        if (graph_mode > 0) {
+            set_crown_cuda_graph_eps(eps_f);
+        }
 
         for (int i = 0; i < N; ++i) {
-            // ── [1] 추론 ──────────────────────────────────────────
-            // 신경망 정방향 통과
-            auto t0 = std::chrono::high_resolution_clock::now();
-            Vector y0 = network_forward(*net, dataset[i]);
-            auto t1 = std::chrono::high_resolution_clock::now(); // 추론 끝 시간
-            time_infer_total += std::chrono::duration<double>(t1 - t0).count(); // 추론 시간 누적
+            Vector y0, lb, ub;
 
-            // ── [2] Bound 계산 + [3] 검증 ────────────────────────
-            // CROWN backward bound or forward bound 계산
-            // (각 case 안에서 직접 초기화 → NRVO 적용, 4MB+ 구조체 복사 0회)
-            switch(method){
-                case 0: {
-                    ForwardBoundResult fwd = lirpa_forward_bound_impl(*net, dataset[i], eps_f, false, false, true);
-                    auto t2 = std::chrono::high_resolution_clock::now(); // bound 계산 끝 시간
-                    time_bound_total += std::chrono::duration<double>(t2 - t1).count(); // bound 시간 누적
-                    // Top-k 인증 판정
-                    if (certify_topk(y0, fwd.final_lower, fwd.final_upper, k))
-                        ++t_count;
-                    else
-                        ++f_count;
-                    auto t3 = std::chrono::high_resolution_clock::now(); // 검증 끝 시간
-                    time_certify_total += std::chrono::duration<double>(t3 - t2).count(); // 검증 시간 누적
-                    break;
+            if (graph_mode == 1) {
+                // ── [1] 추론 (CUDA Graph) ─────────────────────────
+                auto t0 = std::chrono::high_resolution_clock::now();
+                run_crown_cuda_graph_infer(dataset[i], y0);
+                auto t1 = std::chrono::high_resolution_clock::now();
+                time_infer_total += std::chrono::duration<double>(t1 - t0).count();
+
+                // ── [2] Bound 계산 (CUDA Graph) ───────────────────
+                run_crown_cuda_graph_bound(dataset[i], eps_f, lb, ub, method, true);
+                auto t2 = std::chrono::high_resolution_clock::now();
+                time_bound_total += std::chrono::duration<double>(t2 - t1).count();
+
+                // ── [3] 검증 ─────────────────────────────────────
+                if (certify_topk(y0, lb, ub, k))
+                    ++t_count;
+                else
+                    ++f_count;
+                auto t3 = std::chrono::high_resolution_clock::now();
+                time_certify_total += std::chrono::duration<double>(t3 - t2).count();
+
+            } else if (graph_mode == 2) {
+                // ── [1+2] 추론 + Bound 통합 런치 (CUDA Graph) ────
+                auto t0 = std::chrono::high_resolution_clock::now();
+                run_crown_cuda_graph_combined(dataset[i], eps_f, y0, lb, ub, method);
+                auto t2 = std::chrono::high_resolution_clock::now();
+                time_bound_total += std::chrono::duration<double>(t2 - t0).count();
+
+                // ── [3] 검증 ─────────────────────────────────────
+                if (certify_topk(y0, lb, ub, k))
+                    ++t_count;
+                else
+                    ++f_count;
+                auto t3 = std::chrono::high_resolution_clock::now();
+                time_certify_total += std::chrono::duration<double>(t3 - t2).count();
+
+            } else {
+                // ── [1] 추론 (기존) ──────────────────────────────
+                auto t0 = std::chrono::high_resolution_clock::now();
+                y0 = network_forward(*net, dataset[i]);
+                auto t1 = std::chrono::high_resolution_clock::now();
+                time_infer_total += std::chrono::duration<double>(t1 - t0).count();
+
+                // ── [2] Bound 계산 (기존) ────────────────────────
+                switch(method){
+                    case 0: {
+                        ForwardBoundResult fwd = lirpa_forward_bound_impl(*net, dataset[i], eps_f, false, false, true);
+                        lb = fwd.final_lower;
+                        ub = fwd.final_upper;
+                        break;
+                    }
+                    case 1: {
+                        BackwardBoundResult bwd = lirpa_backward_bound(*net, dataset[i], eps_f, false, false);
+                        lb = bwd.final_lower;
+                        ub = bwd.final_upper;
+                        break;
+                    }
+                    default:
+                        break;
                 }
-                case 1: {
-                    BackwardBoundResult bwd = lirpa_backward_bound(*net, dataset[i], eps_f, false, false);
-                    auto t2 = std::chrono::high_resolution_clock::now();// bound 계산 끝 시간
-                    time_bound_total += std::chrono::duration<double>(t2 - t1).count();// bound 시간 누적
-                    // Top-k 인증 판정
-                    if (certify_topk(y0, bwd.final_lower, bwd.final_upper, k))
-                        ++t_count;
-                    else
-                        ++f_count;
-                    auto t3 = std::chrono::high_resolution_clock::now(); // 검증 끝 시간
-                    time_certify_total += std::chrono::duration<double>(t3 - t2).count();  // 검증 시간 누적
-                    break;
-                }
-                default:
-                    break;
+                auto t2 = std::chrono::high_resolution_clock::now();
+                time_bound_total += std::chrono::duration<double>(t2 - t1).count();
+
+                // ── [3] 검증 ─────────────────────────────────────
+                if (certify_topk(y0, lb, ub, k))
+                    ++t_count;
+                else
+                    ++f_count;
+                auto t3 = std::chrono::high_resolution_clock::now();
+                time_certify_total += std::chrono::duration<double>(t3 - t2).count();
             }
 
             // 1000개마다 진행상황 출력 (sparse.py 와 동일 포맷)
@@ -395,8 +454,12 @@ int main(int argc, char** argv) {
             }
 
             log << std::fixed;
+            std::string method_tag = method_str;
+            if (graph_mode == 1) method_tag += "_cuda_graph";
+            else if (graph_mode == 2) method_tag += "_cuda_graph_fused";
+
             log << time_buf         << ","
-                << method_str       << ","
+                << method_tag       << ","
                 << N                << ","
                 << eps_list.size()  << ","
                 << std::setprecision(4) << total_elapsed      << ","
@@ -415,6 +478,9 @@ int main(int argc, char** argv) {
     }
 
     // 10. 메모리 해제
+    if (graph_mode > 0) {
+        cleanup_crown_cuda_graph();
+    }
     delete net;
     return 0;
 }

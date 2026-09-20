@@ -1434,6 +1434,8 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
   cudaMemset(upper_c, 0, sizeof(Vector));
   set_vector_size_gpu<<<1, 1>>>(lower_c, in_dim);
   set_vector_size_gpu<<<1, 1>>>(upper_c, in_dim);
+
+  // x0 + eps , x0 - eps 만들기
   Vector xl = x0, xu = x0;
   for (int i = 0; i < in_dim; ++i) { xl.v[i] -= eps; xu.v[i] += eps; }
   cudaMemcpy(d_xl, &xl, sizeof(Vector), cudaMemcpyHostToDevice);
@@ -2089,6 +2091,663 @@ BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const
   }
   return out;
 }
+
+// ==============================================================================
+// 🚀 [CUDA Graph 최적화: 런치 오버헤드 제로화]
+//
+// 💡 [10살도 이해하는 쉬운 비유: 식당 주문 이야기]
+// - 기존 방식 (매번 커널 런치):
+//   손님(CPU)이 주방장(GPU)한테 "양파 썰어줘!" -> (다 썰면) "당근 썰어줘!" -> "고기 볶아줘!"...
+//   요리 하나 만드는데 주방 문을 50번 넘게 열고 닫느라 요리 시간보다 문 여닫는 시간이 더 걸렸어요!
+//
+// - CUDA Graph 방식:
+//   손님(CPU)이 주방장(GPU)에게 "전체 요리 레시피(Graph)"를 딱 한 번 적어서 줍니다.
+//   그 다음부터는 "1번 세트 요리 시작!(cudaGraphLaunch)" 외치면 끝!
+//   주방장이 주방 문 열 필요 없이 혼자서 50단계를 1초의 낭비도 없이 촥촥촥 끝냅니다!
+// ==============================================================================
+
+// 1. [입력값 상자 만들기 커널]
+//    "원래 숫자(x0)에 오차 범위(eps)를 빼고 더해서 [최솟값, 최댓값] 울타리를 쳐주는 작업"
+//    CPU한테 물어보지 않고 GPU 안에서 혼자 뚝딱 계산해서 시간 낭비가 전혀 없어요!
+__global__ void compute_input_box_stream_gpu(const Vector* x0, const float* d_eps,
+                                             Vector* xl, Vector* xu, int in_dim) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid == 0) {
+    xl->n = in_dim;
+    xu->n = in_dim;
+  }
+  if (tid < in_dim) {
+    const float eps = *d_eps; // GPU 메모리에 적힌 오차(eps)를 바로 읽어와요
+    xl->v[tid] = x0->v[tid] - eps; // 최솟값(하한) = x0 - eps
+    xu->v[tid] = x0->v[tid] + eps; // 최댓값(상한) = x0 + eps
+  }
+}
+
+// 2. [출발선 긋기 커널 - Forward 초기화]
+//    "달리기 시합 시작하기 전, 출발선에 서서 준비하는 단계"
+//    대각선에만 1을 넣고(단위 행렬), 나머지는 0으로 깨끗하게 칠해둡니다.
+// make_eye_gpu는 memset을 사용하는데 cuda graph 캡처에서는 memset 사용 불가
+__global__ void init_forward_state_gpu(Matrix *lower_A, Matrix *upper_A,
+                                       Vector *lower_c, Vector *upper_c,
+                                       int in_dim) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid == 0) {
+    lower_A->rows = in_dim;
+    lower_A->cols = in_dim;
+    upper_A->rows = in_dim;
+    upper_A->cols = in_dim;
+    lower_c->n = in_dim;
+    upper_c->n = in_dim;
+  }
+  const int total = in_dim * in_dim;
+  if (tid < total) {
+    const int r = tid / in_dim;
+    const int c = tid % in_dim;
+    const float val = (r == c) ? 1.0f : 0.0f; // 대각선만 1, 나머지는 0
+    lower_A->a[r][c] = val;
+    upper_A->a[r][c] = val;
+  }
+  if (tid < in_dim) {
+    lower_c->v[tid] = 0.0f; // 편향(오프셋)은 0으로 시작
+    upper_c->v[tid] = 0.0f;
+  }
+}
+
+// 3. [초고속 택배 배달원 커널]
+//    "GPU 메모리 방 A에 있는 숫자들을 방 B로 순식간에 슝 복사해주는 착한 배달부"
+__global__ void copy_vector_gpu(const Vector *src, Vector *dst) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid == 0) dst->n = src->n;
+  if (tid < src->n) dst->v[tid] = src->v[tid];
+}
+
+// ==============================================================================
+// 🏭 [CrownCUDAGraphManager: GPU 자동화 공장의 총지배인 로봇]
+//
+// 1) 공장 바닥(GPU 메모리 방)을 미리 평생 쓸 크기로 잡아둡니다. (매번 방 잡으면 느림!)
+// 2) 요리 순서(커널 순서)를 비디오 카메라로 딱 1번만 녹화(Capture)해둡니다.
+// 3) 새로운 데이터가 올 때마다 "재생(Launch)!" 버튼만 딸깍 누릅니다.
+// ==============================================================================
+class CrownCUDAGraphManager {
+public:
+  cudaStream_t stream = nullptr; // 작업 명령들이 차례대로 지나가는 전용 컨베이어 벨트
+
+  // 📦 [입력과 출력을 위한 GPU 전용 바구니들 (I/O Device Buffers)]
+  Vector* d_x0 = nullptr;          // 입력 데이터(x0)를 담아둘 GPU 방 (고정 자리)
+  float*  d_eps = nullptr;         // 오차 범위(eps)를 담아둘 GPU 방 (숫자 딱 1개)
+  Vector* d_y0 = nullptr;          // 추론 결과(신경망 출력 y0)가 나올 GPU 방
+  Vector* d_final_lower = nullptr; // CROWN 계산 결과인 최솟값(하한선) 바구니
+  Vector* d_final_upper = nullptr; // CROWN 계산 결과인 최댓값(상한선) 바구니
+
+  // ⚡ [CPU와 GPU 사이 초고속 하이패스 메모리 (Pinned Host Buffers)]
+  // 일반 메모리보다 복사 속도가 2~3배 빠르고, GPU가 일하는 동안 CPU를 방해하지 않아요!
+  Vector* h_y0 = nullptr;
+  Vector* h_final_lower = nullptr;
+  Vector* h_final_upper = nullptr;
+
+  // 📝 [정방향(Forward) 계산할 때 쓸 GPU 연습장들]
+  Matrix* d_lower_A = nullptr;
+  Matrix* d_upper_A = nullptr;
+  Matrix* d_pre_lower_A = nullptr;
+  Matrix* d_pre_upper_A = nullptr;
+  Vector* d_lower_c = nullptr;
+  Vector* d_upper_c = nullptr;
+  Vector* d_pre_lower_c = nullptr;
+  Vector* d_pre_upper_c = nullptr;
+  Vector* d_pre_lower = nullptr;
+  Vector* d_pre_upper = nullptr;
+  Vector* d_alpha_l = nullptr;
+  Vector* d_beta_l = nullptr;
+  Vector* d_alpha_u = nullptr;
+  Vector* d_beta_u = nullptr;
+  Vector* d_xl = nullptr;
+  Vector* d_xu = nullptr;
+
+  // 🎒 [역방향(Backward) 계산 때 재사용하려고 Forward 결과를 보관해두는 사물함]
+  Vector* d_cached_alpha_l[MAX_LAYERS]{};
+  Vector* d_cached_beta_l[MAX_LAYERS]{};
+  Vector* d_cached_alpha_u[MAX_LAYERS]{};
+  Vector* d_cached_beta_u[MAX_LAYERS]{};
+
+  // 🔄 [역방향(Backward) 계산할 때 쓸 GPU 연습장들]
+  Matrix* d_bwd_lower_M = nullptr;
+  Matrix* d_bwd_upper_M = nullptr;
+  Matrix* d_bwd_lower_pos = nullptr;
+  Matrix* d_bwd_lower_neg = nullptr;
+  Matrix* d_bwd_upper_pos = nullptr;
+  Matrix* d_bwd_upper_neg = nullptr;
+  Matrix* d_bwd_lower_coeff = nullptr;
+  Matrix* d_bwd_upper_coeff = nullptr;
+  Matrix* d_bwd_new_lower_M = nullptr;
+  Matrix* d_bwd_new_upper_M = nullptr;
+
+  Vector* d_bwd_lower_p = nullptr;
+  Vector* d_bwd_upper_p = nullptr;
+  Vector* d_bwd_term_lp = nullptr;
+  Vector* d_bwd_term_ln = nullptr;
+  Vector* d_bwd_new_lower_p = nullptr;
+  Vector* d_bwd_new_upper_p = nullptr;
+
+  // 🏓 [추론할 때 핑퐁처럼 번갈아 쓰는 버퍼]
+  Vector* d_infer_vec[2]{};
+
+  // 🎬 [비디오 테이프(Graph)와 재생기(Exec Instance)]
+  // 1. 추론 전용 비디오
+  cudaGraph_t graph_infer = nullptr;
+  cudaGraphExec_t instance_infer = nullptr;
+
+  // 2. 바운드(CROWN) 전용 비디오
+  cudaGraph_t graph_bound = nullptr;
+  cudaGraphExec_t instance_bound = nullptr;
+
+  // 3. 추론 + 바운드 한 번에 돌리는 통합 비디오
+  cudaGraph_t graph_combined = nullptr;
+  cudaGraphExec_t instance_combined = nullptr;
+
+  bool initialized = false;
+  float current_eps = -1.0f;
+  int current_method = 1; // 0: forward, 1: backward
+  const void* last_uploaded_x_addr = nullptr;
+
+  // 🛠️ [공장 개장식: 모든 메모리를 미리 계약하고, 비디오를 1번만 녹화합니다]
+  // 여기서 gpuPool 말고 추가로 malloc을 했는데, 이유는
+  // 1. 캡처된 graph는 고정 주소 바인딩 방식(읽고 쓰는 메모리 주소 자체가 하드코딩 됨)
+  // 그래프 외부에서 다른 함수가 g_pool을 사용하거나 덮어쓸 때 이미 녹화된 그래프가 오염된 데이터를 읽을 수 있음
+  // 2. 기존 graph로 캡처하지 않은 bound 계산을 위해 분리
+  void init(const FullyConnectedNetwork& net, int method, int mode = 1) {
+    if (initialized) cleanup();
+    current_method = method;
+    last_uploaded_x_addr = nullptr;
+
+    ensure_pool();
+    prepare_network_on_gpu(net);
+
+    // 전용 컨베이어 벨트(Stream) 생성
+    cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+
+    // 1. 입출력 바구니들 GPU에 자리 만들기
+    cudaMalloc(&d_x0, sizeof(Vector));
+    cudaMalloc(&d_eps, sizeof(float));
+    cudaMalloc(&d_y0, sizeof(Vector));
+    cudaMalloc(&d_final_lower, sizeof(Vector));
+    cudaMalloc(&d_final_upper, sizeof(Vector));
+
+    // 하이패스 메모리(Pinned Host) 자리 만들기
+    cudaHostAlloc(&h_y0, sizeof(Vector), cudaHostAllocDefault);
+    cudaHostAlloc(&h_final_lower, sizeof(Vector), cudaHostAllocDefault);
+    cudaHostAlloc(&h_final_upper, sizeof(Vector), cudaHostAllocDefault);
+
+    // 2. 정방향 연습장들 만들기
+    cudaMalloc(&d_lower_A, sizeof(Matrix));
+    cudaMalloc(&d_upper_A, sizeof(Matrix));
+    cudaMalloc(&d_pre_lower_A, sizeof(Matrix));
+    cudaMalloc(&d_pre_upper_A, sizeof(Matrix));
+    cudaMalloc(&d_lower_c, sizeof(Vector));
+    cudaMalloc(&d_upper_c, sizeof(Vector));
+    cudaMalloc(&d_pre_lower_c, sizeof(Vector));
+    cudaMalloc(&d_pre_upper_c, sizeof(Vector));
+    cudaMalloc(&d_pre_lower, sizeof(Vector));
+    cudaMalloc(&d_pre_upper, sizeof(Vector));
+    cudaMalloc(&d_alpha_l, sizeof(Vector));
+    cudaMalloc(&d_beta_l, sizeof(Vector));
+    cudaMalloc(&d_alpha_u, sizeof(Vector));
+    cudaMalloc(&d_beta_u, sizeof(Vector));
+    cudaMalloc(&d_xl, sizeof(Vector));
+    cudaMalloc(&d_xu, sizeof(Vector));
+
+    for (int l = 0; l < MAX_LAYERS; ++l) {
+      cudaMalloc(&d_cached_alpha_l[l], sizeof(Vector));
+      cudaMalloc(&d_cached_beta_l[l], sizeof(Vector));
+      cudaMalloc(&d_cached_alpha_u[l], sizeof(Vector));
+      cudaMalloc(&d_cached_beta_u[l], sizeof(Vector));
+    }
+
+    // 3. 역방향 연습장들 만들기
+    cudaMalloc(&d_bwd_lower_M, sizeof(Matrix));
+    cudaMalloc(&d_bwd_upper_M, sizeof(Matrix));
+    cudaMalloc(&d_bwd_lower_pos, sizeof(Matrix));
+    cudaMalloc(&d_bwd_lower_neg, sizeof(Matrix));
+    cudaMalloc(&d_bwd_upper_pos, sizeof(Matrix));
+    cudaMalloc(&d_bwd_upper_neg, sizeof(Matrix));
+    cudaMalloc(&d_bwd_lower_coeff, sizeof(Matrix));
+    cudaMalloc(&d_bwd_upper_coeff, sizeof(Matrix));
+    cudaMalloc(&d_bwd_new_lower_M, sizeof(Matrix));
+    cudaMalloc(&d_bwd_new_upper_M, sizeof(Matrix));
+
+    cudaMalloc(&d_bwd_lower_p, sizeof(Vector));
+    cudaMalloc(&d_bwd_upper_p, sizeof(Vector));
+    cudaMalloc(&d_bwd_term_lp, sizeof(Vector));
+    cudaMalloc(&d_bwd_term_ln, sizeof(Vector));
+    cudaMalloc(&d_bwd_new_lower_p, sizeof(Vector));
+    cudaMalloc(&d_bwd_new_upper_p, sizeof(Vector));
+
+    // 4. 추론 연습장 만들기 (추론을 할 때 레이어 두개만 있으면 가중치랑 곱해줄 수 있으니까)
+    // 즉 인풋 layer -> 아웃풋 layer에 순전파 이후  아웃풋 layer와 인풋 layer swap (이 시점에서 input 레이어는 쓰레기 값)
+    cudaMalloc(&d_infer_vec[0], sizeof(Vector));
+    cudaMalloc(&d_infer_vec[1], sizeof(Vector));
+
+    // 카메라 테스트용 가짜 데이터 한 번 흘려보내기
+    // cudaMalloc 직후 gpu 메모리에 들어있는 쓰레기 값 초기화
+    // graph 캡처할 때 사전검증 하는 과정에서 쓰레기 값이 유입되는 걸 방지하기 위함
+    float dummy_eps = 1e-4f;
+    current_eps = dummy_eps;
+    cudaMemcpy(d_eps, &dummy_eps, sizeof(float), cudaMemcpyHostToDevice);
+    Vector dummy_x = make_zero_vector(network_input_dim(net));
+    cudaMemcpy(d_x0, &dummy_x, sizeof(Vector), cudaMemcpyHostToDevice);
+
+    // 5. 🎥 비디오 카메라를 켜고 레시피를 딱 1번 녹화(Capture)합니다!
+    build_infer_graph(net);
+    build_bound_graph(net, method);
+    build_combined_graph(net, method);
+
+    initialized = true;
+  }
+
+  // 🧹 [공장 문 닫기: 빌렸던 메모리 방과 비디오 테이프들을 깨끗이 반납합니다]
+  void cleanup() {
+    if (!initialized) return;
+    if (instance_infer) { cudaGraphExecDestroy(instance_infer); instance_infer = nullptr; }
+    if (graph_infer) { cudaGraphDestroy(graph_infer); graph_infer = nullptr; }
+    if (instance_bound) { cudaGraphExecDestroy(instance_bound); instance_bound = nullptr; }
+    if (graph_bound) { cudaGraphDestroy(graph_bound); graph_bound = nullptr; }
+    if (instance_combined) { cudaGraphExecDestroy(instance_combined); instance_combined = nullptr; }
+    if (graph_combined) { cudaGraphDestroy(graph_combined); graph_combined = nullptr; }
+
+    cudaFree(d_x0); d_x0 = nullptr;
+    cudaFree(d_eps); d_eps = nullptr;
+    cudaFree(d_y0); d_y0 = nullptr;
+    cudaFree(d_final_lower); d_final_lower = nullptr;
+    cudaFree(d_final_upper); d_final_upper = nullptr;
+
+    if (h_y0) { cudaFreeHost(h_y0); h_y0 = nullptr; }
+    if (h_final_lower) { cudaFreeHost(h_final_lower); h_final_lower = nullptr; }
+    if (h_final_upper) { cudaFreeHost(h_final_upper); h_final_upper = nullptr; }
+
+    cudaFree(d_lower_A); d_lower_A = nullptr;
+    cudaFree(d_upper_A); d_upper_A = nullptr;
+    cudaFree(d_pre_lower_A); d_pre_lower_A = nullptr;
+    cudaFree(d_pre_upper_A); d_pre_upper_A = nullptr;
+    cudaFree(d_lower_c); d_lower_c = nullptr;
+    cudaFree(d_upper_c); d_upper_c = nullptr;
+    cudaFree(d_pre_lower_c); d_pre_lower_c = nullptr;
+    cudaFree(d_pre_upper_c); d_pre_upper_c = nullptr;
+    cudaFree(d_pre_lower); d_pre_lower = nullptr;
+    cudaFree(d_pre_upper); d_pre_upper = nullptr;
+    cudaFree(d_alpha_l); d_alpha_l = nullptr;
+    cudaFree(d_beta_l); d_beta_l = nullptr;
+    cudaFree(d_alpha_u); d_alpha_u = nullptr;
+    cudaFree(d_beta_u); d_beta_u = nullptr;
+    cudaFree(d_xl); d_xl = nullptr;
+    cudaFree(d_xu); d_xu = nullptr;
+
+    for (int l = 0; l < MAX_LAYERS; ++l) {
+      cudaFree(d_cached_alpha_l[l]); d_cached_alpha_l[l] = nullptr;
+      cudaFree(d_cached_beta_l[l]); d_cached_beta_l[l] = nullptr;
+      cudaFree(d_cached_alpha_u[l]); d_cached_alpha_u[l] = nullptr;
+      cudaFree(d_cached_beta_u[l]); d_cached_beta_u[l] = nullptr;
+    }
+
+    cudaFree(d_bwd_lower_M); d_bwd_lower_M = nullptr;
+    cudaFree(d_bwd_upper_M); d_bwd_upper_M = nullptr;
+    cudaFree(d_bwd_lower_pos); d_bwd_lower_pos = nullptr;
+    cudaFree(d_bwd_lower_neg); d_bwd_lower_neg = nullptr;
+    cudaFree(d_bwd_upper_pos); d_bwd_upper_pos = nullptr;
+    cudaFree(d_bwd_upper_neg); d_bwd_upper_neg = nullptr;
+    cudaFree(d_bwd_lower_coeff); d_bwd_lower_coeff = nullptr;
+    cudaFree(d_bwd_upper_coeff); d_bwd_upper_coeff = nullptr;
+    cudaFree(d_bwd_new_lower_M); d_bwd_new_lower_M = nullptr;
+    cudaFree(d_bwd_new_upper_M); d_bwd_new_upper_M = nullptr;
+
+    cudaFree(d_bwd_lower_p); d_bwd_lower_p = nullptr;
+    cudaFree(d_bwd_upper_p); d_bwd_upper_p = nullptr;
+    cudaFree(d_bwd_term_lp); d_bwd_term_lp = nullptr;
+    cudaFree(d_bwd_term_ln); d_bwd_term_ln = nullptr;
+    cudaFree(d_bwd_new_lower_p); d_bwd_new_lower_p = nullptr;
+    cudaFree(d_bwd_new_upper_p); d_bwd_new_upper_p = nullptr;
+
+    cudaFree(d_infer_vec[0]); d_infer_vec[0] = nullptr;
+    cudaFree(d_infer_vec[1]); d_infer_vec[1] = nullptr;
+
+    if (stream) { cudaStreamDestroy(stream); stream = nullptr; }
+    initialized = false;
+    last_uploaded_x_addr = nullptr;
+  }
+
+  // 🎯 [오차(eps) 숫자만 GPU 방에 쏙 바꿔주기]
+  // 전체 그래프를 다시 녹화할 필요 없이, GPU 안의 숫자 하나만 업데이트하면 끝!
+  void set_eps(float eps) {
+    if (std::abs(eps - current_eps) < 1e-12f) return; // 같은 숫자면 아무것도 안 함
+    current_eps = eps;
+    cudaMemcpyAsync(d_eps, &eps, sizeof(float), cudaMemcpyHostToDevice, stream);
+  }
+
+  // 🚀 [1단계: 추론 실행하기]
+  // "데이터를 넣고 -> 추론 비디오 재생(Launch) 버튼 꾹! -> 끝난 결과 꺼내오기"
+  void run_infer(const Vector& x0, Vector& y0) {
+    cudaMemcpyAsync(d_x0, &x0, sizeof(Vector), cudaMemcpyHostToDevice, stream);
+    last_uploaded_x_addr = &x0;
+    cudaGraphLaunch(instance_infer, stream); // 🎬 녹화해둔 추론 50개 커널이 1번에 자동 실행!
+    cudaMemcpyAsync(h_y0, d_y0, sizeof(Vector), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    y0 = *h_y0;
+  }
+
+  // 🛡️ [2단계: CROWN Bound 계산 실행하기]
+  // "바운드 계산 비디오 재생 버튼 꾹! -> 최솟값(lb)과 최댓값(ub) 꺼내오기"
+  void run_bound(const Vector& x0, float eps, Vector& lb, Vector& ub, int method, bool allow_cached_x = true) {
+    set_eps(eps); // 필요하면 새로운 오차값만 전달
+    if (!allow_cached_x || last_uploaded_x_addr != &x0) {
+      // 추론할 때 이미 x0를 보냈으면 또 보낼 필요 없이 스킵! (초고속 절약)
+      cudaMemcpyAsync(d_x0, &x0, sizeof(Vector), cudaMemcpyHostToDevice, stream);
+      last_uploaded_x_addr = &x0;
+    }
+    cudaGraphLaunch(instance_bound, stream); // 🎬 녹화해둔 CROWN 커널들이 1번에 자동 실행!
+    cudaMemcpyAsync(h_final_lower, d_final_lower, sizeof(Vector), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_final_upper, d_final_upper, sizeof(Vector), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    lb = *h_final_lower;
+    ub = *h_final_upper;
+  }
+
+  // ⚡ [1+2단계 통합: 추론과 바운드를 한 방에 실행하기]
+  // "추론이랑 바운드를 묶어둔 슈퍼 비디오를 딱 1번만 재생!"
+  void run_combined(const Vector& x0, float eps, Vector& y0, Vector& lb, Vector& ub, int method) {
+    set_eps(eps);
+    cudaMemcpyAsync(d_x0, &x0, sizeof(Vector), cudaMemcpyHostToDevice, stream);
+    last_uploaded_x_addr = &x0;
+    cudaGraphLaunch(instance_combined, stream); // 🎬 추론+바운드 전체가 딱 1번의 명령으로 끝!
+    cudaMemcpyAsync(h_y0, d_y0, sizeof(Vector), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_final_lower, d_final_lower, sizeof(Vector), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_final_upper, d_final_upper, sizeof(Vector), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    y0 = *h_y0;
+    lb = *h_final_lower;
+    ub = *h_final_upper;
+  }
+
+private:
+  // 🎥 [레시피 1 녹화: 신경망 추론 과정 담기]
+  // "입력 데이터 x0를 첫 층부터 끝 층까지 곱하고 더하면서 최종 정답(출력)을 구하는 과정"
+  void record_infer_kernels(const FullyConnectedNetwork &net) {
+    Vector *d_in = d_infer_vec[0];
+    Vector *d_out = d_infer_vec[1];
+    
+    // 맨 처음 입력값 x0를 첫 번째 연습장(d_in)에 배달
+    copy_vector_gpu<<<1, 256, 0, stream>>>(d_x0, d_in);
+
+    // 1층, 2층, 3층... 마지막 층까지 차례대로 가중치 곱하고 활성화 함수(ReLU 등) 통과
+    for (int l = 0; l < net.num_layers; ++l) {
+      const int rows = net.W[l].rows;
+      const int blocks = (rows + 255) / 256;
+      matvec_bias_gpu<<<blocks, 256, 0, stream>>>(g_pool.d_weight[l], d_in, g_pool.d_bias[l], d_out);
+      apply_activation_gpu<<<blocks, 256, 0, stream>>>(net.act[l], d_out);
+      std::swap(d_in, d_out); // 다음 층을 위해 입출력 그릇 체인지 (핑퐁)
+    }
+    // 최종 결과를 d_y0 방에 저장
+    copy_vector_gpu<<<1, 256, 0, stream>>>(d_in, d_y0);
+  }
+
+  // 🎥 [레시피 2 녹화: 정방향(Forward) 바운드 계산 담기]
+  // "입력 상자 [x-eps, x+eps]부터 시작해서 각 층마다 숫자가 어디까지 튈 수 있는지 상한/하한을 계산"
+  void record_forward_bound_kernels(const FullyConnectedNetwork &net, bool is_pure_forward) {
+    const int in_dim = network_input_dim(net);
+
+    // 1단계: 입력값에 오차(eps)를 더하고 빼서 시작 상자 만들기
+    compute_input_box_stream_gpu<<<(in_dim + 255) / 256, 256, 0, stream>>>(
+        d_x0, d_eps, d_xl, d_xu, in_dim);
+
+    // 2단계: 출발선 긋기 (대각선 1, 나머지 0 단위 행렬 세팅)
+    const int eye_blocks = (in_dim * in_dim + 255) / 256;
+    init_forward_state_gpu<<<eye_blocks, 256, 0, stream>>>(
+        d_lower_A, d_upper_A, d_lower_c, d_upper_c, in_dim);
+
+    // 3단계: 앞쪽 층부터 차례차례 CROWN Forward 공식 적용
+    for (int l = 0; l < net.num_layers; ++l) {
+      const Matrix *d_W_pos = g_pool.d_weight_pos[l];
+      const Matrix *d_W_neg = g_pool.d_weight_neg[l];
+      const int weight_rows = net.W[l].rows;
+      const int matrix_elements = weight_rows * in_dim;
+      const int matrix_blocks = (matrix_elements + 255) / 256;
+      const int vector_blocks = (weight_rows + 255) / 256;
+      const Vector *d_bias = g_pool.d_bias[l];
+
+      // 양수 가중치와 음수 가중치를 나눠서 곱하기
+      matmul_pair_add_gpu<<<matrix_blocks, 256, 0, stream>>>(
+          d_W_pos, d_lower_A, d_W_neg, d_upper_A, d_pre_lower_A);
+      matmul_pair_add_gpu<<<matrix_blocks, 256, 0, stream>>>(
+          d_W_pos, d_upper_A, d_W_neg, d_lower_A, d_pre_upper_A);
+
+      matvec_pair_bias_gpu<<<vector_blocks, 256, 0, stream>>>(
+          d_W_pos, d_lower_c, d_W_neg, d_upper_c, d_bias, d_pre_lower_c);
+      matvec_pair_bias_gpu<<<vector_blocks, 256, 0, stream>>>(
+          d_W_pos, d_upper_c, d_W_neg, d_lower_c, d_bias, d_pre_upper_c);
+
+      // 이번 층의 활성화 전 최소/최대 범위 구하기
+      affine_minmax_pair_gpu<<<vector_blocks, 256, 0, stream>>>(
+          d_pre_lower_A, d_pre_lower_c, d_pre_upper_A, d_pre_upper_c,
+          d_xl, d_xu, d_pre_lower, d_pre_upper);
+
+      // 꺾인 ReLU 함수를 삼각형 지붕(선형 완화: Relaxation)으로 감싸기
+      if (net.act[l] == ActivationType::Relu) {
+        relu_relax_full_gpu<<<vector_blocks, 256, 0, stream>>>(
+            d_pre_lower, d_pre_upper, d_alpha_l, d_beta_l, d_alpha_u, d_beta_u);
+      } else if (net.act[l] == ActivationType::Linear) {
+        linear_relax_full_gpu<<<vector_blocks, 256, 0, stream>>>(
+            d_alpha_l, d_beta_l, d_alpha_u, d_beta_u, weight_rows);
+      }
+
+      // 나중에 Backward 할 때 쓰려고 완화 기울기(alpha, beta)를 사물함에 쏙 보관!
+      cache_relaxation_layer_gpu<<<vector_blocks, 256, 0, stream>>>(
+          d_alpha_l, d_beta_l, d_alpha_u, d_beta_u,
+          d_cached_alpha_l[l], d_cached_beta_l[l],
+          d_cached_alpha_u[l], d_cached_beta_u[l]);
+
+      // 다음 층을 위해 행렬 크기 조절
+      rowwise_scale_pair_gpu<<<matrix_blocks, 256, 0, stream>>>(
+          d_pre_lower_A, d_alpha_l, d_pre_upper_A, d_alpha_u, d_lower_A, d_upper_A);
+
+      elemwise_affine_pair_gpu<<<vector_blocks, 256, 0, stream>>>(
+          d_alpha_l, d_pre_lower_c, d_beta_l,
+          d_alpha_u, d_pre_upper_c, d_beta_u,
+          d_lower_c, d_upper_c);
+    }
+
+    // 순수 Forward 모드일 때는 여기서 바로 최종 하한선/상한선을 뽑아냅니다
+    if (is_pure_forward) {
+      const int out_dim = network_output_dim(net);
+      const int blocks = (out_dim + 255) / 256;
+      affine_minmax_pair_gpu<<<blocks, 256, 0, stream>>>(
+          d_lower_A, d_lower_c, d_upper_A, d_upper_c,
+          d_xl, d_xu, d_final_lower, d_final_upper);
+    }
+  }
+
+  // 🎥 [레시피 3 녹화: 역방향(Backward) 바운드 계산 담기]
+  // "CROWN의 꽃! 뒤쪽 층(출력)부터 시작해서 앞쪽(입력)으로 거꾸로 행렬을 밀고 내려옵니다!"
+  void record_backward_bound_kernels(const FullyConnectedNetwork &net) {
+    // 1단계: 먼저 Forward를 돌려서 각 층의 사물함(alpha, beta)을 꽉 채워둡니다
+    record_forward_bound_kernels(net, false);
+
+    const int out_dim = network_output_dim(net);
+    const int matrix_rows = out_dim;
+    const int matrix_cols = out_dim;
+    const int vector_n = out_dim;
+    const int init_elements = max(matrix_rows * matrix_cols, vector_n);
+
+    // 2단계: 뒤에서 시작할 준비 (단위 행렬로 시작)
+    initialize_backward_state_gpu<<<(init_elements + 255) / 256, 256, 0, stream>>>(
+        d_bwd_lower_M, d_bwd_upper_M, d_bwd_lower_p, d_bwd_upper_p,
+        matrix_rows, matrix_cols, vector_n,
+        true, true, true, true);
+
+    Matrix *lower_M = d_bwd_lower_M;
+    Matrix *upper_M = d_bwd_upper_M;
+    Matrix *new_lower_M = d_bwd_new_lower_M;
+    Matrix *new_upper_M = d_bwd_new_upper_M;
+    Vector *lower_p = d_bwd_lower_p;
+    Vector *upper_p = d_bwd_upper_p;
+    Vector *new_lower_p = d_bwd_new_lower_p;
+    Vector *new_upper_p = d_bwd_new_upper_p;
+
+    // 3단계: 맨 마지막 층(출력) -> 맨 앞 층(입력) 방향으로 거꾸로 역주행 루프!
+    for (int l = net.num_layers - 1; l >= 0; --l) {
+      const int m_rows = matrix_rows;
+      const int m_cols = net.layer_out_dim[l];
+      const int w_cols = net.layer_in_dim[l];
+      const int matrix_elems = m_rows * m_cols;
+      const int matrix_blocks = (matrix_elems + 255) / 256;
+      const int vector_blocks = (m_rows + 255) / 256;
+
+      // 사물함에서 꺼내온 이번 층의 완화 기울기
+      const Vector *alpha_l = d_cached_alpha_l[l];
+      const Vector *beta_l = d_cached_beta_l[l];
+      const Vector *alpha_u = d_cached_alpha_u[l];
+      const Vector *beta_u = d_cached_beta_u[l];
+
+      // 행렬의 양수/음수 분리
+      split_pos_neg_pair_gpu<<<matrix_blocks, 256, 0, stream>>>(
+          lower_M, upper_M, d_bwd_lower_pos, d_bwd_lower_neg,
+          d_bwd_upper_pos, d_bwd_upper_neg);
+
+      // 계수 행렬 만들기
+      build_coeff_pair_fused_gpu<<<matrix_blocks, 256, 0, stream>>>(
+          lower_M, upper_M, alpha_l, alpha_u, d_bwd_lower_coeff, d_bwd_upper_coeff);
+
+      // 신경망 가중치(W)와 뒤에서 온 행렬 곱하기
+      backward_matmul_pair_gpu<<<(m_rows * w_cols + 255) / 256, 256, 0, stream>>>(
+          d_bwd_lower_coeff, d_bwd_upper_coeff, g_pool.d_weight[l], new_lower_M, new_upper_M);
+
+      // 편향(bias) 누적 계산
+      const Vector *bias = g_pool.d_bias[l];
+      affine_term_pair_fused_gpu<<<(net.layer_out_dim[l] + 255) / 256, 256, 0, stream>>>(
+          alpha_l, beta_l, alpha_u, beta_u, bias, d_bwd_term_lp, d_bwd_term_ln);
+
+      backward_bias_pair_fused_gpu<<<vector_blocks, 256, 0, stream>>>(
+          d_bwd_lower_pos, d_bwd_lower_neg, d_bwd_upper_pos, d_bwd_upper_neg,
+          d_bwd_term_lp, d_bwd_term_ln, d_bwd_term_ln, d_bwd_term_lp,
+          lower_p, upper_p, new_lower_p, new_upper_p);
+
+      // 다음 층 역주행을 위해 포인터 교체 (스왑)
+      std::swap(lower_M, new_lower_M);
+      std::swap(upper_M, new_upper_M);
+      std::swap(lower_p, new_lower_p);
+      std::swap(upper_p, new_upper_p);
+    }
+
+    // 4단계: 맨 앞 입력층까지 밀고 온 행렬과 초기 입력 상자(xl, xu)를 곱해서 최종 [하한, 상한] 결정!
+    const int blocks = (out_dim + 255) / 256;
+    affine_minmax_pair_gpu<<<blocks, 256, 0, stream>>>(
+        lower_M, lower_p, upper_M, upper_p, d_xl, d_xu, d_final_lower, d_final_upper);
+  }
+
+  // 🎬 [비디오 촬영소 1: 추론 그래프 만들기]
+  void build_infer_graph(const FullyConnectedNetwork &net) {
+    cudaError_t err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal); // 🔴 녹화 시작!
+    if (err != cudaSuccess) {
+      std::cerr << "cudaStreamBeginCapture (infer) failed: " << cudaGetErrorString(err) << std::endl;
+      return;
+    }
+    record_infer_kernels(net); // 요리 순서대로 커널 배치
+    err = cudaStreamEndCapture(stream, &graph_infer); // ⏹️ 녹화 종료!
+    if (err != cudaSuccess) {
+      std::cerr << "cudaStreamEndCapture (infer) failed: " << cudaGetErrorString(err) << std::endl;
+      return;
+    }
+    // 녹화본을 GPU 하드웨어에 딱 맞춘 초고속 실행 파일로 컴파일(인스턴스화)
+    err = cudaGraphInstantiate(&instance_infer, graph_infer, nullptr, nullptr, 0);
+    if (err != cudaSuccess) {
+      std::cerr << "cudaGraphInstantiate (infer) failed: " << cudaGetErrorString(err) << std::endl;
+      return;
+    }
+  }
+
+  // 🎬 [비디오 촬영소 2: 바운드 계산 그래프 만들기]
+  void build_bound_graph(const FullyConnectedNetwork &net, int method) {
+    cudaError_t err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal); // 🔴 녹화 시작!
+    if (err != cudaSuccess) {
+      std::cerr << "cudaStreamBeginCapture (bound) failed: " << cudaGetErrorString(err) << std::endl;
+      return;
+    }
+    if (method == 0) {
+      record_forward_bound_kernels(net, true);  // Forward 바운드 촬영
+    } else {
+      record_backward_bound_kernels(net);       // Backward 바운드 촬영
+    }
+    err = cudaStreamEndCapture(stream, &graph_bound); // ⏹️ 녹화 종료!
+    if (err != cudaSuccess) {
+      std::cerr << "cudaStreamEndCapture (bound) failed: " << cudaGetErrorString(err) << std::endl;
+      return;
+    }
+    err = cudaGraphInstantiate(&instance_bound, graph_bound, nullptr, nullptr, 0);
+    if (err != cudaSuccess) {
+      std::cerr << "cudaGraphInstantiate (bound) failed: " << cudaGetErrorString(err) << std::endl;
+      return;
+    }
+  }
+
+  // 🎬 [비디오 촬영소 3: 추론 + 바운드 통합 슈퍼 그래프 만들기]
+  void build_combined_graph(const FullyConnectedNetwork &net, int method) {
+    cudaError_t err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal); // 🔴 녹화 시작!
+    if (err != cudaSuccess) {
+      std::cerr << "cudaStreamBeginCapture (combined) failed: " << cudaGetErrorString(err) << std::endl;
+      return;
+    }
+    record_infer_kernels(net); // 1) 추론 촬영
+    if (method == 0) {
+      record_forward_bound_kernels(net, true);  // 2) Forward 바운드 촬영
+    } else {
+      record_backward_bound_kernels(net);       // 2) Backward 바운드 촬영
+    }
+    err = cudaStreamEndCapture(stream, &graph_combined); // ⏹️ 녹화 종료!
+    if (err != cudaSuccess) {
+      std::cerr << "cudaStreamEndCapture (combined) failed: " << cudaGetErrorString(err) << std::endl;
+      return;
+    }
+    err = cudaGraphInstantiate(&instance_combined, graph_combined, nullptr, nullptr, 0);
+    if (err != cudaSuccess) {
+      std::cerr << "cudaGraphInstantiate (combined) failed: " << cudaGetErrorString(err) << std::endl;
+      return;
+    }
+  }
+};
+
+// ==============================================================================
+// 🔘 [외부(crown_test_all_data.cu)에서 누르는 간단한 리모컨 버튼들]
+// ==============================================================================
+
+// 전역 매니저 객체 (딱 1개만 상주)
+static CrownCUDAGraphManager g_crown_graph;
+
+// 1. 공장 가동 준비 버튼 (메모리 확보 + 비디오 1회 녹화)
+void init_crown_cuda_graph(const FullyConnectedNetwork& net, int method, int mode = 1) {
+  g_crown_graph.init(net, method, mode);
+}
+
+// 2. 오차 범위(eps) 변경 버튼
+void set_crown_cuda_graph_eps(float eps) {
+  g_crown_graph.set_eps(eps);
+}
+
+// 3. 추론 실행 버튼 (y0 계산)
+void run_crown_cuda_graph_infer(const Vector& x0, Vector& y0) {
+  g_crown_graph.run_infer(x0, y0);
+}
+
+// 4. 바운드 계산 실행 버튼 (lb, ub 계산)
+void run_crown_cuda_graph_bound(const Vector& x0, float eps, Vector& lb, Vector& ub, int method, bool allow_cached_x = true) {
+  g_crown_graph.run_bound(x0, eps, lb, ub, method, allow_cached_x);
+}
+
+// 5. 추론 + 바운드 한 방 실행 버튼 (y0, lb, ub 동시 계산)
+void run_crown_cuda_graph_combined(const Vector& x0, float eps, Vector& y0, Vector& lb, Vector& ub, int method) {
+  g_crown_graph.run_combined(x0, eps, y0, lb, ub, method);
+}
+
+// 6. 공장 폐장 및 청소 버튼 (메모리 해제)
+void cleanup_crown_cuda_graph() {
+  g_crown_graph.cleanup();
+}
+
 
 // 얘는 재귀버전이라 CUDA로 재작성하기 쉽지 않을 것임.. ==> 이터레이션 버전 추가
 class LiRPABackwardOnly {
