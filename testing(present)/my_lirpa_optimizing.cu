@@ -1811,10 +1811,6 @@ __global__ void backward_matmul_pair_gpu(
   }
 }
 
-// Initialize the default output specification directly on the GPU.  The
-// (기존 initialize_backward_state_gpu 커널은 Forward/Backward 공용 사용을 위해
-//  위쪽의 initialize_bound_state_gpu로 통합 정의되었습니다.)
-
 // 단지 전체 레이어를 루프로 돌면서 커널 퓨전(Kernel Fusion)과 포인터 스왑을 통해 
 // 메모리 할당/복사를 완전히 없앤 극자적 최적화(Zero-Memcpy) 버전
 void backward_bound_gpu(const FullyConnectedNetwork &net,
