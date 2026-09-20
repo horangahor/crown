@@ -183,12 +183,12 @@ bool certify_topk(const Vector& y0, const Vector& lb, const Vector& ub, int k = 
 
 int main(int argc, char** argv) {
 
-    int         method       = (argc > 1) ? std::atoi(argv[1]) : 0; // 0: forward, 1: backward, // 추가 ? ==> 2: backward_only
-    const char* network_path = (argc > 2) ? argv[2] : MODEL_PATH;
-    const char* data_path    = (argc > 3) ? argv[3] : "test_data_all.bin";
-    int         k            = (argc > 4) ? std::atoi(argv[4]) : 8;
-    const char* output_csv   = (argc > 5) ? argv[5] : "results_cuda.csv";
-    int         graph_mode   = (argc > 6) ? std::atoi(argv[6]) : 1;
+    int         method       = (argc > 1 && strlen(argv[1]) > 0) ? std::atoi(argv[1]) : 0; // 0: forward, 1: backward, // 추가 ? ==> 2: backward_only
+    const char* network_path = (argc > 2 && strlen(argv[2]) > 0) ? argv[2] : MODEL_PATH;
+    const char* data_path    = (argc > 3 && strlen(argv[3]) > 0) ? argv[3] : "test_data_all.bin";
+    int         k            = (argc > 4 && strlen(argv[4]) > 0) ? std::atoi(argv[4]) : 8;
+    const char* output_csv   = (argc > 5 && strlen(argv[5]) > 0) ? argv[5] : "results_cuda.csv";
+    int         graph_mode   = (argc > 6 && strlen(argv[6]) > 0) ? std::atoi(argv[6]) : 1;
     // graph_mode: 0 = Baseline (No Graph), 1 = CUDA Graph (Separate Infer + Bound), 2 = CUDA Graph (Combined Fused)
 
     // 1. 모델 로드
