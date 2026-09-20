@@ -155,28 +155,38 @@ std::vector<Vector> load_all_data(const char* filepath, int input_dim, int& N_ou
 // CROWN 에서 노드 8개를 선택 가능한 경우(4번 과정), 신경망이 추론해 정렬한 결과와 CROWN lower bound의 인덱스가 매치하면 신경망이 같은 안테나를 선택했으므로
 // 실제 환경에서 해당 신경망의 입력에 noise가 추가되었을 때, 정답 8개 (== CROWN이 내놓은 상위 8개와 동일하다, 실험 때 lower bound 정렬이 noise 추가 안된 추론값의 정렬과 같으므로) 
 bool certify_topk(const Vector& y0, const Vector& lb, const Vector& ub, int k = 8, int max_diff = 0) {
-    int out_dim = y0.n;
+    // out_dim은 신경망의 출력 노드 수 , 출력 노드 수 유효성 검사
+    const int out_dim = y0.n;
+    if (out_dim <= 0 || out_dim > MAX_DIM) return false;
+
     // 1. clean_topk: y0 오름차순 정렬, 뒤 k개 = top-k
-    std::vector<int> y_order(out_dim);
-    std::iota(y_order.begin(), y_order.end(), 0); // 0 ~ 15 까지 연속된 숫자를 채워줌 (index 반환용)
-    std::sort(y_order.begin(), y_order.end(),
+    // 기존 y_order는 vector를 기반으로 하여 heap 할당을 했음 (즉 동적 할당에서 생기는 jitter 문제가 있었다.)
+    // 스택으로 16개의 출력을 보관하는 배열을 만들어서 topk 검증 시간에서 jitter 문제 해결
+    int y_order[MAX_DIM];
+    std::iota(y_order, y_order + out_dim, 0); // 0 ~ 15 까지 연속된 숫자를 채워줌 (index 반환용)
+    std::sort(y_order, y_order + out_dim,
               [&](int a, int b){ return y0.v[a] < y0.v[b]; }); // 0~ 15번 노드의 추론 값, 인덱스가 매치 된 상황에서 오름차순 정렬
+
     // 2. order_lb: lb 내림차순 정렬
-    std::vector<int> order_lb(out_dim);
-    std::iota(order_lb.begin(), order_lb.end(), 0); // 0 ~ 15 까지 연속된 숫자를 채워줌 (index 반환용)
-    std::sort(order_lb.begin(), order_lb.end(),
+    int order_lb[MAX_DIM];
+    std::iota(order_lb, order_lb + out_dim, 0); // 0 ~ 15 까지 연속된 숫자를 채워줌 (index 반환용)
+    std::sort(order_lb, order_lb + out_dim,
               [&](int a, int b){ return lb.v[a] > lb.v[b]; }); // 0~ 15번 노드의 CROWN 하한값, 인덱스가 매치 된 상황에서 내림차순 정렬
+
     // 3. sorted_ub: ub 내림차순 정렬
-    std::vector<float> sorted_ub(out_dim);
+    float sorted_ub[MAX_DIM];
     for (int i = 0; i < out_dim; ++i) sorted_ub[i] = ub.v[i];
-    std::sort(sorted_ub.begin(), sorted_ub.end(), std::greater<float>()); // 0~ 15번 노드의 CROWN 상한값, 인덱스가 매치 된 상황에서 내림차순 정렬
+    std::sort(sorted_ub, sorted_ub + out_dim, std::greater<float>()); // 0~ 15번 노드의 CROWN 상한값, 인덱스가 매치 된 상황에서 내림차순 정렬
+
     // 4. gap_ok: lb[order_lb[k-1]] > sorted_ub[k]
     if (lb.v[order_lb[k - 1]] <= sorted_ub[k]) return false;
+
     // 5. guaranteed_topk (order_lb 앞 k개) 와 clean_topk 교집합 == k
     int match = 0;
     for (int i = 0; i < k; ++i)    // 0 ~ 7
         for (int j = out_dim - k; j < out_dim; ++j)   // 16 - 8 = 8 , 8 ~ 15
             if (order_lb[i] == y_order[j]) { ++match; break; } // 가장 높은 lower bound 인덱스 8개랑 , 상위 8개의 추론값인 y0 인덱스가 몇개 포함되는지 구함
+
     return (match >= k - max_diff); // 8개 다 일치하면 해당 입력에 대해서는 강건성이 보장되었단 소리(epsilon으로 인한 CROWN 결과와 출력 값의 상위 8개 선택이 일치) true
 }
 // 즉 eps 를 바꿔가며 T/F 비율을 구해서 해당 신경망이 어디 eps까지 버틸 수 있는지 비율을 구하는 것임 (비율을 보고 관리자가 판단)
@@ -190,11 +200,17 @@ int main(int argc, char** argv) {
     const char* output_csv   = (argc > 5 && strlen(argv[5]) > 0) ? argv[5] : "results_cuda.csv";
     int         graph_mode   = (argc > 6 && strlen(argv[6]) > 0) ? std::atoi(argv[6]) : 1;
     // graph_mode: 0 = Baseline (No Graph), 1 = CUDA Graph (Separate Infer + Bound), 2 = CUDA Graph (Combined Fused)
+    int         max_samples  = (argc > 7 && strlen(argv[7]) > 0) ? std::atoi(argv[7]) : 0; // 0 = all samples // sparse.py의 max_sample 따라한 것
 
     // 1. 모델 로드
     std::cout << "\n=== crown_test_all_data ===" << std::endl;
     std::cout << "network read start" << std::endl;
     FullyConnectedNetwork* net = load_custom_network(network_path);
+    if (net->num_layers == 0) {   //net 모델 로드 실패 guardrail
+        std::cerr << "Error: failed to load network from " << network_path << std::endl;
+        delete net;
+        return 1;
+    }
     std::cout << "network read success" << std::endl;
 
     // 2. GPU 메모리 풀 초기화 + 불변 가중치 GPU 업로드
@@ -217,7 +233,32 @@ int main(int argc, char** argv) {
         std::cerr << "데이터를 읽지 못했습니다." << std::endl;
         delete net; return 1;
     }
+
+    // 이것도 max_sample 입력에 맞게 resize 
+    if (max_samples > 0 && max_samples < N) {
+        std::cout << "Applying max_samples limit: " << max_samples << " (out of " << N << ")" << std::endl;
+        N = max_samples;
+        dataset.resize(N);
+    }
     std::cout << "loaded " << N << " points (dim=" << net->layer_in_dim[0] << ")" << std::endl;
+
+    // 실시간 PCIe H2D 전송 최적화: Host Memory Pinning (cudaHostRegister)
+    // pinned memory 를 써서 GPU가 CPU 메모리에 직접 접근할 수 있도록 하여 데이터셋 전송 속도 향상 
+    // 왜 이걸 했냐 하면 실제 상황 최대한 재현을 위한 것 (5 , 6G 환경에서의 실시간 입력 속도를 최대한 재현하기 위함)
+    bool dataset_pinned = false;
+    if (N > 0) {
+        // cudaHostRegister : 일반 메모리로 만들어진 메모리 영역을 복사 없이 pinned Memory 로 승격시켜줌
+        // 인자로 시작 포인터 dataset.data() / 등록할 메모리 크기 (N * sizeof(Vector))
+        // 플래그 cudaHostRegisterDefault (가장 일반적인 pinning 옵션)
+        cudaError_t reg_err = cudaHostRegister(dataset.data(), (size_t)N * sizeof(Vector), cudaHostRegisterDefault);
+        if (reg_err == cudaSuccess) { // 여기서 cudaSuccess는 cuda에서 쓰는 성공 고유 상태코드
+            dataset_pinned = true;
+            std::cout << "Dataset host memory pinned via cudaHostRegister ("
+                      << ((size_t)N * sizeof(Vector)) / (1024 * 1024) << " MB, zero CPU blocking DMA enabled)." << std::endl;
+        } else {
+            std::cout << "Notice: cudaHostRegister skipped (" << cudaGetErrorString(reg_err) << ")." << std::endl;
+        }
+    }
 
     // 4. eps 리스트 (sparse.py와 동일)
     const std::vector<double> eps_list = {
@@ -275,6 +316,14 @@ int main(int argc, char** argv) {
     // ===========================================================
 
     // 6. 전체 시간 측정 시작
+    // latencies_us 는 매 샘플마다 수행한 연산에 대한 시간들을 자세하게 기록하기 위해 추가함
+    std::vector<double> latencies_us;
+    latencies_us.reserve(std::min((size_t)100000, (size_t)N * eps_list.size())); // 최소 10만개 만큼의 double 방을 예약 (92만개가 아닌 이유는 표본 측정으로 하려고)
+    // reserve는 동적할당된 vector의 pushback 할 때 메모리를 다시 잡고 카피하는(이 과정에서 CPU가 stall) 오버헤드를 줄여줌 
+    // min(100000, N * eps_list.size()) => 100000 아니면 N * eps_list.size() 만큼 공간을 미리 잡는다는 뜻임 (N*eps가 100000보다 작을 경우에 한해서 )
+    // 만약 N*eps가 100000보다 크면 100000개 까지만 미리 잡고 그 이후부터는 공간을 재확보하지 않음 -> 100000개 초과시 오버헤드 발생 
+    // 아예 크기가 정해져있는 vector를 쓸거면 vector<double> latencies_us(std::min((size_t)100000, (size_t)N * eps_list.size()));
+
     auto total_start = std::chrono::high_resolution_clock::now();
     nvtxRangePushA("CROWN_SWEEP");
 
@@ -293,6 +342,7 @@ int main(int argc, char** argv) {
 
         for (int i = 0; i < N; ++i) {
             Vector y0, lb, ub;
+            auto sample_t0 = std::chrono::high_resolution_clock::now(); // graph_mode와 상관없이 샘플 1 사이클 측정을 위한 시간
 
             if (graph_mode == 1) {
                 // ── [1] 추론 (CUDA Graph) ─────────────────────────
@@ -365,6 +415,13 @@ int main(int argc, char** argv) {
                 time_certify_total += std::chrono::duration<double>(t3 - t2).count();
             }
 
+            // 이것도 샘플 하나의 시간을 측정하기 위해 넣음
+            auto sample_t1 = std::chrono::high_resolution_clock::now();
+            double sample_lat_us = std::chrono::duration<double, std::micro>(sample_t1 - sample_t0).count();
+            if (latencies_us.size() < 100000) {
+                latencies_us.push_back(sample_lat_us);
+            }
+
             // 1000개마다 진행상황 출력 (sparse.py 와 동일 포맷)
             if ((i + 1) % 1000 == 0) {
                 std::cout << "  eps=" << std::setw(10)
@@ -406,6 +463,43 @@ int main(int argc, char** argv) {
               << "s  (" << std::setprecision(1) << 100.0 * time_bound_total   / total_elapsed << "%)" << std::endl;
     std::cout << "  certify : " << std::setw(8) << std::setprecision(3) << time_certify_total
               << "s  (" << std::setprecision(1) << 100.0 * time_certify_total / total_elapsed << "%)" << std::endl;
+
+    // 8. 실시간 단일 샘플 (B=1) 지연시간 정밀 분석
+    if (!latencies_us.empty()) { // 단일 샘플당 시간을 분석 (추론 + bound + 검증)
+        std::vector<double> sorted_lat = latencies_us;
+        std::sort(sorted_lat.begin(), sorted_lat.end());
+        double sum_lat = std::accumulate(sorted_lat.begin(), sorted_lat.end(), 0.0);
+        double mean_lat = sum_lat / sorted_lat.size();
+        double p50_lat = sorted_lat[sorted_lat.size() * 50 / 100];
+        double p95_lat = sorted_lat[sorted_lat.size() * 95 / 100];
+        double p99_lat = sorted_lat[sorted_lat.size() * 99 / 100];
+        double min_lat = sorted_lat.front();
+        double max_lat = sorted_lat.back();
+
+        double sq_sum = 0.0;
+        for (double val : sorted_lat) sq_sum += (val - mean_lat) * (val - mean_lat);
+        double std_lat = std::sqrt(sq_sum / sorted_lat.size());
+
+        std::cout << "\n=== Real-Time Single-Sample (B=1) Latency Analysis ===" << std::endl;
+        std::cout << std::fixed << std::setprecision(2);
+        std::cout << "  Evaluated Samples : " << sorted_lat.size() << std::endl;
+        std::cout << "  Min Latency       : " << std::setw(8) << min_lat  << " us" << std::endl;
+        std::cout << "  Mean Latency      : " << std::setw(8) << mean_lat << " us (" << mean_lat / 1000.0 << " ms)" << std::endl;
+        std::cout << "  Median (P50)      : " << std::setw(8) << p50_lat  << " us" << std::endl;
+        std::cout << "  P95 Tail Latency  : " << std::setw(8) << p95_lat  << " us" << std::endl;
+        std::cout << "  P99 Tail Latency  : " << std::setw(8) << p99_lat  << " us" << std::endl;
+        std::cout << "  Max Latency       : " << std::setw(8) << max_lat  << " us" << std::endl;
+        std::cout << "  Jitter (StdDev)   : " << std::setw(8) << std_lat  << " us" << std::endl;
+        std::cout << "  Throughput        : " << std::setw(8) << (1e6 / mean_lat) << " samples/sec" << std::endl;
+        // 커널 순수 시간만 측정한 결과는 여기서 확인
+        // 여기서 마지막 샘플의 커널 시간만 측정하는데 , 그 이유는 cudaGraph로 캡처한 커널은 시간이 거의 비슷하기 때문(고정된 하드웨어 파이프라인)
+        // 자세하게 말하면 커널의 개수, 블록 수, 스레드, 메모리 주소까지 모두 하드코딩된 형태라서 항상 커널 시간의 jitter가 상대적으로 적다
+        // 그니까 입력 데이터의 연산량, gpu 온도 , 클럭 등을 제외하면 시간을 바꿀만한 변수가 많이 사라진다 보면 됨
+        if (graph_mode > 0) { 
+            std::cout << "  Pure GPU Execution: " << std::setw(8) << get_crown_cuda_graph_last_gpu_time_ms() * 1000.0 << " us (last sample)" << std::endl;
+        } 
+        std::cout << "======================================================\n" << std::endl;
+    }
 
     // 8. CSV 저장 (sparse.py와 동일 컬럼: method, eps, T, F, ratio)
     std::ofstream csv_file(output_csv);
@@ -478,6 +572,9 @@ int main(int argc, char** argv) {
     }
 
     // 10. 메모리 해제
+    if (dataset_pinned) {
+        cudaHostUnregister(dataset.data());
+    }
     if (graph_mode > 0) {
         cleanup_crown_cuda_graph();
     }
