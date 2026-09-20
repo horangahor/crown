@@ -188,6 +188,7 @@ int main(int argc, char** argv) {
     const char* data_path    = (argc > 3) ? argv[3] : "test_data_all.bin";
     int         k            = (argc > 4) ? std::atoi(argv[4]) : 8;
     const char* output_csv   = (argc > 5) ? argv[5] : "results_cuda.csv";
+    int         batch_size   = (argc > 6) ? std::atoi(argv[6]) : 32;
 
     // 1. 모델 로드
     std::cout << "\n=== crown_test_all_data ===" << std::endl;
@@ -209,6 +210,17 @@ int main(int argc, char** argv) {
         delete net; return 1;
     }
     std::cout << "loaded " << N << " points (dim=" << net->layer_in_dim[0] << ")" << std::endl;
+
+    // 전체 데이터셋을 GPU 글로벌 메모리에 한 번만 업로드 (Sweep 중 H2D 복사 제거)
+    Vector* d_dataset = nullptr;
+    cudaMalloc(&d_dataset, N * sizeof(Vector));
+    cudaMemcpy(d_dataset, dataset.data(), N * sizeof(Vector), cudaMemcpyHostToDevice);
+
+    // Multi-Stream 컨텍스트 초기화
+    std::vector<StreamContext> stream_contexts(batch_size);
+    for (int b = 0; b < batch_size; ++b) {
+        stream_contexts[b].init();
+    }
 
     // 4. eps 리스트 (sparse.py와 동일)
     const std::vector<double> eps_list = {
@@ -239,11 +251,13 @@ int main(int argc, char** argv) {
     {
         std::cout << "Warming up GPU..." << std::endl;
         float eps_warmup = static_cast<float>(eps_list[0]);
-        network_forward(*net, dataset[0]);
-        if (method == 0) {
-            lirpa_forward_bound_impl(*net, dataset[0], eps_warmup, false, false, true);
-        } else {
-            lirpa_backward_bound(*net, dataset[0], eps_warmup, false, false);
+        int cur_b = std::min(batch_size, N);
+        for (int b = 0; b < cur_b; ++b) {
+            if (method == 0) {
+                lirpa_forward_only_bound_async(*net, eps_warmup, &d_dataset[b], stream_contexts[b]);
+            } else {
+                lirpa_backward_bound_async(*net, eps_warmup, &d_dataset[b], stream_contexts[b]);
+            }
         }
         cudaDeviceSynchronize();
         std::cout << "Warmup done." << std::endl;
@@ -259,58 +273,58 @@ int main(int argc, char** argv) {
     double time_bound_total   = 0.0;
     double time_certify_total = 0.0;
 
+    // ── [1] 추론 (클린 입력 y0 사전 계산) ───────────────────────────
+    std::vector<Vector> y0_list(N);
+    auto infer_start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < N; i += batch_size) {
+        int cur_b = std::min(batch_size, N - i);
+        for (int b = 0; b < cur_b; ++b) {
+            network_forward_async(*net, &d_dataset[i + b], stream_contexts[b]);
+        }
+        cudaDeviceSynchronize();
+        for (int b = 0; b < cur_b; ++b) {
+            y0_list[i + b] = *stream_contexts[b].h_y0;
+        }
+    }
+    auto infer_end = std::chrono::high_resolution_clock::now();
+    time_infer_total = std::chrono::duration<double>(infer_end - infer_start).count();
+
     // 6. eps x 데이터 이중 루프 (sparse.py sweep() 와 완전히 동일)
     for (double eps : eps_list) {
         int t_count = 0, f_count = 0;
         float eps_f = static_cast<float>(eps);
 
-        for (int i = 0; i < N; ++i) {
-            // ── [1] 추론 ──────────────────────────────────────────
-            // 신경망 정방향 통과
-            auto t0 = std::chrono::high_resolution_clock::now();
-            Vector y0 = network_forward(*net, dataset[i]);
-            auto t1 = std::chrono::high_resolution_clock::now(); // 추론 끝 시간
-            time_infer_total += std::chrono::duration<double>(t1 - t0).count(); // 추론 시간 누적
+        for (int i = 0; i < N; i += batch_size) {
+            int cur_b = std::min(batch_size, N - i);
 
-            // ── [2] Bound 계산 + [3] 검증 ────────────────────────
-            // CROWN backward bound or forward bound 계산
-            // (각 case 안에서 직접 초기화 → NRVO 적용, 4MB+ 구조체 복사 0회)
-            switch(method){
-                case 0: {
-                    ForwardBoundResult fwd = lirpa_forward_bound_impl(*net, dataset[i], eps_f, false, false, true);
-                    auto t2 = std::chrono::high_resolution_clock::now(); // bound 계산 끝 시간
-                    time_bound_total += std::chrono::duration<double>(t2 - t1).count(); // bound 시간 누적
-                    // Top-k 인증 판정
-                    if (certify_topk(y0, fwd.final_lower, fwd.final_upper, k))
-                        ++t_count;
-                    else
-                        ++f_count;
-                    auto t3 = std::chrono::high_resolution_clock::now(); // 검증 끝 시간
-                    time_certify_total += std::chrono::duration<double>(t3 - t2).count(); // 검증 시간 누적
-                    break;
+            // ── [2] Bound 계산 (Multi-Stream) ─────────────────────
+            auto t1 = std::chrono::high_resolution_clock::now();
+            for (int b = 0; b < cur_b; ++b) {
+                if (method == 0) {
+                    lirpa_forward_only_bound_async(*net, eps_f, &d_dataset[i + b], stream_contexts[b]);
+                } else {
+                    lirpa_backward_bound_async(*net, eps_f, &d_dataset[i + b], stream_contexts[b]);
                 }
-                case 1: {
-                    BackwardBoundResult bwd = lirpa_backward_bound(*net, dataset[i], eps_f, false, false);
-                    auto t2 = std::chrono::high_resolution_clock::now();// bound 계산 끝 시간
-                    time_bound_total += std::chrono::duration<double>(t2 - t1).count();// bound 시간 누적
-                    // Top-k 인증 판정
-                    if (certify_topk(y0, bwd.final_lower, bwd.final_upper, k))
-                        ++t_count;
-                    else
-                        ++f_count;
-                    auto t3 = std::chrono::high_resolution_clock::now(); // 검증 끝 시간
-                    time_certify_total += std::chrono::duration<double>(t3 - t2).count();  // 검증 시간 누적
-                    break;
-                }
-                default:
-                    break;
             }
+            cudaDeviceSynchronize();
+            auto t2 = std::chrono::high_resolution_clock::now();
+            time_bound_total += std::chrono::duration<double>(t2 - t1).count();
+
+            // ── [3] 검증 (Top-k 인증 판정) ─────────────────────────
+            for (int b = 0; b < cur_b; ++b) {
+                if (certify_topk(y0_list[i + b], *stream_contexts[b].h_final_lower, *stream_contexts[b].h_final_upper, k))
+                    ++t_count;
+                else
+                    ++f_count;
+            }
+            auto t3 = std::chrono::high_resolution_clock::now();
+            time_certify_total += std::chrono::duration<double>(t3 - t2).count();
 
             // 1000개마다 진행상황 출력 (sparse.py 와 동일 포맷)
-            if ((i + 1) % 1000 == 0) {
+            if ((i + cur_b) % 1000 == 0 || (i + cur_b) == N) {
                 std::cout << "  eps=" << std::setw(10)
                           << std::scientific << std::setprecision(1) << eps
-                          << ": " << (i + 1) << "/" << N
+                          << ": " << (i + cur_b) << "/" << N
                           << " points done (T=" << t_count
                           << " F=" << f_count << ")" << std::endl;
                 std::cout.flush();
@@ -415,6 +429,10 @@ int main(int argc, char** argv) {
     }
 
     // 10. 메모리 해제
+    for (int b = 0; b < batch_size; ++b) {
+        stream_contexts[b].destroy();
+    }
+    cudaFree(d_dataset);
     delete net;
     return 0;
 }

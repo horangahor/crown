@@ -2356,4 +2356,388 @@ void run_xor_demo(float eps) {
     std::cout << "Backward-only mode does not certify at least one XOR corner classification for this epsilon.\n";
 }
 
+// ============================================================
+// Multi-Stream CUDA Kernels and Asynchronous CROWN Algorithms
+// ============================================================
+
+__global__ void make_input_box_gpu(const Vector* x0, float eps, Vector* xl, Vector* xu, int in_dim) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid == 0) {
+        xl->n = in_dim;
+        xu->n = in_dim;
+    }
+    if (tid < in_dim) {
+        xl->v[tid] = x0->v[tid] - eps;
+        xu->v[tid] = x0->v[tid] + eps;
+    }
+}
+
+struct StreamContext {
+    cudaStream_t stream = nullptr;
+
+    // Device memory for Forward Bound ping-pong
+    Matrix* d_lower_A = nullptr;
+    Matrix* d_upper_A = nullptr;
+    Matrix* d_pre_lower_A = nullptr;
+    Matrix* d_pre_upper_A = nullptr;
+
+    Vector* d_lower_c = nullptr;
+    Vector* d_upper_c = nullptr;
+    Vector* d_pre_lower_c = nullptr;
+    Vector* d_pre_upper_c = nullptr;
+    Vector* d_pre_lower = nullptr;
+    Vector* d_pre_upper = nullptr;
+    Vector* d_alpha_l = nullptr;
+    Vector* d_beta_l = nullptr;
+    Vector* d_alpha_u = nullptr;
+    Vector* d_beta_u = nullptr;
+    Vector* d_xl = nullptr;
+    Vector* d_xu = nullptr;
+
+    // Cached relaxation layers across network layers
+    Vector* d_fwd_alpha_lower[MAX_LAYERS]{};
+    Vector* d_fwd_beta_lower[MAX_LAYERS]{};
+    Vector* d_fwd_alpha_upper[MAX_LAYERS]{};
+    Vector* d_fwd_beta_upper[MAX_LAYERS]{};
+
+    // Device memory for Backward Bound
+    Matrix* d_bwd_lower_M = nullptr;
+    Matrix* d_bwd_upper_M = nullptr;
+    Matrix* d_bwd_lower_pos = nullptr;
+    Matrix* d_bwd_lower_neg = nullptr;
+    Matrix* d_bwd_upper_pos = nullptr;
+    Matrix* d_bwd_upper_neg = nullptr;
+    Matrix* d_bwd_lower_coeff = nullptr;
+    Matrix* d_bwd_upper_coeff = nullptr;
+    Matrix* d_bwd_new_lower_M = nullptr;
+    Matrix* d_bwd_new_upper_M = nullptr;
+
+    Vector* d_bwd_lower_p = nullptr;
+    Vector* d_bwd_upper_p = nullptr;
+    Vector* d_bwd_term_lp = nullptr;
+    Vector* d_bwd_term_ln = nullptr;
+    Vector* d_bwd_new_lower_p = nullptr;
+    Vector* d_bwd_new_upper_p = nullptr;
+
+    // Final result buffers on Device
+    Vector* d_final_lower = nullptr;
+    Vector* d_final_upper = nullptr;
+
+    // Device memory for Inference (network_forward)
+    Vector* d_infer_vec[2]{};
+
+    // Pinned Host Memory for non-blocking async transfer
+    Vector* h_y0 = nullptr;
+    Vector* h_final_lower = nullptr;
+    Vector* h_final_upper = nullptr;
+
+    void init() {
+        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+
+        // Forward
+        cudaMalloc(&d_lower_A, sizeof(Matrix));
+        cudaMalloc(&d_upper_A, sizeof(Matrix));
+        cudaMalloc(&d_pre_lower_A, sizeof(Matrix));
+        cudaMalloc(&d_pre_upper_A, sizeof(Matrix));
+
+        cudaMalloc(&d_lower_c, sizeof(Vector));
+        cudaMalloc(&d_upper_c, sizeof(Vector));
+        cudaMalloc(&d_pre_lower_c, sizeof(Vector));
+        cudaMalloc(&d_pre_upper_c, sizeof(Vector));
+        cudaMalloc(&d_pre_lower, sizeof(Vector));
+        cudaMalloc(&d_pre_upper, sizeof(Vector));
+        cudaMalloc(&d_alpha_l, sizeof(Vector));
+        cudaMalloc(&d_beta_l, sizeof(Vector));
+        cudaMalloc(&d_alpha_u, sizeof(Vector));
+        cudaMalloc(&d_beta_u, sizeof(Vector));
+        cudaMalloc(&d_xl, sizeof(Vector));
+        cudaMalloc(&d_xu, sizeof(Vector));
+
+        for (int l = 0; l < MAX_LAYERS; ++l) {
+            cudaMalloc(&d_fwd_alpha_lower[l], sizeof(Vector));
+            cudaMalloc(&d_fwd_beta_lower[l], sizeof(Vector));
+            cudaMalloc(&d_fwd_alpha_upper[l], sizeof(Vector));
+            cudaMalloc(&d_fwd_beta_upper[l], sizeof(Vector));
+        }
+
+        // Backward
+        cudaMalloc(&d_bwd_lower_M, sizeof(Matrix));
+        cudaMalloc(&d_bwd_upper_M, sizeof(Matrix));
+        cudaMalloc(&d_bwd_lower_pos, sizeof(Matrix));
+        cudaMalloc(&d_bwd_lower_neg, sizeof(Matrix));
+        cudaMalloc(&d_bwd_upper_pos, sizeof(Matrix));
+        cudaMalloc(&d_bwd_upper_neg, sizeof(Matrix));
+        cudaMalloc(&d_bwd_lower_coeff, sizeof(Matrix));
+        cudaMalloc(&d_bwd_upper_coeff, sizeof(Matrix));
+        cudaMalloc(&d_bwd_new_lower_M, sizeof(Matrix));
+        cudaMalloc(&d_bwd_new_upper_M, sizeof(Matrix));
+
+        cudaMalloc(&d_bwd_lower_p, sizeof(Vector));
+        cudaMalloc(&d_bwd_upper_p, sizeof(Vector));
+        cudaMalloc(&d_bwd_term_lp, sizeof(Vector));
+        cudaMalloc(&d_bwd_term_ln, sizeof(Vector));
+        cudaMalloc(&d_bwd_new_lower_p, sizeof(Vector));
+        cudaMalloc(&d_bwd_new_upper_p, sizeof(Vector));
+
+        cudaMalloc(&d_final_lower, sizeof(Vector));
+        cudaMalloc(&d_final_upper, sizeof(Vector));
+
+        cudaMalloc(&d_infer_vec[0], sizeof(Vector));
+        cudaMalloc(&d_infer_vec[1], sizeof(Vector));
+
+        // Pinned host memory
+        cudaHostAlloc(&h_y0, sizeof(Vector), cudaHostAllocDefault);
+        cudaHostAlloc(&h_final_lower, sizeof(Vector), cudaHostAllocDefault);
+        cudaHostAlloc(&h_final_upper, sizeof(Vector), cudaHostAllocDefault);
+    }
+
+    void destroy() {
+        if (stream) {
+            cudaStreamSynchronize(stream);
+            cudaStreamDestroy(stream);
+            stream = nullptr;
+        }
+
+        cudaFree(d_lower_A);
+        cudaFree(d_upper_A);
+        cudaFree(d_pre_lower_A);
+        cudaFree(d_pre_upper_A);
+
+        cudaFree(d_lower_c);
+        cudaFree(d_upper_c);
+        cudaFree(d_pre_lower_c);
+        cudaFree(d_pre_upper_c);
+        cudaFree(d_pre_lower);
+        cudaFree(d_pre_upper);
+        cudaFree(d_alpha_l);
+        cudaFree(d_beta_l);
+        cudaFree(d_alpha_u);
+        cudaFree(d_beta_u);
+        cudaFree(d_xl);
+        cudaFree(d_xu);
+
+        for (int l = 0; l < MAX_LAYERS; ++l) {
+            cudaFree(d_fwd_alpha_lower[l]);
+            cudaFree(d_fwd_beta_lower[l]);
+            cudaFree(d_fwd_alpha_upper[l]);
+            cudaFree(d_fwd_beta_upper[l]);
+        }
+
+        cudaFree(d_bwd_lower_M);
+        cudaFree(d_bwd_upper_M);
+        cudaFree(d_bwd_lower_pos);
+        cudaFree(d_bwd_lower_neg);
+        cudaFree(d_bwd_upper_pos);
+        cudaFree(d_bwd_upper_neg);
+        cudaFree(d_bwd_lower_coeff);
+        cudaFree(d_bwd_upper_coeff);
+        cudaFree(d_bwd_new_lower_M);
+        cudaFree(d_bwd_new_upper_M);
+
+        cudaFree(d_bwd_lower_p);
+        cudaFree(d_bwd_upper_p);
+        cudaFree(d_bwd_term_lp);
+        cudaFree(d_bwd_term_ln);
+        cudaFree(d_bwd_new_lower_p);
+        cudaFree(d_bwd_new_upper_p);
+
+        cudaFree(d_final_lower);
+        cudaFree(d_final_upper);
+
+        cudaFree(d_infer_vec[0]);
+        cudaFree(d_infer_vec[1]);
+
+        if (h_y0) cudaFreeHost(h_y0);
+        if (h_final_lower) cudaFreeHost(h_final_lower);
+        if (h_final_upper) cudaFreeHost(h_final_upper);
+    }
+};
+
+void network_forward_async(const FullyConnectedNetwork& net,
+                           const Vector* d_x0,
+                           StreamContext& sc) {
+    const Vector* cur_in = d_x0;
+    Vector* cur_out = sc.d_infer_vec[0];
+
+    for (int l = 0; l < net.num_layers; ++l) {
+        const int rows = net.W[l].rows;
+        const int blocks = (rows + 255) / 256;
+
+        matvec_bias_gpu<<<blocks, 256, 0, sc.stream>>>(
+            g_pool.d_weight[l], cur_in, g_pool.d_bias[l], cur_out);
+        apply_activation_gpu<<<blocks, 256, 0, sc.stream>>>(net.act[l], cur_out);
+
+        if (l == 0) {
+            cur_in = sc.d_infer_vec[0];
+            cur_out = sc.d_infer_vec[1];
+        } else {
+            std::swap(*(Vector**)&cur_in, cur_out);
+        }
+    }
+
+    cudaMemcpyAsync(sc.h_y0, cur_in, sizeof(Vector), cudaMemcpyDeviceToHost, sc.stream);
+}
+
+void lirpa_forward_bound_async(const FullyConnectedNetwork& net,
+                               float eps,
+                               const Vector* d_x0,
+                               StreamContext& sc) {
+    const int in_dim = net.layer_in_dim[0];
+
+    cudaMemsetAsync(sc.d_lower_A, 0, sizeof(Matrix), sc.stream);
+    cudaMemsetAsync(sc.d_upper_A, 0, sizeof(Matrix), sc.stream);
+    make_eye_gpu<<<(in_dim + 255) / 256, 256, 0, sc.stream>>>(sc.d_lower_A, in_dim);
+    make_eye_gpu<<<(in_dim + 255) / 256, 256, 0, sc.stream>>>(sc.d_upper_A, in_dim);
+
+    cudaMemsetAsync(sc.d_lower_c, 0, sizeof(Vector), sc.stream);
+    cudaMemsetAsync(sc.d_upper_c, 0, sizeof(Vector), sc.stream);
+    set_vector_size_gpu<<<1, 1, 0, sc.stream>>>(sc.d_lower_c, in_dim);
+    set_vector_size_gpu<<<1, 1, 0, sc.stream>>>(sc.d_upper_c, in_dim);
+
+    make_input_box_gpu<<<(in_dim + 255) / 256, 256, 0, sc.stream>>>(
+        d_x0, eps, sc.d_xl, sc.d_xu, in_dim);
+
+    for (int l = 0; l < net.num_layers; ++l) {
+        const Matrix* d_W_pos = g_pool.d_weight_pos[l];
+        const Matrix* d_W_neg = g_pool.d_weight_neg[l];
+        const int weight_rows = net.W[l].rows;
+        const int matrix_elements = weight_rows * in_dim;
+        const int matrix_blocks = (matrix_elements + 255) / 256;
+
+        matmul_pair_add_gpu<<<matrix_blocks, 256, 0, sc.stream>>>(
+            d_W_pos, sc.d_lower_A, d_W_neg, sc.d_upper_A, sc.d_pre_lower_A);
+        matmul_pair_add_gpu<<<matrix_blocks, 256, 0, sc.stream>>>(
+            d_W_pos, sc.d_upper_A, d_W_neg, sc.d_lower_A, sc.d_pre_upper_A);
+
+        const int vector_blocks = (weight_rows + 255) / 256;
+        const Vector* d_bias = g_pool.d_bias[l];
+        matvec_pair_bias_gpu<<<vector_blocks, 256, 0, sc.stream>>>(
+            d_W_pos, sc.d_lower_c, d_W_neg, sc.d_upper_c, d_bias, sc.d_pre_lower_c);
+        matvec_pair_bias_gpu<<<vector_blocks, 256, 0, sc.stream>>>(
+            d_W_pos, sc.d_upper_c, d_W_neg, sc.d_lower_c, d_bias, sc.d_pre_upper_c);
+
+        affine_minmax_pair_gpu<<<vector_blocks, 256, 0, sc.stream>>>(
+            sc.d_pre_lower_A, sc.d_pre_lower_c, sc.d_pre_upper_A, sc.d_pre_upper_c,
+            sc.d_xl, sc.d_xu, sc.d_pre_lower, sc.d_pre_upper);
+
+        if (net.act[l] == ActivationType::Relu) {
+            relu_relax_full_gpu<<<vector_blocks, 256, 0, sc.stream>>>(
+                sc.d_pre_lower, sc.d_pre_upper,
+                sc.d_alpha_l, sc.d_beta_l, sc.d_alpha_u, sc.d_beta_u);
+        } else if (net.act[l] == ActivationType::Linear) {
+            linear_relax_full_gpu<<<vector_blocks, 256, 0, sc.stream>>>(
+                sc.d_alpha_l, sc.d_beta_l, sc.d_alpha_u, sc.d_beta_u, weight_rows);
+        }
+
+        cache_relaxation_layer_gpu<<<vector_blocks, 256, 0, sc.stream>>>(
+            sc.d_alpha_l, sc.d_beta_l, sc.d_alpha_u, sc.d_beta_u,
+            sc.d_fwd_alpha_lower[l], sc.d_fwd_beta_lower[l],
+            sc.d_fwd_alpha_upper[l], sc.d_fwd_beta_upper[l]);
+
+        rowwise_scale_pair_gpu<<<matrix_blocks, 256, 0, sc.stream>>>(
+            sc.d_pre_lower_A, sc.d_alpha_l, sc.d_pre_upper_A, sc.d_alpha_u,
+            sc.d_lower_A, sc.d_upper_A);
+
+        elemwise_affine_pair_gpu<<<vector_blocks, 256, 0, sc.stream>>>(
+            sc.d_alpha_l, sc.d_pre_lower_c, sc.d_beta_l,
+            sc.d_alpha_u, sc.d_pre_upper_c, sc.d_beta_u,
+            sc.d_lower_c, sc.d_upper_c);
+    }
+}
+
+void lirpa_backward_bound_async(const FullyConnectedNetwork& net,
+                                float eps,
+                                const Vector* d_x0,
+                                StreamContext& sc) {
+    lirpa_forward_bound_async(net, eps, d_x0, sc);
+
+    const int output_dim = net.layer_out_dim[net.num_layers - 1];
+
+    Matrix* lower_M = sc.d_bwd_lower_M;
+    Matrix* upper_M = sc.d_bwd_upper_M;
+    Matrix* lower_pos = sc.d_bwd_lower_pos;
+    Matrix* lower_neg = sc.d_bwd_lower_neg;
+    Matrix* upper_pos = sc.d_bwd_upper_pos;
+    Matrix* upper_neg = sc.d_bwd_upper_neg;
+    Matrix* lower_coeff = sc.d_bwd_lower_coeff;
+    Matrix* upper_coeff = sc.d_bwd_upper_coeff;
+    Matrix* new_lower_M = sc.d_bwd_new_lower_M;
+    Matrix* new_upper_M = sc.d_bwd_new_upper_M;
+
+    Vector* lower_p = sc.d_bwd_lower_p;
+    Vector* upper_p = sc.d_bwd_upper_p;
+    Vector* term_lp = sc.d_bwd_term_lp;
+    Vector* term_ln = sc.d_bwd_term_ln;
+    Vector* new_lower_p = sc.d_bwd_new_lower_p;
+    Vector* new_upper_p = sc.d_bwd_new_upper_p;
+
+    const int init_elements = max(output_dim * output_dim, output_dim);
+    initialize_backward_state_gpu<<<(init_elements + 255) / 256, 256, 0, sc.stream>>>(
+        lower_M, upper_M, lower_p, upper_p,
+        output_dim, output_dim, output_dim,
+        true, true, true, true);
+
+    for (int l = net.num_layers - 1; l >= 0; --l) {
+        const int m_rows = output_dim;
+        const int m_cols = net.layer_out_dim[l];
+        const int w_rows = net.layer_out_dim[l];
+        const int w_cols = net.layer_in_dim[l];
+        const int matrix_elems = m_rows * m_cols;
+        const int matrix_blocks = (matrix_elems + 255) / 256;
+        const int vector_blocks = (m_rows + 255) / 256;
+
+        const Vector* alpha_l = sc.d_fwd_alpha_lower[l];
+        const Vector* beta_l = sc.d_fwd_beta_lower[l];
+        const Vector* alpha_u = sc.d_fwd_alpha_upper[l];
+        const Vector* beta_u = sc.d_fwd_beta_upper[l];
+
+        split_pos_neg_pair_gpu<<<matrix_blocks, 256, 0, sc.stream>>>(
+            lower_M, upper_M, lower_pos, lower_neg, upper_pos, upper_neg);
+
+        build_coeff_pair_fused_gpu<<<matrix_blocks, 256, 0, sc.stream>>>(
+            lower_M, upper_M, alpha_l, alpha_u, lower_coeff, upper_coeff);
+
+        backward_matmul_pair_gpu<<<(m_rows * w_cols + 255) / 256, 256, 0, sc.stream>>>(
+            lower_coeff, upper_coeff, g_pool.d_weight[l], new_lower_M, new_upper_M);
+
+        const Vector* bias = g_pool.d_bias[l];
+        affine_term_pair_fused_gpu<<<(w_rows + 255) / 256, 256, 0, sc.stream>>>(
+            alpha_l, beta_l, alpha_u, beta_u, bias, term_lp, term_ln);
+
+        backward_bias_pair_fused_gpu<<<vector_blocks, 256, 0, sc.stream>>>(
+            lower_pos, lower_neg, upper_pos, upper_neg,
+            term_lp, term_ln, term_ln, term_lp,
+            lower_p, upper_p, new_lower_p, new_upper_p);
+
+        std::swap(lower_M, new_lower_M);
+        std::swap(upper_M, new_upper_M);
+        std::swap(lower_p, new_lower_p);
+        std::swap(upper_p, new_upper_p);
+    }
+
+    const int blocksPerGrid = (output_dim + 255) / 256;
+    affine_minmax_pair_gpu<<<blocksPerGrid, 256, 0, sc.stream>>>(
+        lower_M, lower_p, upper_M, upper_p, sc.d_xl, sc.d_xu,
+        sc.d_final_lower, sc.d_final_upper);
+
+    cudaMemcpyAsync(sc.h_final_lower, sc.d_final_lower, sizeof(Vector), cudaMemcpyDeviceToHost, sc.stream);
+    cudaMemcpyAsync(sc.h_final_upper, sc.d_final_upper, sizeof(Vector), cudaMemcpyDeviceToHost, sc.stream);
+}
+
+void lirpa_forward_only_bound_async(const FullyConnectedNetwork& net,
+                                    float eps,
+                                    const Vector* d_x0,
+                                    StreamContext& sc) {
+    lirpa_forward_bound_async(net, eps, d_x0, sc);
+
+    const int output_dim = net.layer_out_dim[net.num_layers - 1];
+    const int blocksPerGrid = (output_dim + 255) / 256;
+    affine_minmax_pair_gpu<<<blocksPerGrid, 256, 0, sc.stream>>>(
+        sc.d_lower_A, sc.d_lower_c, sc.d_upper_A, sc.d_upper_c,
+        sc.d_xl, sc.d_xu, sc.d_final_lower, sc.d_final_upper);
+
+    cudaMemcpyAsync(sc.h_final_lower, sc.d_final_lower, sizeof(Vector), cudaMemcpyDeviceToHost, sc.stream);
+    cudaMemcpyAsync(sc.h_final_upper, sc.d_final_upper, sizeof(Vector), cudaMemcpyDeviceToHost, sc.stream);
+}
+
 } // namespace
