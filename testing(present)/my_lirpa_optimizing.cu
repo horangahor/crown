@@ -1,11 +1,3 @@
-// ============================================================
-// my_lirpa_mempool.cu - my_lirpa.cu에 메모리 풀만 적용한 버전
-//
-// my_lirpa.cu 대비 변경점: 오직 "메모리 풀" 하나만 추가
-//   - 모든 함수에서 cudaMalloc/cudaFree 반복 호출 제거
-//   - 프로그램 시작 시 GPU 메모리를 미리 할당(풀)해 두고 재사용
-//   - GPU 커널, 연산 로직, 알고리즘은 my_lirpa.cu와 100% 동일
-//
 // 메모리 풀 크기:
 //   - Matrix 슬롯 3개 (mat_add, matmul, rowwise_scale 등에서 최대 3개 동시 사용)
 //   - Vector 슬롯 6개 (relu_relax에서 최대 6개 동시 사용)
@@ -205,10 +197,8 @@ void gpu_pool_cleanup() {
   g_pool.destroy();
 }
 
-// ============================================================
-// 기본 유틸리티
-// ============================================================
 
+// 기본 util
 __host__ __device__ inline float pos(float x) { return x > 0.0f ? x : 0.0f; }
 __host__ __device__ inline float neg(float x) { return x < 0.0f ? x : 0.0f; }
 __host__ __device__ inline float relu(float x) { return x > 0.0f ? x : 0.0f; }
@@ -245,10 +235,8 @@ void require(bool cond, const std::string &msg) {
   }
 }
 
-// ============================================================
-// make 함수들 - cpu + 풀 사용으로 변경
-// ============================================================
 
+// make 함수들 - cpu +  GPU pool 사용으로 변경
 Matrix make_zero_matrix(int rows, int cols) {
   require(rows >= 0 && rows <= MAX_DIM && cols >= 0 && cols <= MAX_DIM,
           "Matrix shape out of bounds.");
@@ -308,9 +296,7 @@ Matrix make_eye(int n) {
   return out;
 }
 
-// ============================================================
 // GPU 커널 함수들 (my_lirpa.cu와 동일)
-// ============================================================
 
 // 행렬 합
 __global__ void mat_add_gpu(const Matrix *A, const Matrix *B, Matrix *C) {
@@ -442,9 +428,6 @@ Matrix matmul(const Matrix &A, const Matrix &B) {
 }
 
 // 가중치가 GPU에 미리 올라와 있는 상태의 행렬 곱셈 함수 정의
-
-// A is still a host-side intermediate, but B is an immutable matrix already
-// resident on the GPU.  This removes one full Matrix H2D transfer per call.
 Matrix matmul_device_rhs(const Matrix &A, const Matrix *d_B, int b_rows,
                          int b_cols) {
   require(A.cols == b_rows, "matmul_device_rhs shape mismatch.");
@@ -465,7 +448,6 @@ Matrix matmul_device_rhs(const Matrix &A, const Matrix *d_B, int b_rows,
   return C;
 }
 
-// Device-resident left operand variant for W * A in the forward bound.
 Matrix matmul_device_lhs(const Matrix *d_A, int a_rows, int a_cols,
                          const Matrix &B) {
   require(a_cols == B.rows, "matmul_device_lhs shape mismatch.");
@@ -498,7 +480,6 @@ __global__ void matvec_gpu(const Matrix *A, const Vector *x, Vector *y) {
   }
 }
 
-// Device-resident bias variant used by the normal network forward pass.
 __global__ void matvec_bias_gpu(const Matrix *A, const Vector *x,
                                 const Vector *bias, Vector *y) {
   const int tid = blockDim.x * blockIdx.x + threadIdx.x;
@@ -549,7 +530,6 @@ Vector matvec(const Matrix &A, const Vector &x) {
 }
 
 // 동일하게 가중치가 미리 올라와 있는 행렬 * 벡터 곱
-// Device-resident matrix variant used for immutable network weights.
 Vector matvec_device_matrix(const Matrix *d_A, int rows, int cols,
                             const Vector &x) {
   require(cols == x.n, "matvec_device_matrix shape mismatch.");
@@ -650,8 +630,6 @@ Vector negative_part(const Vector& x) {
     return out;
 }
 
-// Upload immutable network weights once.  The positive/negative decompositions
-// are also computed once and reused by every forward-bound operation.
 void prepare_network_on_gpu(const FullyConnectedNetwork &net) {
   ensure_pool();
 
@@ -667,8 +645,6 @@ void prepare_network_on_gpu(const FullyConnectedNetwork &net) {
     }
     // 6MB + 6MB + 6MB => 18MB
 
-    // Seed pos/neg buffers with metadata (rows/cols); their value arrays are
-    // overwritten by the kernels below.
     // 가중치 GPU 메모리에 복사
     //nvtxRangePushA("memcpy W,B");
     cudaMemcpy(g_pool.d_weight[l], &net.W[l], sizeof(Matrix), cudaMemcpyHostToDevice);
@@ -910,8 +886,6 @@ __global__ void relu_relax_gpu(const Vector *lower, const Vector *upper,
   }
 }
 
-// GPU-resident forward-bound helpers.  Kernels write only value arrays, so
-// keep the small shape metadata valid on every reusable workspace buffer.
 inline void set_matrix_shape(Matrix *d_matrix, int rows, int cols) {
   const int shape[2] = {rows, cols};
   cudaMemcpy(d_matrix, shape, sizeof(shape), cudaMemcpyHostToDevice);
@@ -1135,10 +1109,7 @@ void relu_relax(const Vector &lower, const Vector &upper, Vector &alpha_l,
   cudaMemcpy(&beta_u, g_pool.d_vec[5], sizeof(Vector), cudaMemcpyDeviceToHost);
 }
 
-// ============================================================
 // sigmoid_relax (CPU - my_lirpa.cu와 동일, GPU 포팅 불필요)
-// ============================================================
-
 // bisect_root 와 sigmoid_relax는 수학적 정밀도가 필요하므로 double 유지
 double bisect_root(double lo, double hi,
                    const std::function<double(double)> &fn, int max_iter = 80,
@@ -1263,10 +1234,7 @@ void sigmoid_relax(const Vector &lower, const Vector &upper, Vector &alpha_l,
   }
 }
 
-// ============================================================
 // 신경망 관련 함수 (my_lirpa.cu와 동일)
-// ============================================================
-
 ActivationType parse_activation(const std::string &name) {
   std::string lower = name;
   for (char &ch : lower) {
@@ -1389,14 +1357,9 @@ Vector network_forward(const FullyConnectedNetwork &net, const Vector &x) {
   return f;
 }
 
-// ============================================================
-// CROWN 알고리즘 (my_lirpa.cu와 동일한 로직)
-// ============================================================
+// CROWN 알고리즘 
 
-// ==============================================================================
 // 단위행렬, 영벡터 복사 안하고 GPU에서 직접 만들기 (공용 커널 퓨전 함수)
-// Forward와 Backward 바운드 초기화에서 공용으로 사용합니다.
-// ==============================================================================
 __global__ void initialize_bound_state_gpu(
     Matrix *lower_M, Matrix *upper_M, Vector *lower_p, Vector *upper_p,
     int matrix_rows, int matrix_cols, int vector_n,
@@ -1440,11 +1403,7 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
   prepare_network_on_gpu(net);
   ForwardBoundResult out;
   out.num_layer_bounds = net.num_layers;
-  // =====================================================================
-  // 핑퐁(Ping-Pong)을 위한 고정 GPU 버퍼 맵핑
-  // 원본의 current.lower_A, pre.lower_A, post.lower_A 등을 
-  // 매번 새로 만들지 않고 아래의 6개 행렬, 14개 벡터 버퍼 안에서 돌려막기 합니다.
-  // =====================================================================
+
   Matrix *const lower_A = g_pool.d_fwd_mat[0];     // 원본: current.lower_A (동시에 post 역할도 겸함)
   Matrix *const upper_A = g_pool.d_fwd_mat[1];     // 원본: current.upper_A 
   Matrix *const pre_lower_A = g_pool.d_fwd_mat[2]; // 원본: pre.lower_A
@@ -1482,9 +1441,8 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
     const int weight_rows = net.W[l].rows;
     const int matrix_elements = weight_rows * in_dim;
     const int matrix_blocks = (matrix_elements + 255) / 256;
-    // ---------------------------------------------------------
-    // [Pre-activation 계산] 원본: pre.lower_A = W_pos*lower_A + W_neg*upper_A
-    // ---------------------------------------------------------
+
+    // Pre-activation 계산 원본: pre.lower_A = W_pos*lower_A + W_neg*upper_A
     matmul_pair_add_gpu<<<matrix_blocks, 256>>>(
         d_W_pos, lower_A, d_W_neg, upper_A, pre_lower_A);
     
@@ -1492,34 +1450,24 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
     matmul_pair_add_gpu<<<matrix_blocks, 256>>>(
         d_W_pos, upper_A, d_W_neg, lower_A, pre_upper_A);
 
-    // ---------------------------------------------------------
-    // [편향(Bias) 계산] 원본: pre.lower_c = W_pos*lower_c + W_neg*upper_c + b
-    // ---------------------------------------------------------
+
+    // 편향(Bias) 계산 원본: pre.lower_c = W_pos*lower_c + W_neg*upper_c + b
     const int vector_blocks = (weight_rows + 255) / 256;
     const Vector *d_bias = g_pool.d_bias[l];
     matvec_pair_bias_gpu<<<vector_blocks, 256>>>(
         d_W_pos, lower_c, d_W_neg, upper_c, d_bias, pre_lower_c);
-    // pre_lower_c is reused as the next kernel's input, so its header must
-    // be valid before that kernel reads pre_lower_c->n.
     
-    // CPU에 있는 net.b[l]만 어쩔 수 없이 아주 잠깐 복사해옴 (크기가 작아 부담 적음)
-    // pre.lower_c = pre.lower_c + b (덮어쓰기 In-place 연산!)
     
     // 원본: pre.upper_c = W_pos*upper_c + W_neg*lower_c + b
     matvec_pair_bias_gpu<<<vector_blocks, 256>>>(
         d_W_pos, upper_c, d_W_neg, lower_c, d_bias, pre_upper_c);
-    // Same requirement for the in-place bias addition below.
 
-    // ---------------------------------------------------------
-    // [구체적 수치로 변환] 원본: pre_lower = affine_min(pre.lower_A, ...)
-    // ---------------------------------------------------------
+    // 구체적 수치로 변환, 원본: pre_lower = affine_min(pre.lower_A, ...)
     affine_minmax_pair_gpu<<<vector_blocks, 256>>>(
         pre_lower_A, pre_lower_c, pre_upper_A, pre_upper_c,
         d_xl, d_xu, pre_lower, pre_upper);
     
-    // ---------------------------------------------------------
-    // [Relaxation (샌드위치 이완)] 원본: relu_relax(pre_lower, ...)
-    // ---------------------------------------------------------
+    // Relaxation, 원본: relu_relax(pre_lower, ...)
     if (net.act[l] == ActivationType::Relu) {
       relu_relax_full_gpu<<<vector_blocks, 256>>>(pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u);
     } else if (net.act[l] == ActivationType::Linear) {
@@ -1537,18 +1485,15 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
       cudaMemcpy(beta_u, &h_beta_u, sizeof(Vector), cudaMemcpyHostToDevice);
     }
 
-    // Preserve each layer's relaxation coefficients on the GPU so the
-    // backward pass can consume them without a host round trip.
     // GPU 메모리에 계산결과 저장
     cache_relaxation_layer_gpu<<<vector_blocks, 256>>>(
         alpha_l, beta_l, alpha_u, beta_u,
         g_pool.d_fwd_alpha_lower[l], g_pool.d_fwd_beta_lower[l],
         g_pool.d_fwd_alpha_upper[l], g_pool.d_fwd_beta_upper[l]);
 
-    // ---------------------------------------------------------
-    // [Post-activation 갱신] 원본: post.lower_A = pre.lower_A * alpha_l
+
+    // Post-activation 갱신 원본: post.lower_A = pre.lower_A * alpha_l
     // 여기서 생성된 post.lower_A를 다음 루프를 위해 current.lower_A(lower_A) 자리에 덮어쓰기
-    // ---------------------------------------------------------
     rowwise_scale_pair_gpu<<<matrix_blocks, 256>>>(
         pre_lower_A, alpha_l, pre_upper_A, alpha_u, lower_A, upper_A);
     
@@ -1571,9 +1516,6 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
       out.layer_bounds[l].alpha_upper.n = out.layer_bounds[l].beta_upper.n = weight_rows;
     }
   }
-  // ---------------------------------------------------------
-  // 3. [최종 도출] 다 끝난 lower_A, lower_c 등을 최종 결과에 담아서 리턴
-  // ---------------------------------------------------------
 
   // final_affine (계수 행렬/벡터 원본) 이 필요할 때만 D2H 복사
   // crown_test_optimizing 같은 단일 샘플 디버깅 용도
@@ -1587,7 +1529,6 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
     out.final_affine.lower_A.cols = out.final_affine.upper_A.cols = in_dim;
     out.final_affine.lower_c.n    = out.final_affine.upper_c.n    = out_dim;
   }
-
 
   // backward 과정에서 최종 결과 필요없으므로 D to H memcpy 안함
   if (materialize_final_bounds) {
@@ -1890,7 +1831,7 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
         lower_M, upper_M, lower_pos, lower_neg, upper_pos, upper_neg);
 
     // 2. 분리된 행렬과 Forward에서 구한 alpha, beta를 곱해 CROWN 계수 생성
-    // (CPU의 lower_s_coeff, upper_s_coeff 연산과 100% 동일)
+    // (CPU의 lower_s_coeff + upper_s_coeff 연산)
     build_coeff_pair_fused_gpu<<<matrix_blocks, 256>>>(
         lower_M, upper_M, alpha_l, alpha_u, lower_coeff, upper_coeff);
 
@@ -1913,9 +1854,7 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
         term_lp, term_ln, term_ln, term_lp,
         lower_p, upper_p, new_lower_p, new_upper_p);
 
-    // The newly computed buffers become the current state for the next
-    // layer.  Swapping pointers avoids copying full matrices/vectors on GPU.
-    // 6. 새로 계산된 M과 p를 다음 레이어 연산의 입력으로 사용하기 위해 포인터만 쓱 교체
+    // 6. 새로 계산된 M과 p를 다음 레이어 연산의 입력으로 사용하기 위해 포인터만 교체
     // (CPU처럼 cudaMemcpy나 새로 할당할 필요가 없는 Zero-Memcpy 아키텍처의 핵심)
     // 스왑해줘야 new_lower_M을 다음 역전파의 lower_M으로 사용할 수 있음
     std::swap(lower_M, new_lower_M);
@@ -2090,23 +2029,10 @@ BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const
   return out;
 }
 
-// ==============================================================================
-// 🚀 [CUDA Graph 최적화: 런치 오버헤드 제로화]
-//
-// 💡 [10살도 이해하는 쉬운 비유: 식당 주문 이야기]
-// - 기존 방식 (매번 커널 런치):
-//   손님(CPU)이 주방장(GPU)한테 "양파 썰어줘!" -> (다 썰면) "당근 썰어줘!" -> "고기 볶아줘!"...
-//   요리 하나 만드는데 주방 문을 50번 넘게 열고 닫느라 요리 시간보다 문 여닫는 시간이 더 걸렸어요!
-//
-// - CUDA Graph 방식:
-//   손님(CPU)이 주방장(GPU)에게 "전체 요리 레시피(Graph)"를 딱 한 번 적어서 줍니다.
-//   그 다음부터는 "1번 세트 요리 시작!(cudaGraphLaunch)" 외치면 끝!
-//   주방장이 주방 문 열 필요 없이 혼자서 50단계를 1초의 낭비도 없이 촥촥촥 끝냅니다!
-// ==============================================================================
 
-// 1. [입력값 상자 만들기 커널]
-//    "원래 숫자(x0)에 오차 범위(eps)를 빼고 더해서 [최솟값, 최댓값] 울타리를 쳐주는 작업"
-//    CPU한테 물어보지 않고 GPU 안에서 혼자 뚝딱 계산해서 시간 낭비가 전혀 없어요!
+//==================================================================================================
+
+//    gpu 계산 (xl , xu)
 __global__ void compute_input_box_stream_gpu(const Vector* x0, const float* d_eps,
                                              Vector* xl, Vector* xu, int in_dim) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2115,33 +2041,16 @@ __global__ void compute_input_box_stream_gpu(const Vector* x0, const float* d_ep
     xu->n = in_dim;
   }
   if (tid < in_dim) {
-    const float eps = *d_eps; // GPU 메모리에 적힌 오차(eps)를 바로 읽어와요
+    const float eps = *d_eps; // GPU 메모리에 적힌 오차(eps) 읽어오기
     xl->v[tid] = x0->v[tid] - eps; // 최솟값(하한) = x0 - eps
     xu->v[tid] = x0->v[tid] + eps; // 최댓값(상한) = x0 + eps
   }
 }
 
-// 2. [출발선 긋기 커널 - 바운드 상태 초기화]
-//    별도 중복 커널 없이 공용 initialize_bound_state_gpu 커널을 재사용합니다.
-
-// 3. [초고속 택배 배달원 커널]
-//    "GPU 메모리 방 A에 있는 숫자들을 방 B로 순식간에 슝 복사해주는 착한 배달부"
-__global__ void copy_vector_gpu(const Vector *src, Vector *dst) {
-  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid == 0) dst->n = src->n;
-  if (tid < src->n) dst->v[tid] = src->v[tid];
-}
-
-// ==============================================================================
-// 🏭 [CrownCUDAGraphManager: GPU 자동화 공장의 총지배인 로봇]
-//
-// 1) 공장 바닥(GPU 메모리 방)을 미리 평생 쓸 크기로 잡아둡니다. (매번 방 잡으면 느림!)
-// 2) 요리 순서(커널 순서)를 비디오 카메라로 딱 1번만 녹화(Capture)해둡니다.
-// 3) 새로운 데이터가 올 때마다 "재생(Launch)!" 버튼만 딸깍 누릅니다.
-// ==============================================================================
+// graph 관리 클래스
 class CrownCUDAGraphManager {
 public:
-  cudaStream_t stream = nullptr; // 작업 명령들이 차례대로 지나가는 전용 컨베이어 벨트
+  cudaStream_t stream = nullptr; // 작업 명령을 진행할 단일 stream 
   // 순수 커널 시간 측정을 위한 Event
   cudaEvent_t ev_start = nullptr; // GPU 커널 순수 하드웨어 시작 시각 기록
   cudaEvent_t ev_stop = nullptr;  // GPU 커널 순수 하드웨어 종료 시각 기록
@@ -2150,21 +2059,21 @@ public:
   int in_dim = 0;   // 신경망 입력 차원 (예: 256)
   int out_dim = 0;  // 신경망 출력 차원 (예: 16)
 
-  // 📦 [입력과 출력을 위한 GPU 전용 바구니들 (I/O Device Buffers)]
-  Vector* d_x0 = nullptr;          // 입력 데이터(x0)를 담아둘 GPU 방 (고정 자리)
-  float*  d_eps = nullptr;         // 오차 범위(eps)를 담아둘 GPU 방 (숫자 딱 1개)
-  Vector* d_y0 = nullptr;          // 추론 결과(신경망 출력 y0)가 나올 GPU 방
-  Vector* d_final_lower = nullptr; // CROWN 계산 결과인 최솟값(하한선) 바구니
-  Vector* d_final_upper = nullptr; // CROWN 계산 결과인 최댓값(상한선) 바구니
+  // 입력과 출력을 위한 GPU 메모리 (I/O Device Buffers)
+  Vector* d_x0 = nullptr;          // 입력 데이터(x0)
+  float*  d_eps = nullptr;         // 오차 범위(eps)
+  Vector* d_y0 = nullptr;          // 추론 결과(신경망 출력 y0)
+  Vector* d_final_lower = nullptr; // CROWN 계산 결과인 최솟값(하한선)
+  Vector* d_final_upper = nullptr; // CROWN 계산 결과인 최댓값(상한선)
 
-  // ⚡ [CPU와 GPU 사이 초고속 하이패스 메모리 (Pinned Host Buffers)]
-  // 일반 메모리보다 복사 속도가 2~3배 빠르고, GPU가 일하는 동안 CPU를 방해하지 않아요!
+  // CPU와 GPU 사이 병목 완화용 메모리 (Pinned Host Buffers)]
+  // 일반 메모리보다 복사 속도가 2~3배 빠르고, GPU가 일하는 동안 CPU는 고정된 메모리 공간을 간섭하지 못함
   Vector* h_x0 = nullptr;          // 입력 전용 Pinned Host 메모리 (Direct DMA) // 데이터셋 입력용 pinned Memory
   Vector* h_y0 = nullptr;
   Vector* h_final_lower = nullptr;
   Vector* h_final_upper = nullptr;
 
-  // 📝 [정방향(Forward) 계산할 때 쓸 GPU 연습장들]
+  // forward 계산할 때 쓸 GPU 공간
   Matrix* d_lower_A = nullptr;
   Matrix* d_upper_A = nullptr;
   Matrix* d_pre_lower_A = nullptr;
@@ -2182,13 +2091,13 @@ public:
   Vector* d_xl = nullptr;
   Vector* d_xu = nullptr;
 
-  // 🎒 [역방향(Backward) 계산 때 재사용하려고 Forward 결과를 보관해두는 사물함]
+  // backward 계산 때 재사용 하기 위해 Forward 결과를 보관해두는 공간
   Vector* d_cached_alpha_l[MAX_LAYERS]{};
   Vector* d_cached_beta_l[MAX_LAYERS]{};
   Vector* d_cached_alpha_u[MAX_LAYERS]{};
   Vector* d_cached_beta_u[MAX_LAYERS]{};
 
-  // 🔄 [역방향(Backward) 계산할 때 쓸 GPU 연습장들]
+  // backward 계산 때 쓸 GPU 공간
   Matrix* d_bwd_lower_M = nullptr;
   Matrix* d_bwd_upper_M = nullptr;
   Matrix* d_bwd_lower_pos = nullptr;
@@ -2207,19 +2116,19 @@ public:
   Vector* d_bwd_new_lower_p = nullptr;
   Vector* d_bwd_new_upper_p = nullptr;
 
-  // 🏓 [추론할 때 핑퐁처럼 번갈아 쓰는 버퍼]
+  // 추론할 때 핑퐁처럼 번갈아 쓰는 버퍼
   Vector* d_infer_vec[2]{};
 
-  // 🎬 [비디오 테이프(Graph)와 재생기(Exec Instance)]
-  // 1. 추론 전용 비디오
+  // Graph, Instance 관리
+  // 1. 추론
   cudaGraph_t graph_infer = nullptr;
   cudaGraphExec_t instance_infer = nullptr;
 
-  // 2. 바운드(CROWN) 전용 비디오
+  // 2. 바운드(CROWN)
   cudaGraph_t graph_bound = nullptr;
   cudaGraphExec_t instance_bound = nullptr;
 
-  // 3. 추론 + 바운드 한 번에 돌리는 통합 비디오
+  // 3. 추론 + 바운드 한 번에 통합
   cudaGraph_t graph_combined = nullptr;
   cudaGraphExec_t instance_combined = nullptr;
 
@@ -2228,7 +2137,7 @@ public:
   int current_method = 1; // 0: forward, 1: backward
   const void* last_uploaded_x_addr = nullptr;
 
-  // 🛠️ [공장 개장식: 모든 메모리를 미리 계약하고, 비디오를 1번만 녹화합니다]
+  // constructor
   // 여기서 gpuPool 말고 추가로 malloc을 했는데, 이유는
   // 1. 캡처된 graph는 고정 주소 바인딩 방식(읽고 쓰는 메모리 주소 자체가 하드코딩 됨)
   // 그래프 외부에서 다른 함수가 g_pool을 사용하거나 덮어쓸 때 이미 녹화된 그래프가 오염된 데이터를 읽을 수 있음
@@ -2243,28 +2152,28 @@ public:
     ensure_pool();
     prepare_network_on_gpu(net);
 
-    // 전용 컨베이어 벨트(Stream) 생성
+    // Stream 생성
     cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
     cudaEventCreate(&ev_start);
     cudaEventCreate(&ev_stop);
 
-    // 1. 입출력 바구니들 GPU에 자리 만들기
+    // H2D, D2H memcpy 용 메모리
     cudaMalloc(&d_x0, sizeof(Vector));
     cudaMalloc(&d_eps, sizeof(float));
     cudaMalloc(&d_y0, sizeof(Vector));
     cudaMalloc(&d_final_lower, sizeof(Vector));
     cudaMalloc(&d_final_upper, sizeof(Vector));
 
-    // 하이패스 메모리(Pinned Host) 자리 만들기 (CPU의 DRAM에 고정된 메모리 공간을 만듦, GPU와 통신을 위한.)
+    // 고정 메모리(Pinned Host) 자리 만들기 (CPU의 DRAM에 고정된 메모리 공간을 만듦, GPU와 통신을 위한.)
     cudaHostAlloc(&h_x0, sizeof(Vector), cudaHostAllocDefault); 
-    // 아 여기서 pinned Memory로 승격시켰는데 왜 또 alloc 하지? 생각했는데 생각해보니까 얘는 독립적인 모듈이고 
+    // 아 여기서 pinned Memory로 승격시켰는데 왜 또 alloc 해야하지 생각했는데 생각해보니까 얘는 독립적인 모듈(crown_test_all.cu와)이고 
     // 다른 테스트에서는 40000개의 데이터를 안쓸수도 있는거임
     // 확실한 건 입력이 하나 들어갈만한 pinned_memory가 필요하니까 넣었다.
     cudaHostAlloc(&h_y0, sizeof(Vector), cudaHostAllocDefault);
     cudaHostAlloc(&h_final_lower, sizeof(Vector), cudaHostAllocDefault);
     cudaHostAlloc(&h_final_upper, sizeof(Vector), cudaHostAllocDefault);
 
-    // 2. 정방향 연습장들 만들기
+    // forward 용 
     cudaMalloc(&d_lower_A, sizeof(Matrix));
     cudaMalloc(&d_upper_A, sizeof(Matrix));
     cudaMalloc(&d_pre_lower_A, sizeof(Matrix));
@@ -2289,7 +2198,7 @@ public:
       cudaMalloc(&d_cached_beta_u[l], sizeof(Vector));
     }
 
-    // 3. 역방향 연습장들 만들기
+    // forward + backward용
     cudaMalloc(&d_bwd_lower_M, sizeof(Matrix));
     cudaMalloc(&d_bwd_upper_M, sizeof(Matrix));
     cudaMalloc(&d_bwd_lower_pos, sizeof(Matrix));
@@ -2308,12 +2217,11 @@ public:
     cudaMalloc(&d_bwd_new_lower_p, sizeof(Vector));
     cudaMalloc(&d_bwd_new_upper_p, sizeof(Vector));
 
-    // 4. 추론 연습장 만들기 (추론을 할 때 레이어 두개만 있으면 가중치랑 곱해줄 수 있으니까)
+    // 추론을 할 때 레이어 두개만 있으면 가중치랑 곱해줄 수 있으니까
     // 즉 인풋 layer -> 아웃풋 layer에 순전파 이후  아웃풋 layer와 인풋 layer swap (이 시점에서 input 레이어는 쓰레기 값)
     cudaMalloc(&d_infer_vec[0], sizeof(Vector));
     cudaMalloc(&d_infer_vec[1], sizeof(Vector));
 
-    // 카메라 테스트용 가짜 데이터 한 번 흘려보내기
     // cudaMalloc 직후 gpu 메모리에 들어있는 쓰레기 값 초기화
     // graph 캡처할 때 사전검증 하는 과정에서 쓰레기 값이 유입되는 걸 방지하기 위함
     float dummy_eps = 1e-4f;
@@ -2322,7 +2230,7 @@ public:
     Vector dummy_x = make_zero_vector(in_dim);
     cudaMemcpy(d_x0, &dummy_x, sizeof(Vector), cudaMemcpyHostToDevice);
 
-    // 5. 🎥 비디오 카메라를 켜고 레시피를 딱 1번 녹화(Capture)합니다!
+    // 캡처
     build_infer_graph(net);
     build_bound_graph(net, method);
     build_combined_graph(net, method);
@@ -2330,7 +2238,7 @@ public:
     initialized = true;
   }
 
-  // 🧹 [공장 문 닫기: 빌렸던 메모리 방과 비디오 테이프들을 깨끗이 반납합니다]
+  // destroy
   void cleanup() {
     if (!initialized) return;
     if (instance_infer) { cudaGraphExecDestroy(instance_infer); instance_infer = nullptr; }
@@ -2404,51 +2312,50 @@ public:
     last_uploaded_x_addr = nullptr;
   }
 
-  // 🎯 [오차(eps) 숫자만 GPU 방에 쏙 바꿔주기]
-  // 전체 그래프를 다시 녹화할 필요 없이, GPU 안의 숫자 하나만 업데이트하면 끝!
+  // eps 업데이트
   void set_eps(float eps) {
     if (std::abs(eps - current_eps) < 1e-12f) return; // 같은 숫자면 아무것도 안 함
     current_eps = eps;
     cudaMemcpyAsync(d_eps, &eps, sizeof(float), cudaMemcpyHostToDevice, stream);
   }
 
-  // 🚀 [1단계: 추론 실행하기]
-  // "데이터를 넣고 -> 추론 비디오 재생(Launch) 버튼 꾹! -> 끝난 결과 꺼내오기"
-  void run_infer(const Vector& x0, Vector& y0) {
+  
+  // 추론 graph 실행
+  // measure: 시스템 인자/호출자의 요청이 있을 때만 cudaEvent를 기록하여 불필요한 드라이버 오버헤드 방지
+  void run_infer(const Vector& x0, Vector& y0, bool measure = false) {
     const size_t in_bytes = sizeof(int) + (size_t)in_dim * sizeof(float); // 딱 입력 차원 개수만큼만 계산해서 보내주기 위한 계산용..
     cudaMemcpyAsync(d_x0, &x0, in_bytes, cudaMemcpyHostToDevice, stream); // 기존에는 Vector 크기만큼 바로 복사했는데 ==> in_bytes
     // 원래 Vector 명세   float v[MAX_DIM]{}; // 4byte * 512 ==> 2KB (double 대비 절반) , 이걸 4byte * 256(입력 개수) 로 바꿈
     last_uploaded_x_addr = &x0;
 
-    if (ev_start && ev_stop) cudaEventRecord(ev_start, stream); // 커널 시간 측정 시작
-    cudaGraphLaunch(instance_infer, stream); // 🎬 녹화해둔 추론 50개 커널이 1번에 자동 실행!
-    if (ev_start && ev_stop) cudaEventRecord(ev_stop, stream); // 끝
+    if (measure && ev_start && ev_stop) cudaEventRecord(ev_start, stream); // 커널 시간 측정 시작 (요청 시에만)
+    cudaGraphLaunch(instance_infer, stream);
+    if (measure && ev_start && ev_stop) cudaEventRecord(ev_stop, stream); // 끝
 
-    const size_t out_bytes = sizeof(int) + (size_t)out_dim * sizeof(float); // 이것도 데이터 복사양 최소화
+    const size_t out_bytes = sizeof(int) + (size_t)out_dim * sizeof(float); // 이것도 데이터 복사양 최소화 (계산)
     cudaMemcpyAsync(h_y0, d_y0, out_bytes, cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
 
-    if (ev_start && ev_stop) {
+    if (measure && ev_start && ev_stop) {
       cudaEventElapsedTime(&last_gpu_time_ms, ev_start, ev_stop);
     }
     y0.n = out_dim;
     memcpy(y0.v, h_y0->v, (size_t)out_dim * sizeof(float)); // 딱 출력 노드 개수인 16 * 4byte만 가져오기 위함 ..
   }
 
-  // 🛡️ [2단계: CROWN Bound 계산 실행하기]
-  // "바운드 계산 비디오 재생 버튼 꾹! -> 최솟값(lb)과 최댓값(ub) 꺼내오기"
-  void run_bound(const Vector& x0, float eps, Vector& lb, Vector& ub, int method, bool allow_cached_x = true) {
+  // CROWN Bound 계산 실행
+  // 최솟값(lb)과 최댓값(ub) 꺼내오기
+  void run_bound(const Vector& x0, float eps, Vector& lb, Vector& ub, int method, bool allow_cached_x = true, bool measure = false) {
     set_eps(eps); // 필요하면 새로운 오차값만 전달
     if (!allow_cached_x || last_uploaded_x_addr != &x0) {
-      // 추론할 때 이미 x0를 보냈으면 또 보낼 필요 없이 스킵! (초고속 절약)
       const size_t in_bytes = sizeof(int) + (size_t)in_dim * sizeof(float);
       cudaMemcpyAsync(d_x0, &x0, in_bytes, cudaMemcpyHostToDevice, stream);
       last_uploaded_x_addr = &x0;
     }
 
-    if (ev_start && ev_stop) cudaEventRecord(ev_start, stream);
-    cudaGraphLaunch(instance_bound, stream); // 🎬 녹화해둔 CROWN 커널들이 1번에 자동 실행!
-    if (ev_start && ev_stop) cudaEventRecord(ev_stop, stream);
+    if (measure && ev_start && ev_stop) cudaEventRecord(ev_start, stream);
+    cudaGraphLaunch(instance_bound, stream); 
+    if (measure && ev_start && ev_stop) cudaEventRecord(ev_stop, stream);
 
     // 이것도 16개 노드 * 두개의 바운드 해서 총 32 (* 4byte)만 딱 가져오려고
     const size_t out_bytes = sizeof(int) + (size_t)out_dim * sizeof(float);
@@ -2456,7 +2363,7 @@ public:
     cudaMemcpyAsync(h_final_upper, d_final_upper, out_bytes, cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
 
-    if (ev_start && ev_stop) {
+    if (measure && ev_start && ev_stop) {
       cudaEventElapsedTime(&last_gpu_time_ms, ev_start, ev_stop);
     }
     lb.n = out_dim;
@@ -2465,17 +2372,17 @@ public:
     memcpy(ub.v, h_final_upper->v, (size_t)out_dim * sizeof(float));
   }
 
-  // ⚡ [1+2단계 통합: 추론과 바운드를 한 방에 실행하기]
-  // "추론이랑 바운드를 묶어둔 슈퍼 비디오를 딱 1번만 재생!"
-  void run_combined(const Vector& x0, float eps, Vector& y0, Vector& lb, Vector& ub, int method) {
+
+  // 추론 + bound 통합 graph
+  void run_combined(const Vector& x0, float eps, Vector& y0, Vector& lb, Vector& ub, int method, bool measure = false) {
     set_eps(eps);
     const size_t in_bytes = sizeof(int) + (size_t)in_dim * sizeof(float);
     cudaMemcpyAsync(d_x0, &x0, in_bytes, cudaMemcpyHostToDevice, stream);
     last_uploaded_x_addr = &x0;
 
-    if (ev_start && ev_stop) cudaEventRecord(ev_start, stream);
-    cudaGraphLaunch(instance_combined, stream); // 🎬 추론+바운드 전체가 딱 1번의 명령으로 끝!
-    if (ev_start && ev_stop) cudaEventRecord(ev_stop, stream);
+    if (measure && ev_start && ev_stop) cudaEventRecord(ev_start, stream);
+    cudaGraphLaunch(instance_combined, stream); 
+    if (measure && ev_start && ev_stop) cudaEventRecord(ev_stop, stream);
 
     const size_t out_bytes = sizeof(int) + (size_t)out_dim * sizeof(float);
     cudaMemcpyAsync(h_y0, d_y0, out_bytes, cudaMemcpyDeviceToHost, stream);
@@ -2483,7 +2390,7 @@ public:
     cudaMemcpyAsync(h_final_upper, d_final_upper, out_bytes, cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
 
-    if (ev_start && ev_stop) {
+    if (measure && ev_start && ev_stop) {
       cudaEventElapsedTime(&last_gpu_time_ms, ev_start, ev_stop);
     }
     y0.n = out_dim;
@@ -2495,8 +2402,7 @@ public:
   }
 
 private:
-  // 🎥 [레시피 1 녹화: 신경망 추론 과정 담기]
-  // "입력 데이터 x0를 첫 층부터 끝 층까지 곱하고 더하면서 최종 정답(출력)을 구하는 과정"
+  // 추론 커널
   void record_infer_kernels(const FullyConnectedNetwork &net) {
     if (net.num_layers == 1) { // 가중치 레이어가 한 개인 경우 바로 추론 시작
       const int rows = net.W[0].rows;
@@ -2521,27 +2427,26 @@ private:
 
       // swap 대신 수동으로 코드 적은 것
       cur_in = dest;
-      cur_out = (dest == d_infer_vec[0]) ? d_infer_vec[1] : d_infer_vec[0]; // 다음 층을 위해 입출력 그릇 체인지 (핑퐁)
+      cur_out = (dest == d_infer_vec[0]) ? d_infer_vec[1] : d_infer_vec[0]; // 다음 층(layer)을 위해 입출력 swap 
     }
   }
 
-  // 🎥 [레시피 2 녹화: 정방향(Forward) 바운드 계산 담기]
-  // "입력 상자 [x-eps, x+eps]부터 시작해서 각 층마다 숫자가 어디까지 튈 수 있는지 상한/하한을 계산"
+  // forward 커널 
   void record_forward_bound_kernels(const FullyConnectedNetwork &net, bool is_pure_forward) {
     const int in_dim = network_input_dim(net);
 
-    // 1단계: 입력값에 오차(eps)를 더하고 빼서 시작 상자 만들기
+    // x+- eps ==> xu, xl
     compute_input_box_stream_gpu<<<(in_dim + 255) / 256, 256, 0, stream>>>(
         d_x0, d_eps, d_xl, d_xu, in_dim);
 
-    // 2단계: 출발선 긋기 (공용 initialize_bound_state_gpu 커널 재사용)
+    // 초기화
     const int eye_blocks = (in_dim * in_dim + 255) / 256;
     initialize_bound_state_gpu<<<eye_blocks, 256, 0, stream>>>(
         d_lower_A, d_upper_A, d_lower_c, d_upper_c,
         in_dim, in_dim, in_dim,
         true, true, true, true);
 
-    // 3단계: 앞쪽 층부터 차례차례 CROWN Forward 공식 적용
+    //  CROWN Forward 
     for (int l = 0; l < net.num_layers; ++l) {
       const Matrix *d_W_pos = g_pool.d_weight_pos[l];
       const Matrix *d_W_neg = g_pool.d_weight_neg[l];
@@ -2567,7 +2472,7 @@ private:
           d_pre_lower_A, d_pre_lower_c, d_pre_upper_A, d_pre_upper_c,
           d_xl, d_xu, d_pre_lower, d_pre_upper);
 
-      // 꺾인 ReLU 함수를 삼각형 지붕(선형 완화: Relaxation)으로 감싸기
+      // 꺾인 ReLU 함수를 (선형 완화: Relaxation)으로 감싸기
       if (net.act[l] == ActivationType::Relu) {
         relu_relax_full_gpu<<<vector_blocks, 256, 0, stream>>>(
             d_pre_lower, d_pre_upper, d_alpha_l, d_beta_l, d_alpha_u, d_beta_u);
@@ -2576,7 +2481,7 @@ private:
             d_alpha_l, d_beta_l, d_alpha_u, d_beta_u, weight_rows);
       }
 
-      // 나중에 Backward 할 때 쓰려고 완화 기울기(alpha, beta)를 사물함에 쏙 보관!
+      // backward 하기 위한 완화 기울기(alpha, beta) 보관
       // 이건 backward 안할때는 쓸 필요없으니까 최소화 한거고
       if (!is_pure_forward) {
         cache_relaxation_layer_gpu<<<vector_blocks, 256, 0, stream>>>(
@@ -2595,7 +2500,7 @@ private:
           d_lower_c, d_upper_c);
     }
 
-    // 순수 Forward 모드일 때는 여기서 바로 최종 하한선/상한선을 뽑아냅니다
+    // 순수 forward 모드일 때는 여기서 바로 최종 하한선/상한선을 계산
     if (is_pure_forward) {
       const int out_dim = network_output_dim(net);
       const int blocks = (out_dim + 255) / 256;
@@ -2605,10 +2510,8 @@ private:
     }
   }
 
-  // 🎥 [레시피 3 녹화: 역방향(Backward) 바운드 계산 담기]
-  // "CROWN의 꽃! 뒤쪽 층(출력)부터 시작해서 앞쪽(입력)으로 거꾸로 행렬을 밀고 내려옵니다!"
+  // backward 바운드 계산 커널 
   void record_backward_bound_kernels(const FullyConnectedNetwork &net) {
-    // 1단계: 먼저 Forward를 돌려서 각 층의 사물함(alpha, beta)을 꽉 채워둡니다
     record_forward_bound_kernels(net, false);
 
     const int out_dim = network_output_dim(net);
@@ -2617,7 +2520,6 @@ private:
     const int vector_n = out_dim;
     const int init_elements = max(matrix_rows * matrix_cols, vector_n);
 
-    // 2단계: 뒤에서 시작할 준비 (단위 행렬로 시작)
     initialize_bound_state_gpu<<<(init_elements + 255) / 256, 256, 0, stream>>>(
         d_bwd_lower_M, d_bwd_upper_M, d_bwd_lower_p, d_bwd_upper_p,
         matrix_rows, matrix_cols, vector_n,
@@ -2632,7 +2534,7 @@ private:
     Vector *new_lower_p = d_bwd_new_lower_p;
     Vector *new_upper_p = d_bwd_new_upper_p;
 
-    // 3단계: 맨 마지막 층(출력) -> 맨 앞 층(입력) 방향으로 거꾸로 역주행 루프!
+    // 역전파
     for (int l = net.num_layers - 1; l >= 0; --l) {
       const int m_rows = matrix_rows;
       const int m_cols = net.layer_out_dim[l];
@@ -2641,7 +2543,7 @@ private:
       const int matrix_blocks = (matrix_elems + 255) / 256;
       const int vector_blocks = (m_rows + 255) / 256;
 
-      // 사물함에서 꺼내온 이번 층의 완화 기울기
+      // 해당 layer 완화 기울기
       const Vector *alpha_l = d_cached_alpha_l[l];
       const Vector *beta_l = d_cached_beta_l[l];
       const Vector *alpha_u = d_cached_alpha_u[l];
@@ -2670,33 +2572,33 @@ private:
           d_bwd_term_lp, d_bwd_term_ln, d_bwd_term_ln, d_bwd_term_lp,
           lower_p, upper_p, new_lower_p, new_upper_p);
 
-      // 다음 층 역주행을 위해 포인터 교체 (스왑)
+      // 다음 층 역전파을 위해 포인터 교체 (스왑)
       std::swap(lower_M, new_lower_M);
       std::swap(upper_M, new_upper_M);
       std::swap(lower_p, new_lower_p);
       std::swap(upper_p, new_upper_p);
     }
 
-    // 4단계: 맨 앞 입력층까지 밀고 온 행렬과 초기 입력 상자(xl, xu)를 곱해서 최종 [하한, 상한] 결정!
+    // 맨 앞 입력층까지 밀고 온 행렬과 초기 입력 상자(xl, xu)를 곱해서 최종 하한, 상한 결정
     const int blocks = (out_dim + 255) / 256;
     affine_minmax_pair_gpu<<<blocks, 256, 0, stream>>>(
         lower_M, lower_p, upper_M, upper_p, d_xl, d_xu, d_final_lower, d_final_upper);
   }
 
-  // 🎬 [비디오 촬영소 1: 추론 그래프 만들기]
+  //  추론 캡쳐
   void build_infer_graph(const FullyConnectedNetwork &net) {
-    cudaError_t err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal); // 🔴 녹화 시작!
+    cudaError_t err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
     if (err != cudaSuccess) {
       std::cerr << "cudaStreamBeginCapture (infer) failed: " << cudaGetErrorString(err) << std::endl;
       return;
     }
-    record_infer_kernels(net); // 요리 순서대로 커널 배치
-    err = cudaStreamEndCapture(stream, &graph_infer); // ⏹️ 녹화 종료!
+    record_infer_kernels(net);
+    err = cudaStreamEndCapture(stream, &graph_infer); 
     if (err != cudaSuccess) {
       std::cerr << "cudaStreamEndCapture (infer) failed: " << cudaGetErrorString(err) << std::endl;
       return;
     }
-    // 녹화본을 GPU 하드웨어에 딱 맞춘 초고속 실행 파일로 컴파일(인스턴스화)
+    // 실행 파일로 인스턴스화
     err = cudaGraphInstantiate(&instance_infer, graph_infer, nullptr, nullptr, 0);
     if (err != cudaSuccess) {
       std::cerr << "cudaGraphInstantiate (infer) failed: " << cudaGetErrorString(err) << std::endl;
@@ -2704,19 +2606,19 @@ private:
     }
   }
 
-  // 🎬 [비디오 촬영소 2: 바운드 계산 그래프 만들기]
+  // bound 캡쳐
   void build_bound_graph(const FullyConnectedNetwork &net, int method) {
-    cudaError_t err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal); // 🔴 녹화 시작!
+    cudaError_t err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal); 
     if (err != cudaSuccess) {
       std::cerr << "cudaStreamBeginCapture (bound) failed: " << cudaGetErrorString(err) << std::endl;
       return;
     }
     if (method == 0) {
-      record_forward_bound_kernels(net, true);  // Forward 바운드 촬영
+      record_forward_bound_kernels(net, true);  // Forward
     } else {
-      record_backward_bound_kernels(net);       // Backward 바운드 촬영
+      record_backward_bound_kernels(net);       // Backward
     }
-    err = cudaStreamEndCapture(stream, &graph_bound); // ⏹️ 녹화 종료!
+    err = cudaStreamEndCapture(stream, &graph_bound); 
     if (err != cudaSuccess) {
       std::cerr << "cudaStreamEndCapture (bound) failed: " << cudaGetErrorString(err) << std::endl;
       return;
@@ -2728,20 +2630,20 @@ private:
     }
   }
 
-  // 🎬 [비디오 촬영소 3: 추론 + 바운드 통합 슈퍼 그래프 만들기]
+  // 추론 + 바운드 통합 캡처
   void build_combined_graph(const FullyConnectedNetwork &net, int method) {
-    cudaError_t err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal); // 🔴 녹화 시작!
+    cudaError_t err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
     if (err != cudaSuccess) {
       std::cerr << "cudaStreamBeginCapture (combined) failed: " << cudaGetErrorString(err) << std::endl;
       return;
     }
-    record_infer_kernels(net); // 1) 추론 촬영
+    record_infer_kernels(net); // 추론
     if (method == 0) {
-      record_forward_bound_kernels(net, true);  // 2) Forward 바운드 촬영
+      record_forward_bound_kernels(net, true);  // Forward
     } else {
-      record_backward_bound_kernels(net);       // 2) Backward 바운드 촬영
+      record_backward_bound_kernels(net);       // Backward
     }
-    err = cudaStreamEndCapture(stream, &graph_combined); // ⏹️ 녹화 종료!
+    err = cudaStreamEndCapture(stream, &graph_combined);
     if (err != cudaSuccess) {
       std::cerr << "cudaStreamEndCapture (combined) failed: " << cudaGetErrorString(err) << std::endl;
       return;
@@ -2754,39 +2656,35 @@ private:
   }
 };
 
-// ==============================================================================
-// 🔘 [외부(crown_test_all_data.cu)에서 누르는 간단한 리모컨 버튼들]
-// ==============================================================================
-
-// 전역 매니저 객체 (딱 1개만 상주)
+// 전역 매니저 객체
 static CrownCUDAGraphManager g_crown_graph;
 
-// 1. 공장 가동 준비 버튼 (메모리 확보 + 비디오 1회 녹화)
+// initiate
 void init_crown_cuda_graph(const FullyConnectedNetwork& net, int method, int mode = 1) {
   g_crown_graph.init(net, method, mode);
 }
 
-// 2. 오차 범위(eps) 변경 버튼
+// 오차 범위(eps) 변경
 void set_crown_cuda_graph_eps(float eps) {
   g_crown_graph.set_eps(eps);
 }
 
-// 3. 추론 실행 버튼 (y0 계산)
-void run_crown_cuda_graph_infer(const Vector& x0, Vector& y0) {
-  g_crown_graph.run_infer(x0, y0);
+// 추론 실행
+void run_crown_cuda_graph_infer(const Vector& x0, Vector& y0, bool measure = false) {
+  g_crown_graph.run_infer(x0, y0, measure);
 }
 
-// 4. 바운드 계산 실행 버튼 (lb, ub 계산)
-void run_crown_cuda_graph_bound(const Vector& x0, float eps, Vector& lb, Vector& ub, int method, bool allow_cached_x = true) {
-  g_crown_graph.run_bound(x0, eps, lb, ub, method, allow_cached_x);
+// 바운드 계산 (lb, ub 계산)
+void run_crown_cuda_graph_bound(const Vector& x0, float eps, Vector& lb, Vector& ub, int method, bool allow_cached_x = true, bool measure = false) {
+  g_crown_graph.run_bound(x0, eps, lb, ub, method, allow_cached_x, measure);
 }
 
-// 5. 추론 + 바운드 한 방 실행 버튼 (y0, lb, ub 동시 계산)
-void run_crown_cuda_graph_combined(const Vector& x0, float eps, Vector& y0, Vector& lb, Vector& ub, int method) {
-  g_crown_graph.run_combined(x0, eps, y0, lb, ub, method);
+// 추론 + 바운드 실행 (y0, lb, ub 동시 계산)
+void run_crown_cuda_graph_combined(const Vector& x0, float eps, Vector& y0, Vector& lb, Vector& ub, int method, bool measure = false) {
+  g_crown_graph.run_combined(x0, eps, y0, lb, ub, method, measure);
 }
 
-// 6. 공장 폐장 및 청소 버튼 (메모리 해제)
+// destoryer (메모리 해제)
 void cleanup_crown_cuda_graph() {
   g_crown_graph.cleanup();
 }
@@ -2909,163 +2807,5 @@ private:
     return out;
   }
 };
-
-// ============================================================
-// XOR 데모 및 테스트 (my_lirpa.cu와 동일)
-// ============================================================
-
-FullyConnectedNetwork make_xor_network() {
-  int layer_in[MAX_LAYERS]{};
-  int layer_out[MAX_LAYERS]{};
-  double W_data[MAX_LAYERS][MAX_DIM][MAX_DIM]{}; // make_network API가 double 입력을 받으므로 유지
-  double b_data[MAX_LAYERS][MAX_DIM]{};
-  std::string acts[MAX_LAYERS];
-
-  const int L = 2;
-  layer_in[0] = 2;  layer_out[0] = 2;  acts[0] = "relu";
-  layer_in[1] = 2;  layer_out[1] = 1;  acts[1] = "sigmoid";
-
-  W_data[0][0][0] = 2.1247;  W_data[0][0][1] = 2.1267;
-  W_data[0][1][0] = -2.1237; W_data[0][1][1] = -2.1235;
-  b_data[0][0] = -2.1259;    b_data[0][1] = 2.1234;
-
-  W_data[1][0][0] = -3.6788; W_data[1][0][1] = -3.6766;
-  b_data[1][0] = 3.5451;
-
-  return make_network(L, layer_in, layer_out, W_data, b_data, acts);
-}
-
-// 아래 3개의 함수는 테스트용 (임시 데이터셋 + temp 신경망)
-void self_test_relaxations() {
-  std::mt19937_64 rng(0);
-  std::uniform_real_distribution<double> dist(-5.0, 5.0); // 테스트는 정밀도 유지를 위해 double
-
-  for (int t = 0; t < 200; ++t) {
-    double a = dist(rng);
-    double b = dist(rng);
-    if (a > b) std::swap(a, b);
-    if (std::abs(a - b) < 1e-8) b = a + 1e-6;
-
-    Vector l = make_zero_vector(1);
-    Vector u = make_zero_vector(1);
-    l.v[0] = a;
-    u.v[0] = b;
-
-    Vector al, bl, au, bu;
-
-    relu_relax(l, u, al, bl, au, bu);
-    for (int k = 0; k < 201; ++k) {
-      const double x = a + (b - a) * static_cast<double>(k) / 200.0;
-      const double y = relu(x);
-      const double lhs = al.v[0] * x + bl.v[0];
-      const double rhs = au.v[0] * x + bu.v[0];
-      if (lhs > y + 1e-8 || y > rhs + 1e-8) {
-        std::cerr << "ReLU test failed! a=" << a << ", b=" << b << ", x=" << x
-                  << ", y=" << y << ", al=" << al.v[0] << ", bl=" << bl.v[0]
-                  << ", au=" << au.v[0] << ", bu=" << bu.v[0] << "\n";
-        std::cerr << "lhs=" << lhs << ", rhs=" << rhs << "\n";
-        throw std::runtime_error("ReLU relaxation self-test failed.");
-      }
-    }
-
-    sigmoid_relax(l, u, al, bl, au, bu);
-    for (int k = 0; k < 201; ++k) {
-      const double x = a + (b - a) * static_cast<double>(k) / 200.0;
-      const double y = sigmoid(x);
-      const double lhs = al.v[0] * x + bl.v[0];
-      const double rhs = au.v[0] * x + bu.v[0];
-      if (lhs > y + 1e-8 || y > rhs + 1e-8) {
-        throw std::runtime_error("Sigmoid relaxation self-test failed.");
-      }
-    }
-  }
-}
-
-int xor_expected_label(const Vector &x) {
-  require(x.n >= 2, "xor_expected_label requires at least 2-dimensional input.");
-  const int a = static_cast<int>(std::llround(x.v[0]));
-  const int b = static_cast<int>(std::llround(x.v[1]));
-  return a ^ b;
-}
-
-void run_xor_demo(float eps) {
-  const FullyConnectedNetwork network = make_xor_network();
-  const LiRPABackwardOnly backward_only_verifier;
-
-  Vector points[4];
-  for (int i = 0; i < 4; ++i) { points[i] = make_zero_vector(2); }
-  points[0].v[0] = 0.0; points[0].v[1] = 0.0;
-  points[1].v[0] = 0.0; points[1].v[1] = 1.0;
-  points[2].v[0] = 1.0; points[2].v[1] = 0.0;
-  points[3].v[0] = 1.0; points[3].v[1] = 1.0;
-
-  std::cout << "XOR network point predictions and LiRPA-certified output bounds\n";
-  std::cout << "Perturbation: L_inf epsilon = " << eps << "\n\n";
-
-  bool all_certified_forward = true;
-  bool all_certified_backward = true;
-  bool all_certified_backward_only = true;
-
-  std::cout << std::fixed << std::setprecision(6);
-
-  for (const auto &x0 : points) {
-    const Vector y = network_forward(network, x0);
-    const ForwardBoundResult fwd = lirpa_forward_bound(network, x0, eps);
-    const BackwardBoundResult bwd = lirpa_backward_bound(network, x0, eps);
-    const BackwardBoundResult bwd_only =
-        backward_only_verifier.bound(network, x0, eps);
-    const int expected = xor_expected_label(x0);
-
-    bool fwd_certified, bwd_certified, bwd_only_certified;
-    std::string condition;
-
-    if (expected == 1) {
-      fwd_certified = (fwd.final_lower.v[0] > 0.5);
-      bwd_certified = (bwd.final_lower.v[0] > 0.5);
-      bwd_only_certified = (bwd_only.final_lower.v[0] > 0.5);
-      condition = "lower bound > 0.5";
-    } else {
-      fwd_certified = (fwd.final_upper.v[0] < 0.5);
-      bwd_certified = (bwd.final_upper.v[0] < 0.5);
-      bwd_only_certified = (bwd_only.final_upper.v[0] < 0.5);
-      condition = "upper bound < 0.5";
-    }
-
-    all_certified_forward = all_certified_forward && fwd_certified;
-    all_certified_backward = all_certified_backward && bwd_certified;
-    all_certified_backward_only = all_certified_backward_only && bwd_only_certified;
-
-    std::cout << "x0=[" << x0.v[0] << ", " << x0.v[1]
-              << "], expected=" << expected << ", network_output=" << y.v[0] << "\n";
-    std::cout << "  forward  bound=[" << fwd.final_lower.v[0] << ", "
-              << fwd.final_upper.v[0]
-              << "], certified=" << (fwd_certified ? "True" : "False") << " ("
-              << condition << ")\n";
-    std::cout << "  backward bound=[" << bwd.final_lower.v[0] << ", "
-              << bwd.final_upper.v[0]
-              << "], certified=" << (bwd_certified ? "True" : "False") << " ("
-              << condition << ")\n";
-    std::cout << "  backward-only bound=[" << bwd_only.final_lower.v[0] << ", "
-              << bwd_only.final_upper.v[0]
-              << "], certified=" << (bwd_only_certified ? "True" : "False")
-              << " (" << condition << ")\n";
-  }
-
-  std::cout << "\n";
-  if (all_certified_forward)
-    std::cout << "Forward mode certifies all four XOR corner classifications for this epsilon.\n";
-  else
-    std::cout << "Forward mode does not certify at least one XOR corner classification for this epsilon.\n";
-
-  if (all_certified_backward)
-    std::cout << "Backward mode certifies all four XOR corner classifications for this epsilon.\n";
-  else
-    std::cout << "Backward mode does not certify at least one XOR corner classification for this epsilon.\n";
-
-  if (all_certified_backward_only)
-    std::cout << "Backward-only mode certifies all four XOR corner classifications for this epsilon.\n";
-  else
-    std::cout << "Backward-only mode does not certify at least one XOR corner classification for this epsilon.\n";
-}
 
 } // namespace

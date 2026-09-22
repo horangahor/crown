@@ -201,6 +201,11 @@ int main(int argc, char** argv) {
     int         graph_mode   = (argc > 6 && strlen(argv[6]) > 0) ? std::atoi(argv[6]) : 1;
     // graph_mode: 0 = Baseline (No Graph), 1 = CUDA Graph (Separate Infer + Bound), 2 = CUDA Graph (Combined Fused)
     int         max_samples  = (argc > 7 && strlen(argv[7]) > 0) ? std::atoi(argv[7]) : 0; // 0 = all samples // sparse.py의 max_sample 따라한 것
+    int         measure_gpu  = (argc > 8 && strlen(argv[8]) > 0) ? std::atoi(argv[8]) : 1;
+    // measure_gpu: cudaEvent 하드웨어 타이머 측정 제어 시스템 인자
+    // 0 = 비활성화 (Off, 드라이버 오버헤드 0, 최고 속도)
+    // 1 = 마지막 샘플만 1회 측정 (Last sample only, 전체 루프 오버헤드 0초 + 맨 마지막 Pure GPU 시간 리포트, 기본값)
+    // 2 = 매 샘플마다 측정 (All samples, 92만 번 전체 정밀 측정, 호출당 20~50us 드라이버 오버헤드 발생 주의)
 
     // 1. 모델 로드
     std::cout << "\n=== crown_test_all_data ===" << std::endl;
@@ -289,6 +294,7 @@ int main(int argc, char** argv) {
     std::cout << "  data points   : " << N                  << std::endl;
     std::cout << "  k (top-k)     : " << k                  << std::endl;
     std::cout << "  eps values    : " << eps_list.size()    << std::endl;
+    std::cout << "  cudaEvent Profiling: " << (measure_gpu == 0 ? "Disabled (0)" : (measure_gpu == 1 ? "Last Sample Only (1)" : "All Samples (2)")) << std::endl;
     std::cout << "========================================\n" << std::endl;
 
     // 5. Warmup (타이머 외부 — GPU JIT + 클럭 안정화)
@@ -344,15 +350,22 @@ int main(int argc, char** argv) {
             Vector y0, lb, ub;
             auto sample_t0 = std::chrono::high_resolution_clock::now(); // graph_mode와 상관없이 샘플 1 사이클 측정을 위한 시간
 
+            // 시스템 인자(measure_gpu)에 따라 cudaEvent 측정 여부 제어:
+            // 0: 측정 완전 비활성화 (오버헤드 0, 최고 속도)
+            // 1: 마지막 샘플만 1회 측정 (루프 92만 번 동안 오버헤드 0초 + 맨 끝에 Pure GPU 출력 가능, 기본값)
+            // 2: 매 샘플마다 측정 (전수 정밀 프로파일링용, 드라이버 오버헤드 발생)
+            bool is_last_sample = (eps == eps_list.back() && i == N - 1);
+            bool do_measure = (measure_gpu == 2) || (measure_gpu == 1 && is_last_sample);
+
             if (graph_mode == 1) {
                 // ── [1] 추론 (CUDA Graph) ─────────────────────────
                 auto t0 = std::chrono::high_resolution_clock::now();
-                run_crown_cuda_graph_infer(dataset[i], y0);
+                run_crown_cuda_graph_infer(dataset[i], y0, do_measure);
                 auto t1 = std::chrono::high_resolution_clock::now();
                 time_infer_total += std::chrono::duration<double>(t1 - t0).count();
 
                 // ── [2] Bound 계산 (CUDA Graph) ───────────────────
-                run_crown_cuda_graph_bound(dataset[i], eps_f, lb, ub, method, true);
+                run_crown_cuda_graph_bound(dataset[i], eps_f, lb, ub, method, true, do_measure);
                 auto t2 = std::chrono::high_resolution_clock::now();
                 time_bound_total += std::chrono::duration<double>(t2 - t1).count();
 
@@ -367,7 +380,7 @@ int main(int argc, char** argv) {
             } else if (graph_mode == 2) {
                 // ── [1+2] 추론 + Bound 통합 런치 (CUDA Graph) ────
                 auto t0 = std::chrono::high_resolution_clock::now();
-                run_crown_cuda_graph_combined(dataset[i], eps_f, y0, lb, ub, method);
+                run_crown_cuda_graph_combined(dataset[i], eps_f, y0, lb, ub, method, do_measure);
                 auto t2 = std::chrono::high_resolution_clock::now();
                 time_bound_total += std::chrono::duration<double>(t2 - t0).count();
 
@@ -496,7 +509,11 @@ int main(int argc, char** argv) {
         // 자세하게 말하면 커널의 개수, 블록 수, 스레드, 메모리 주소까지 모두 하드코딩된 형태라서 항상 커널 시간의 jitter가 상대적으로 적다
         // 그니까 입력 데이터의 연산량, gpu 온도 , 클럭 등을 제외하면 시간을 바꿀만한 변수가 많이 사라진다 보면 됨
         if (graph_mode > 0) { 
-            std::cout << "  Pure GPU Execution: " << std::setw(8) << get_crown_cuda_graph_last_gpu_time_ms() * 1000.0 << " us (last sample)" << std::endl;
+            if (measure_gpu > 0) {
+                std::cout << "  Pure GPU Execution: " << std::setw(8) << get_crown_cuda_graph_last_gpu_time_ms() * 1000.0 << " us (last sample)" << std::endl;
+            } else {
+                std::cout << "  Pure GPU Execution:   Disabled (measure_gpu=0)" << std::endl;
+            }
         } 
         std::cout << "======================================================\n" << std::endl;
     }
