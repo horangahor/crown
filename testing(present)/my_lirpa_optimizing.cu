@@ -61,7 +61,7 @@ struct LayerBound {
   Vector beta_upper;
 };
 
-struct ForwardBoundResult {
+struct BoundResult {
   AffineBound final_affine;
   Vector final_lower;
   Vector final_upper;
@@ -69,13 +69,9 @@ struct ForwardBoundResult {
   LayerBound layer_bounds[MAX_LAYERS]{}; // 순전파 과정에서 얻은 중간 upper, lower bound
 };
 
-struct BackwardBoundResult {
-  AffineBound final_affine;
-  Vector final_lower;
-  Vector final_upper;
-  int num_layer_bounds = 0;
-  LayerBound layer_bounds[MAX_LAYERS]{};
-};
+using ForwardBoundResult = BoundResult;
+using BackwardBoundResult = BoundResult;
+using BackwardOnlyResult = BoundResult;
 
 struct FullyConnectedNetwork {
   int num_layers = 0;
@@ -1722,8 +1718,6 @@ __global__ void backward_bias_pair_fused_gpu(
   }
 }
 
-// Compute lower and upper backward matrix products with one launch.  The
-// two products share the same immutable weight matrix and output coordinates.
 __global__ void backward_matmul_pair_gpu(
     const Matrix *lower_in, const Matrix *upper_in, const Matrix *weight,
     Matrix *lower_out, Matrix *upper_out) {
@@ -1900,6 +1894,7 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
 }
 
 // 이거 대신 backward_bound_gpu를 사용함 (로직은 동일, 다만 GPU, CPU구현에서 차이)
+/*
 void backward_one_layer(Matrix &lower_M, Vector &lower_p, Matrix &upper_M,
                         Vector &upper_p, const Matrix &W, const Vector &b,
                         const Vector &alpha_l, const Vector &beta_l,
@@ -1956,6 +1951,7 @@ void backward_one_layer(Matrix &lower_M, Vector &lower_p, Matrix &upper_M,
   upper_M = new_upper_M;
   upper_p = new_upper_p;
 }
+*/
 
 // materialize_forward_results : forward의 결과를 
 BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const Vector &x0,
@@ -2701,6 +2697,7 @@ Vector* get_crown_cuda_graph_pinned_input() {
 
 
 // 얘는 재귀버전이라 CUDA로 재작성하기 쉽지 않을 것임.. ==> 이터레이션 버전 추가
+/*
 class LiRPABackwardOnly {
 public:
   BackwardBoundResult bound(const FullyConnectedNetwork &net, const Vector &x0,
@@ -2807,5 +2804,5 @@ private:
     return out;
   }
 };
-
+*/
 } // namespace
