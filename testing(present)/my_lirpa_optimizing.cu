@@ -2025,8 +2025,301 @@ BackwardBoundResult lirpa_backward_bound(const FullyConnectedNetwork &net, const
   return out;
 }
 
+// 여기서부터 backwardOnly 작성 + 대응되는 커널 함수 없을시 마찬가지로 여기에 추가로 작성
 
-//==================================================================================================
+// ==================================================================================================
+// LiRPA Backward-Only Iteration (GPU / CUDA 버전)
+// ==================================================================================================
+
+// GPU 상에서 레이어별 가중치/편향 초기 복사 커널
+__global__ void copy_matrix_pair_gpu(const Matrix *src, Matrix *dst1, Matrix *dst2) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = src->rows * src->cols;
+  if (tid == 0) {
+    dst1->rows = src->rows;
+    dst1->cols = src->cols;
+    dst2->rows = src->rows;
+    dst2->cols = src->cols;
+  }
+  if (tid < total) {
+    const int r = tid / src->cols;
+    const int c = tid % src->cols;
+    const float val = src->a[r][c];
+    dst1->a[r][c] = val;
+    dst2->a[r][c] = val;
+  }
+}
+
+__global__ void copy_vector_pair_gpu(const Vector *src, Vector *dst1, Vector *dst2) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid == 0) {
+    dst1->n = src->n;
+    dst2->n = src->n;
+  }
+  if (tid < src->n) {
+    const float val = src->v[tid];
+    dst1->v[tid] = val;
+    dst2->v[tid] = val;
+  }
+}
+
+// Backward-Only에서 이전 레이어 r을 거치며 역전파하는 단일 스텝 (GPU 커널들 호출)
+inline void backward_one_layer_step_gpu(
+    int m_rows, int m_cols, int w_rows, int w_cols,
+    const Vector *alpha_l, const Vector *beta_l,
+    const Vector *alpha_u, const Vector *beta_u,
+    const Matrix *weight, const Vector *bias,
+    Matrix *lower_M, Matrix *upper_M,
+    Matrix *lower_pos, Matrix *lower_neg,
+    Matrix *upper_pos, Matrix *upper_neg,
+    Matrix *lower_coeff, Matrix *upper_coeff,
+    Matrix *new_lower_M, Matrix *new_upper_M,
+    Vector *lower_p, Vector *upper_p,
+    Vector *term_lp, Vector *term_ln,
+    Vector *new_lower_p, Vector *new_upper_p) {
+
+  const int matrix_elems = m_rows * m_cols;
+  const int matrix_blocks = (matrix_elems + 255) / 256;
+  const int vector_blocks = (m_rows + 255) / 256;
+
+  // 1. 하한/상한 행렬 분리 (positive / negative)
+  split_pos_neg_pair_gpu<<<matrix_blocks, 256>>>(
+      lower_M, upper_M, lower_pos, lower_neg, upper_pos, upper_neg);
+
+  // 2. 이완 계수 결합 (CROWN 계수 생성)
+  build_coeff_pair_fused_gpu<<<matrix_blocks, 256>>>(
+      lower_M, upper_M, alpha_l, alpha_u, lower_coeff, upper_coeff);
+
+  // 3. 가중치 행렬곱
+  backward_matmul_pair_gpu<<<(m_rows * w_cols + 255) / 256, 256>>>(
+      lower_coeff, upper_coeff, weight, new_lower_M, new_upper_M);
+
+  // 4. 이완 오차 및 편향 항 계산
+  affine_term_pair_fused_gpu<<<(w_rows + 255) / 256, 256>>>(
+      alpha_l, beta_l, alpha_u, beta_u, bias, term_lp, term_ln);
+
+  // 5. 편향 누적합
+  backward_bias_pair_fused_gpu<<<vector_blocks, 256>>>(
+      lower_pos, lower_neg, upper_pos, upper_neg,
+      term_lp, term_ln, term_ln, term_lp,
+      lower_p, upper_p, new_lower_p, new_upper_p);
+}
+
+// Iterative Backward-Only 방식으로 모든 레이어의 이완 계수(alpha, beta)를 GPU 상에서 누적 계산
+void build_layer_relaxations_iterative_gpu(
+    const FullyConnectedNetwork &net,
+    const Vector *d_xl, const Vector *d_xu) {
+
+  prepare_network_on_gpu(net);
+
+  Matrix *lower_pos   = g_pool.d_bwd_mat[2];
+  Matrix *lower_neg   = g_pool.d_bwd_mat[3];
+  Matrix *upper_pos   = g_pool.d_bwd_mat[4];
+  Matrix *upper_neg   = g_pool.d_bwd_mat[5];
+  Matrix *lower_coeff = g_pool.d_bwd_mat[6];
+  Matrix *upper_coeff = g_pool.d_bwd_mat[7];
+
+  Vector *term_lp     = g_pool.d_bwd_vec[6];
+  Vector *term_ln     = g_pool.d_bwd_vec[7];
+
+  Vector *d_pre_lower = g_pool.d_fwd_vec[4];
+  Vector *d_pre_upper = g_pool.d_fwd_vec[5];
+
+  for (int k = 0; k < net.num_layers; ++k) {
+    Matrix *lower_M     = g_pool.d_bwd_mat[0];
+    Matrix *upper_M     = g_pool.d_bwd_mat[1];
+    Matrix *new_lower_M = g_pool.d_bwd_mat[8];
+    Matrix *new_upper_M = g_pool.d_bwd_mat[9];
+
+    Vector *lower_p     = g_pool.d_bwd_vec[0];
+    Vector *upper_p     = g_pool.d_bwd_vec[1];
+    Vector *new_lower_p = g_pool.d_bwd_vec[10];
+    Vector *new_upper_p = g_pool.d_bwd_vec[11];
+
+    const int w_k_elems = net.W[k].rows * net.W[k].cols;
+    copy_matrix_pair_gpu<<<(w_k_elems + 255) / 256, 256>>>(
+        g_pool.d_weight[k], lower_M, upper_M);
+    copy_vector_pair_gpu<<<(net.b[k].n + 255) / 256, 256>>>(
+        g_pool.d_bias[k], lower_p, upper_p);
+
+    // r = k - 1 down to 0
+    for (int r = k - 1; r >= 0; --r) {
+      const int m_rows = net.W[k].rows;
+      const int m_cols = net.layer_out_dim[r];
+      const int w_rows = net.layer_out_dim[r];
+      const int w_cols = net.layer_in_dim[r];
+
+      const Vector *alpha_l = g_pool.d_fwd_alpha_lower[r];
+      const Vector *beta_l  = g_pool.d_fwd_beta_lower[r];
+      const Vector *alpha_u = g_pool.d_fwd_alpha_upper[r];
+      const Vector *beta_u  = g_pool.d_fwd_beta_upper[r];
+
+      backward_one_layer_step_gpu(
+          m_rows, m_cols, w_rows, w_cols,
+          alpha_l, beta_l, alpha_u, beta_u,
+          g_pool.d_weight[r], g_pool.d_bias[r],
+          lower_M, upper_M,
+          lower_pos, lower_neg, upper_pos, upper_neg,
+          lower_coeff, upper_coeff,
+          new_lower_M, new_upper_M,
+          lower_p, upper_p,
+          term_lp, term_ln,
+          new_lower_p, new_upper_p);
+
+      std::swap(lower_M, new_lower_M);
+      std::swap(upper_M, new_upper_M);
+      std::swap(lower_p, new_lower_p);
+      std::swap(upper_p, new_upper_p);
+    }
+
+    // 입력 박스 [xl, xu]에 대해 레이어 k의 pre-activation bound 계산
+    const int pre_dim = net.layer_out_dim[k];
+    const int pre_blocks = (pre_dim + 255) / 256;
+    affine_minmax_pair_gpu<<<pre_blocks, 256>>>(
+        lower_M, lower_p, upper_M, upper_p, d_xl, d_xu, d_pre_lower, d_pre_upper);
+
+    // 레이어 k의 활성화 함수 Relaxation 계산
+    Vector *d_cur_alpha_l = g_pool.d_fwd_alpha_lower[k];
+    Vector *d_cur_beta_l  = g_pool.d_fwd_beta_lower[k];
+    Vector *d_cur_alpha_u = g_pool.d_fwd_alpha_upper[k];
+    Vector *d_cur_beta_u  = g_pool.d_fwd_beta_upper[k];
+
+    if (net.act[k] == ActivationType::Linear) {
+      linear_relax_full_gpu<<<pre_blocks, 256>>>(
+          d_cur_alpha_l, d_cur_beta_l, d_cur_alpha_u, d_cur_beta_u, pre_dim);
+    } else if (net.act[k] == ActivationType::Relu) {
+      relu_relax_full_gpu<<<pre_blocks, 256>>>(
+          d_pre_lower, d_pre_upper,
+          d_cur_alpha_l, d_cur_beta_l, d_cur_alpha_u, d_cur_beta_u);
+    } else if (net.act[k] == ActivationType::Sigmoid) {
+      Vector h_lower, h_upper, h_alpha_l, h_beta_l, h_alpha_u, h_beta_u;
+      cudaMemcpy(&h_lower, d_pre_lower, sizeof(Vector), cudaMemcpyDeviceToHost);
+      cudaMemcpy(&h_upper, d_pre_upper, sizeof(Vector), cudaMemcpyDeviceToHost);
+      sigmoid_relax(h_lower, h_upper, h_alpha_l, h_beta_l, h_alpha_u, h_beta_u);
+      cudaMemcpy(d_cur_alpha_l, &h_alpha_l, sizeof(Vector), cudaMemcpyHostToDevice);
+      cudaMemcpy(d_cur_beta_l,  &h_beta_l,  sizeof(Vector), cudaMemcpyHostToDevice);
+      cudaMemcpy(d_cur_alpha_u, &h_alpha_u, sizeof(Vector), cudaMemcpyHostToDevice);
+      cudaMemcpy(d_cur_beta_u,  &h_beta_u,  sizeof(Vector), cudaMemcpyHostToDevice);
+    }
+  }
+}
+
+// Backward-Only 전체 바운드 계산 함수 (GPU 가속)
+BackwardOnlyResult lirpa_backward_only_bound(
+    const FullyConnectedNetwork &net,
+    const Vector &x0,
+    const Vector &eps,
+    bool materialize_layer_bounds = false,
+    bool materialize_final_affine = false,
+    const Matrix *output_lower_M = nullptr,
+    const Vector *output_lower_p = nullptr,
+    const Matrix *output_upper_M = nullptr,
+    const Vector *output_upper_p = nullptr) {
+
+  require(net.num_layers > 0, "Network must have at least one layer.");
+  require(x0.n == network_input_dim(net), "x0 dimension mismatch.");
+  require(eps.n == x0.n, "eps must match x0 dimension.");
+  for (int i = 0; i < eps.n; ++i) {
+    require(eps.v[i] >= 0.0f, "eps must be nonnegative.");
+  }
+
+  ensure_pool();
+  prepare_network_on_gpu(net);
+
+  Vector *const d_xl = g_pool.d_fwd_vec[12];
+  Vector *const d_xu = g_pool.d_fwd_vec[13];
+
+  Vector xl = x0;
+  Vector xu = x0;
+  for (int i = 0; i < x0.n; ++i) {
+    xl.v[i] -= eps.v[i];
+    xu.v[i] += eps.v[i];
+  }
+  cudaMemcpy(d_xl, &xl, sizeof(Vector), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_xu, &xu, sizeof(Vector), cudaMemcpyHostToDevice);
+
+  // 1. 모든 레이어에 대한 이완 계수를 Iterative Backward-Only로 GPU에서 계산
+  build_layer_relaxations_iterative_gpu(net, d_xl, d_xu);
+
+  // 2. 최종 출력에 대해 backward_bound_gpu 호출
+  const int output_dim = network_output_dim(net);
+  Matrix lower_M;
+  Matrix upper_M;
+  Vector lower_p;
+  Vector upper_p;
+
+  if (output_lower_M) { lower_M = *output_lower_M; }
+  else { lower_M = make_eye_cpu(output_dim); }
+  if (output_upper_M) { upper_M = *output_upper_M; }
+  else { upper_M = make_eye_cpu(output_dim); }
+  if (output_lower_p) { lower_p = *output_lower_p; }
+  else { lower_p = make_zero_vector(lower_M.rows); }
+  if (output_upper_p) { upper_p = *output_upper_p; }
+  else { upper_p = make_zero_vector(upper_M.rows); }
+
+  require(lower_M.cols == output_dim && upper_M.cols == output_dim,
+          "Output spec matrix column mismatch.");
+  require(lower_M.rows == upper_M.rows,
+          "Output spec lower/upper row mismatch.");
+  require(lower_p.n == lower_M.rows && upper_p.n == upper_M.rows,
+          "Output spec vector row mismatch.");
+
+  BackwardOnlyResult out;
+
+  const bool default_lower_M = (output_lower_M == nullptr);
+  const bool default_lower_p = (output_lower_p == nullptr);
+  const bool default_upper_M = (output_upper_M == nullptr);
+  const bool default_upper_p = (output_upper_p == nullptr);
+
+  ForwardBoundResult dummy_fwd;
+  dummy_fwd.num_layer_bounds = net.num_layers;
+
+  backward_bound_gpu(net, dummy_fwd, lower_M, lower_p, upper_M, upper_p,
+                     out.final_lower, out.final_upper,
+                     out.final_affine.lower_A, out.final_affine.lower_c,
+                     out.final_affine.upper_A, out.final_affine.upper_c,
+                     materialize_final_affine,
+                     default_lower_M, default_lower_p,
+                     default_upper_M, default_upper_p);
+
+  out.num_layer_bounds = net.num_layers;
+  if (materialize_layer_bounds) {
+    for (int l = 0; l < net.num_layers; ++l) {
+      out.layer_bounds[l].dim = net.layer_out_dim[l];
+      cudaMemcpy(&out.layer_bounds[l].alpha_lower, g_pool.d_fwd_alpha_lower[l], sizeof(Vector), cudaMemcpyDeviceToHost);
+      cudaMemcpy(&out.layer_bounds[l].beta_lower,  g_pool.d_fwd_beta_lower[l],  sizeof(Vector), cudaMemcpyDeviceToHost);
+      cudaMemcpy(&out.layer_bounds[l].alpha_upper, g_pool.d_fwd_alpha_upper[l], sizeof(Vector), cudaMemcpyDeviceToHost);
+      cudaMemcpy(&out.layer_bounds[l].beta_upper,  g_pool.d_fwd_beta_upper[l],  sizeof(Vector), cudaMemcpyDeviceToHost);
+    }
+  }
+
+  return out;
+}
+
+// 스칼라 eps 지원 오버로딩
+// 재귀 아님 (받는 인자 다름)
+BackwardOnlyResult lirpa_backward_only_bound(
+    const FullyConnectedNetwork &net,
+    const Vector &x0,
+    float eps,
+    bool materialize_layer_bounds = false,
+    bool materialize_final_affine = false,
+    const Matrix *output_lower_M = nullptr,
+    const Vector *output_lower_p = nullptr,
+    const Matrix *output_upper_M = nullptr,
+    const Vector *output_upper_p = nullptr) {
+  Vector eps_vec = make_eps_vec_cpu(x0.n, eps);
+  return lirpa_backward_only_bound(net, x0, eps_vec,
+                                  materialize_layer_bounds, materialize_final_affine,
+                                  output_lower_M, output_lower_p,
+                                  output_upper_M, output_upper_p);
+}
+
+inline Vector make_eps_vector(int n, float eps) {
+  return make_eps_vec_cpu(n, eps);
+}
+
+//===============================================================================
 
 //    gpu 계산 (xl , xu)
 __global__ void compute_input_box_stream_gpu(const Vector* x0, const float* d_eps,

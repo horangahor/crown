@@ -152,7 +152,7 @@ int main(int argc, char** argv){
     // stof를 사용하면 string 객체를 만들어서 실수로 변환하는 미세한 오버헤드 발생 , 다만 확실한 예외처리 가능
     const int data_idx = (argc > 1) ? std::atoi(argv[1]) : 0;
     const char* network_path = (argc > 2) ? argv[2] : MODEL_PATH;
-    const char* data_path = (argc > 3) ? argv[3] : "test_data_all.bin";
+    const char* data_path = (argc > 3) ? argv[3] : "test_data_1.bin";
     double eps = (argc > 4) ? std::stof(argv[4]) : 1e-6;
     
     std::cout << "network read start " << std::endl;
@@ -183,6 +183,7 @@ int main(int argc, char** argv){
     network_forward(*net, x0);
     lirpa_backward_bound(*net, x0, eps, false, false);
     //lirpa_forward_bound_impl(*net, x0, eps, false, false, true);
+    lirpa_backward_only_bound(*net, x0, eps, false, true);
     // ================================================================
 
 
@@ -203,10 +204,14 @@ int main(int argc, char** argv){
     // 여기서 선언시 BackwardBoundResult 빈 공간(4MB 할당 + 자잘한 벡터들까지 해서 넉넉히 0.25MB )
     // 내부 함수에 진입해서 보면 거의 64MB가 필요함 (함수 주석 참고) <== 근데 64MB 안되서 128MB로 함
     // 왜인지는 모르겠다 너무 함수가 복잡해져서..
-    BackwardBoundResult bwd = lirpa_backward_bound(*net, x0, eps, false, false);
+    //BackwardBoundResult bwd = lirpa_backward_bound(*net, x0, eps, false, false);
 
     // 신경망 + foward 결과만 보면 7ms 초반 ~ 8ms 초반 정도
     //ForwardBoundResult bwd = lirpa_forward_bound_impl(*net, x0, eps, false, false, true);
+
+    // BackwardOnly 테스트
+    BackwardOnlyResult bwd = lirpa_backward_only_bound(*net, x0, eps, false, true);
+
     auto t_bound = std::chrono::high_resolution_clock::now();
     double time_bound = std::chrono::duration<double, std::milli>(t_bound - t_infer).count();
 

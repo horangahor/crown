@@ -133,7 +133,7 @@ int main(int argc, char** argv){
     std::cout << "  ** MODE: CPU ONLY iteration ver **" << std::endl;
     std::cout << "========================================\n";
 
-    std::cout << std::fixed << std::setprecision(6);
+    std::cout << std::fixed << std::setprecision(13);
 
     // 시간 측정 시작
     auto t_start = std::chrono::high_resolution_clock::now();
@@ -164,9 +164,9 @@ int main(int argc, char** argv){
     std::cout << "---------------------------------------------------\n";
     for (int i = 0; i < out_dim; ++i) {
         std::cout << "[" << std::setw(3) << i << "]   |  " 
-                  << std::setw(9) << bwd.final_lower.v[i] << "  |  "
-                  << std::setw(9) << bwd.final_upper.v[i] << "  |  "
-                  << std::setw(9) << y.v[i] << "\n";
+                  << std::setw(17) << bwd.final_lower.v[i] << "  |  "
+                  << std::setw(17) << bwd.final_upper.v[i] << "  |  "
+                  << std::setw(17) << y.v[i] << "\n";
     }
     std::cout << "========================================\n";
 
