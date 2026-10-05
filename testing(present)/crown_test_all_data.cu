@@ -183,12 +183,12 @@ bool certify_topk(const Vector& y0, const Vector& lb, const Vector& ub, int k = 
 
 int main(int argc, char** argv) {
 
-    int         method       = (argc > 1) ? std::atoi(argv[1]) : 0; // 0: forward, 1: backward, // 추가 ? ==> 2: backward_only
-    const char* network_path = (argc > 2) ? argv[2] : MODEL_PATH;
-    const char* data_path    = (argc > 3) ? argv[3] : "test_data_all.bin";
-    int         k            = (argc > 4) ? std::atoi(argv[4]) : 8;
-    const char* output_csv   = (argc > 5) ? argv[5] : "results_cuda.csv";
-    int         batch_size   = (argc > 6) ? std::atoi(argv[6]) : 32;
+    int         method       = (argc > 1 ) ? std::atoi(argv[1]) : 0; // 0: forward, 1: backward, // 추가 ? ==> 2: backward_only
+    const char* network_path = (argc > 2 && std::strlen(argv[2]) > 1) ? argv[2] : MODEL_PATH;
+    const char* data_path    = (argc > 3 && std::strlen(argv[3]) > 1) ? argv[3] : "test_data_all.bin";
+    int         k            = (argc > 4 ) ? std::atoi(argv[4]) : 8;
+    const char* output_csv   = (argc > 5 && std::strlen(argv[5]) > 1) ? argv[5] : "results_cuda.csv";
+    int         batch_size   = (argc > 6 ) ? std::atoi(argv[6]) : 32;
 
     // 1. 모델 로드
     std::cout << "\n=== crown_test_all_data ===" << std::endl;
@@ -381,7 +381,7 @@ int main(int argc, char** argv) {
 
     // 9. 타이밍 로그 CSV에 누적 기록 (실행할 때마다 append)
     {
-        const char* timing_csv = "timing_log_crown.csv";
+        const char* timing_csv = "timing_log_crown_batching.csv";
         // 파일이 없으면 헤더 먼저 작성
         bool write_header = false;
         {
@@ -405,7 +405,7 @@ int main(int argc, char** argv) {
             if (write_header) {
                 log << "timestamp,method,N,eps_count,"
                     << "total_s,infer_s,bound_s,certify_s,"
-                    << "avg_infer_ms,avg_bound_ms,avg_certify_ms\n";
+                    << "avg_infer_ms,avg_bound_ms,avg_certify_ms,batch_size\n";
             }
 
             log << std::fixed;
@@ -419,7 +419,8 @@ int main(int argc, char** argv) {
                 << std::setprecision(4) << time_certify_total << ","
                 << std::setprecision(4) << avg_infer_ms       << ","
                 << std::setprecision(4) << avg_bound_ms       << ","
-                << std::setprecision(4) << avg_certify_ms     << "\n";
+                << std::setprecision(4) << avg_certify_ms     << ","
+                << batch_size<<"\n";
 
             log.close();
             std::cout << "timing log appended to " << timing_csv << std::endl;
