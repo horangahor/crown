@@ -2868,6 +2868,14 @@ private:
       std::swap(upper_p, new_upper_p);
     }
 
+    void record_backward_only_bound_kernels(const FullyConnectedNetwork &net){
+
+    }
+
+    
+
+
+
     // 맨 앞 입력층까지 밀고 온 행렬과 초기 입력 상자(xl, xu)를 곱해서 최종 하한, 상한 결정
     const int blocks = (out_dim + 255) / 256;
     affine_minmax_pair_gpu<<<blocks, 256, 0, stream>>>(
@@ -2904,8 +2912,10 @@ private:
     }
     if (method == 0) {
       record_forward_bound_kernels(net, true);  // Forward
-    } else {
+    } else if(method == 1) {
       record_backward_bound_kernels(net);       // Backward
+    } else {
+      // todo : record_backward_only_bound_kernels(net); // backward_only 
     }
     err = cudaStreamEndCapture(stream, &graph_bound); 
     if (err != cudaSuccess) {
@@ -2929,8 +2939,10 @@ private:
     record_infer_kernels(net); // 추론
     if (method == 0) {
       record_forward_bound_kernels(net, true);  // Forward
-    } else {
+    } else if(method == 1) {
       record_backward_bound_kernels(net);       // Backward
+    } else {
+      //record_backward_only_bound_kernels(net); // backward_only
     }
     err = cudaStreamEndCapture(stream, &graph_combined);
     if (err != cudaSuccess) {

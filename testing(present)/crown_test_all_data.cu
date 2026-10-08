@@ -281,6 +281,8 @@ int main(int argc, char** argv) {
         method_str = "forward";
     }else if(method == 1){
         method_str = "backward";
+    }else if(method == 2){
+        method_str = "backward_only";
     }
 
     std::string mode_desc;
