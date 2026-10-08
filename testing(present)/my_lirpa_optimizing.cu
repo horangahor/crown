@@ -2204,7 +2204,7 @@ void build_layer_relaxations_iterative_gpu(
   }
 }
 
-// Backward-Only 전체 바운드 계산 함수 (GPU 가속)
+// Backward-Only 전체 바운드 계산 함수 (GPU)
 BackwardOnlyResult lirpa_backward_only_bound(
     const FullyConnectedNetwork &net,
     const Vector &x0,
