@@ -210,7 +210,7 @@ int main(int argc, char** argv){
     //ForwardBoundResult bwd = lirpa_forward_bound_impl(*net, x0, eps, false, false, true);
 
     // BackwardOnly 테스트
-    BackwardOnlyResult bwd = lirpa_backward_only_bound(*net, x0, eps, false, true);
+    BackwardOnlyResult bwd = lirpa_backward_only_bound(*net, x0, eps, false, false);
 
     auto t_bound = std::chrono::high_resolution_clock::now();
     double time_bound = std::chrono::duration<double, std::milli>(t_bound - t_infer).count();

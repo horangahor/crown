@@ -2867,16 +2867,158 @@ private:
       std::swap(lower_p, new_lower_p);
       std::swap(upper_p, new_upper_p);
     }
+    // 맨 앞 입력층까지 밀고 온 행렬과 초기 입력 상자(xl, xu)를 곱해서 최종 하한, 상한 결정
+    const int blocks = (out_dim + 255) / 256;
+    affine_minmax_pair_gpu<<<blocks, 256, 0, stream>>>(
+        lower_M, lower_p, upper_M, upper_p, d_xl, d_xu, d_final_lower, d_final_upper);
+  }
 
-    void record_backward_only_bound_kernels(const FullyConnectedNetwork &net){
 
+  // backward_only 바운드 계산 커널 기록 (CUDA Graph 캡처용)
+  void record_backward_only_bound_kernels(const FullyConnectedNetwork &net) {
+    const int in_dim = network_input_dim(net);
+
+    // [1] 입력 박스 계산 (d_x0, d_eps -> d_xl, d_xu)
+    compute_input_box_stream_gpu<<<(in_dim + 255) / 256, 256, 0, stream>>>(
+        d_x0, d_eps, d_xl, d_xu, in_dim);
+
+    // [2] 모든 레이어의 이완 계수(alpha, beta)를 Backward-Only Iteration으로 계산
+    for (int k = 0; k < net.num_layers; ++k) {
+      Matrix *lower_M     = d_bwd_lower_M;
+      Matrix *upper_M     = d_bwd_upper_M;
+      Matrix *new_lower_M = d_bwd_new_lower_M;
+      Matrix *new_upper_M = d_bwd_new_upper_M;
+
+      Vector *lower_p     = d_bwd_lower_p;
+      Vector *upper_p     = d_bwd_upper_p;
+      Vector *new_lower_p = d_bwd_new_lower_p;
+      Vector *new_upper_p = d_bwd_new_upper_p;
+
+      // 레이어 k의 가중치/편향 초기 복사
+      const int w_k_elems = net.W[k].rows * net.W[k].cols;
+      copy_matrix_pair_gpu<<<(w_k_elems + 255) / 256, 256, 0, stream>>>(
+          g_pool.d_weight[k], lower_M, upper_M);
+      copy_vector_pair_gpu<<<(net.b[k].n + 255) / 256, 256, 0, stream>>>(
+          g_pool.d_bias[k], lower_p, upper_p);
+
+      // r = k - 1 down to 0 (입력층까지 역전파)
+      for (int r = k - 1; r >= 0; --r) {
+        const int m_rows = net.W[k].rows;
+        const int m_cols = net.layer_out_dim[r];
+        const int w_cols = net.layer_in_dim[r];
+        const int matrix_elems = m_rows * m_cols;
+        const int matrix_blocks = (matrix_elems + 255) / 256;
+        const int vector_blocks = (m_rows + 255) / 256;
+
+        const Vector *alpha_l = d_cached_alpha_l[r];
+        const Vector *beta_l  = d_cached_beta_l[r];
+        const Vector *alpha_u = d_cached_alpha_u[r];
+        const Vector *beta_u  = d_cached_beta_u[r];
+
+        split_pos_neg_pair_gpu<<<matrix_blocks, 256, 0, stream>>>(
+            lower_M, upper_M, d_bwd_lower_pos, d_bwd_lower_neg,
+            d_bwd_upper_pos, d_bwd_upper_neg);
+
+        build_coeff_pair_fused_gpu<<<matrix_blocks, 256, 0, stream>>>(
+            lower_M, upper_M, alpha_l, alpha_u, d_bwd_lower_coeff, d_bwd_upper_coeff);
+
+        backward_matmul_pair_gpu<<<(m_rows * w_cols + 255) / 256, 256, 0, stream>>>(
+            d_bwd_lower_coeff, d_bwd_upper_coeff, g_pool.d_weight[r], new_lower_M, new_upper_M);
+
+        const Vector *bias = g_pool.d_bias[r];
+        affine_term_pair_fused_gpu<<<(net.layer_out_dim[r] + 255) / 256, 256, 0, stream>>>(
+            alpha_l, beta_l, alpha_u, beta_u, bias, d_bwd_term_lp, d_bwd_term_ln);
+
+        backward_bias_pair_fused_gpu<<<vector_blocks, 256, 0, stream>>>(
+            d_bwd_lower_pos, d_bwd_lower_neg, d_bwd_upper_pos, d_bwd_upper_neg,
+            d_bwd_term_lp, d_bwd_term_ln, d_bwd_term_ln, d_bwd_term_lp,
+            lower_p, upper_p, new_lower_p, new_upper_p);
+
+        std::swap(lower_M, new_lower_M);
+        std::swap(upper_M, new_upper_M);
+        std::swap(lower_p, new_lower_p);
+        std::swap(upper_p, new_upper_p);
+      }
+
+      // 레이어 k의 pre-activation bound 계산
+      const int pre_dim = net.layer_out_dim[k];
+      const int pre_blocks = (pre_dim + 255) / 256;
+      affine_minmax_pair_gpu<<<pre_blocks, 256, 0, stream>>>(
+          lower_M, lower_p, upper_M, upper_p, d_xl, d_xu, d_pre_lower, d_pre_upper);
+
+      // 레이어 k의 활성화 함수 Relaxation 계산 -> d_cached_...[k]에 저장
+      if (net.act[k] == ActivationType::Relu) {
+        relu_relax_full_gpu<<<pre_blocks, 256, 0, stream>>>(
+            d_pre_lower, d_pre_upper,
+            d_cached_alpha_l[k], d_cached_beta_l[k],
+            d_cached_alpha_u[k], d_cached_beta_u[k]);
+      } else if (net.act[k] == ActivationType::Linear) {
+        linear_relax_full_gpu<<<pre_blocks, 256, 0, stream>>>(
+            d_cached_alpha_l[k], d_cached_beta_l[k],
+            d_cached_alpha_u[k], d_cached_beta_u[k], pre_dim);
+      }
     }
 
-    
+    // [3] 최종 출력층에 대해 역전파 1회 수행 (record_backward_bound_kernels와 동일)
+    const int out_dim = network_output_dim(net);
+    const int matrix_rows = out_dim;
+    const int matrix_cols = out_dim;
+    const int vector_n = out_dim;
+    const int init_elements = max(matrix_rows * matrix_cols, vector_n);
 
+    initialize_bound_state_gpu<<<(init_elements + 255) / 256, 256, 0, stream>>>(
+        d_bwd_lower_M, d_bwd_upper_M, d_bwd_lower_p, d_bwd_upper_p,
+        matrix_rows, matrix_cols, vector_n,
+        true, true, true, true);
 
+    Matrix *lower_M     = d_bwd_lower_M;
+    Matrix *upper_M     = d_bwd_upper_M;
+    Matrix *new_lower_M = d_bwd_new_lower_M;
+    Matrix *new_upper_M = d_bwd_new_upper_M;
+    Vector *lower_p     = d_bwd_lower_p;
+    Vector *upper_p     = d_bwd_upper_p;
+    Vector *new_lower_p = d_bwd_new_lower_p;
+    Vector *new_upper_p = d_bwd_new_upper_p;
 
-    // 맨 앞 입력층까지 밀고 온 행렬과 초기 입력 상자(xl, xu)를 곱해서 최종 하한, 상한 결정
+    for (int l = net.num_layers - 1; l >= 0; --l) {
+      const int m_rows = matrix_rows;
+      const int m_cols = net.layer_out_dim[l];
+      const int w_cols = net.layer_in_dim[l];
+      const int matrix_elems = m_rows * m_cols;
+      const int matrix_blocks = (matrix_elems + 255) / 256;
+      const int vector_blocks = (m_rows + 255) / 256;
+
+      const Vector *alpha_l = d_cached_alpha_l[l];
+      const Vector *beta_l  = d_cached_beta_l[l];
+      const Vector *alpha_u = d_cached_alpha_u[l];
+      const Vector *beta_u  = d_cached_beta_u[l];
+
+      split_pos_neg_pair_gpu<<<matrix_blocks, 256, 0, stream>>>(
+          lower_M, upper_M, d_bwd_lower_pos, d_bwd_lower_neg,
+          d_bwd_upper_pos, d_bwd_upper_neg);
+
+      build_coeff_pair_fused_gpu<<<matrix_blocks, 256, 0, stream>>>(
+          lower_M, upper_M, alpha_l, alpha_u, d_bwd_lower_coeff, d_bwd_upper_coeff);
+
+      backward_matmul_pair_gpu<<<(m_rows * w_cols + 255) / 256, 256, 0, stream>>>(
+          d_bwd_lower_coeff, d_bwd_upper_coeff, g_pool.d_weight[l], new_lower_M, new_upper_M);
+
+      const Vector *bias = g_pool.d_bias[l];
+      affine_term_pair_fused_gpu<<<(net.layer_out_dim[l] + 255) / 256, 256, 0, stream>>>(
+          alpha_l, beta_l, alpha_u, beta_u, bias, d_bwd_term_lp, d_bwd_term_ln);
+
+      backward_bias_pair_fused_gpu<<<vector_blocks, 256, 0, stream>>>(
+          d_bwd_lower_pos, d_bwd_lower_neg, d_bwd_upper_pos, d_bwd_upper_neg,
+          d_bwd_term_lp, d_bwd_term_ln, d_bwd_term_ln, d_bwd_term_lp,
+          lower_p, upper_p, new_lower_p, new_upper_p);
+
+      std::swap(lower_M, new_lower_M);
+      std::swap(upper_M, new_upper_M);
+      std::swap(lower_p, new_lower_p);
+      std::swap(upper_p, new_upper_p);
+    }
+
+    // 최종 정답(final_lower, final_upper) 도출
     const int blocks = (out_dim + 255) / 256;
     affine_minmax_pair_gpu<<<blocks, 256, 0, stream>>>(
         lower_M, lower_p, upper_M, upper_p, d_xl, d_xu, d_final_lower, d_final_upper);
@@ -2915,7 +3057,7 @@ private:
     } else if(method == 1) {
       record_backward_bound_kernels(net);       // Backward
     } else {
-      // todo : record_backward_only_bound_kernels(net); // backward_only 
+      record_backward_only_bound_kernels(net); // backward_only 
     }
     err = cudaStreamEndCapture(stream, &graph_bound); 
     if (err != cudaSuccess) {

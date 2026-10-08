@@ -416,7 +416,7 @@ int main(int argc, char** argv) {
                         break;
                     }
                     case 2: {
-                        BackwardOnlyResult bwd = lirpa_backward_only_bound(*net, dataset[i], eps_f, false, true);
+                        BackwardOnlyResult bwd = lirpa_backward_only_bound(*net, dataset[i], eps_f, false, false);
                         lb = bwd.final_lower;
                         ub = bwd.final_upper;
                         break;
