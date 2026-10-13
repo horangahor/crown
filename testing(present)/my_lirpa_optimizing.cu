@@ -2454,6 +2454,7 @@ public:
     cudaMalloc(&d_final_upper, sizeof(Vector));
 
     // 고정 메모리(Pinned Host) 자리 만들기 (CPU의 DRAM에 고정된 메모리 공간을 만듦, GPU와 통신을 위한.)
+    // 현재 crown_test_all에서 사용하고 있지는 않다 (나중에 실시간을 재연할 때 여기 주소로 보내면 됨, 이미 결과는 저기로 보내고 있고)
     cudaHostAlloc(&h_x0, sizeof(Vector), cudaHostAllocDefault); 
     // 아 여기서 pinned Memory로 승격시켰는데 왜 또 alloc 해야하지 생각했는데 생각해보니까 얘는 독립적인 모듈(crown_test_all.cu와)이고 
     // 다른 테스트에서는 40000개의 데이터를 안쓸수도 있는거임

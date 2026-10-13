@@ -191,7 +191,35 @@ bool certify_topk(const Vector& y0, const Vector& lb, const Vector& ub, int k = 
 }
 // 즉 eps 를 바꿔가며 T/F 비율을 구해서 해당 신경망이 어디 eps까지 버틸 수 있는지 비율을 구하는 것임 (비율을 보고 관리자가 판단)
 
+// GPU 클록 자동 잠금 & 자동 해제 구조체 (RAII)
+struct ScopedGpuClockLock {
+    bool locked = false;
+
+    ScopedGpuClockLock(int clock_mhz = 2475) {
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd), "nvidia-smi -lgc %d,%d > nul 2>&1", clock_mhz, clock_mhz);
+        if (std::system(cmd) == 0) {
+            locked = true;
+            std::cout << "[GPU Clock] Successfully locked to " << clock_mhz << " MHz (Admin enabled)." << std::endl;
+        } else {
+            std::cerr << "\n[GPU Clock ERROR] Failed to lock clock to " << clock_mhz << " MHz!" << std::endl;
+            std::cerr << "[GPU Clock ERROR] Administrator privileges are required to change GPU clocks." << std::endl;
+            std::cerr << "[GPU Clock ERROR] Terminating program as requested.\n" << std::endl;
+            exit(1);
+        }
+    }
+
+    ~ScopedGpuClockLock() {
+        if (locked) {
+            std::system("nvidia-smi -rgc > nul 2>&1");
+            std::cout << "[GPU Clock] Reset to default dynamic boost." << std::endl;
+        }
+    }
+};
+
 int main(int argc, char** argv) {
+    // 0. GPU 클록 고정 (프로그램 시작 시 고정, 종료 시 자동 해제)
+    ScopedGpuClockLock clock_guard(2475);
 
     int         method       = (argc > 1 && strlen(argv[1]) > 0) ? std::atoi(argv[1]) : 0; // 0: forward, 1: backward, // 추가 ? ==> 2: backward_only
     const char* network_path = (argc > 2 && strlen(argv[2]) > 0) ? argv[2] : MODEL_PATH;
