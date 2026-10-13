@@ -195,7 +195,7 @@ bool certify_topk(const Vector& y0, const Vector& lb, const Vector& ub, int k = 
 struct ScopedGpuClockLock {
     bool locked = false;
 
-    ScopedGpuClockLock(int clock_mhz = 2475) {
+    ScopedGpuClockLock(int clock_mhz = 2800) {
         char cmd[128];
         snprintf(cmd, sizeof(cmd), "nvidia-smi -lgc %d,%d > nul 2>&1", clock_mhz, clock_mhz);
         if (std::system(cmd) == 0) {
@@ -219,7 +219,7 @@ struct ScopedGpuClockLock {
 
 int main(int argc, char** argv) {
     // 0. GPU 클록 고정 (프로그램 시작 시 고정, 종료 시 자동 해제)
-    ScopedGpuClockLock clock_guard(2475);
+    ScopedGpuClockLock clock_guard(2800);
 
     int         method       = (argc > 1 && strlen(argv[1]) > 0) ? std::atoi(argv[1]) : 0; // 0: forward, 1: backward, // 추가 ? ==> 2: backward_only
     const char* network_path = (argc > 2 && strlen(argv[2]) > 0) ? argv[2] : MODEL_PATH;
