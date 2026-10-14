@@ -5,6 +5,7 @@
 #include<numeric>
 #include<chrono>
 #include<ctime>
+#include<cstdlib>
 #include "my_lirpa_optimizing.cu"
 #include<fstream>
 #include <nvtx3/nvToolsExt.h>
@@ -196,6 +197,12 @@ struct ScopedGpuClockLock {
     bool locked = false;
 
     ScopedGpuClockLock(int clock_mhz = 2800) {
+        // cli에서 set CROWN_SKIP_CLOCK_LOCK = 1 을 하면 해당 세션에서 환경변수가 유지됨
+        const char* skip_lock = std::getenv("CROWN_SKIP_CLOCK_LOCK");
+        if (skip_lock && skip_lock[0] == '1') {
+            std::cout << "[GPU Clock] Clock lock skipped by CROWN_SKIP_CLOCK_LOCK=1." << std::endl;
+            return;
+        }
         char cmd[128];
         snprintf(cmd, sizeof(cmd), "nvidia-smi -lgc %d,%d > nul 2>&1", clock_mhz, clock_mhz);
         if (std::system(cmd) == 0) {

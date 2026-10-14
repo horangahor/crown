@@ -927,6 +927,63 @@ __global__ void matvec_pair_bias_gpu(const Matrix *A1, const Vector *x1,
   }
 }
 
+// Forward lower/upper matmul 통합
+__global__ void matmul_bound_pair_gpu(
+    const Matrix *weight_pos, const Matrix *lower_in,
+    const Matrix *weight_neg, const Matrix *upper_in,
+    Matrix *lower_out, Matrix *upper_out) {
+  const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+  const int total = weight_pos->rows * lower_in->cols;
+  if (tid == 0) {
+    lower_out->rows = weight_pos->rows;
+    lower_out->cols = lower_in->cols;
+    upper_out->rows = weight_pos->rows;
+    upper_out->cols = lower_in->cols;
+  }
+  if (tid < total) {
+    const int r = tid / lower_in->cols;
+    const int c = tid % lower_in->cols;
+    float lower_sum = 0.0f;
+    float upper_sum = 0.0f;
+    for (int k = 0; k < weight_pos->cols; ++k) {
+      const float wp = weight_pos->a[r][k];
+      const float wn = weight_neg->a[r][k];
+      const float lower_value = lower_in->a[k][c];
+      const float upper_value = upper_in->a[k][c];
+      lower_sum += wp * lower_value + wn * upper_value;
+      upper_sum += wp * upper_value + wn * lower_value;
+    }
+    lower_out->a[r][c] = lower_sum;
+    upper_out->a[r][c] = upper_sum;
+  }
+}
+
+// Forward CROWN: calculate lower and upper pre-activation constants together.
+__global__ void matvec_bound_pair_bias_gpu(
+    const Matrix *weight_pos, const Vector *lower_in,
+    const Matrix *weight_neg, const Vector *upper_in,
+    const Vector *bias, Vector *lower_out, Vector *upper_out) {
+  const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+  if (tid == 0) {
+    lower_out->n = weight_pos->rows;
+    upper_out->n = weight_pos->rows;
+  }
+  if (tid < weight_pos->rows) {
+    float lower_sum = bias->v[tid];
+    float upper_sum = bias->v[tid];
+    for (int j = 0; j < weight_pos->cols; ++j) {
+      const float wp = weight_pos->a[tid][j];
+      const float wn = weight_neg->a[tid][j];
+      const float lower_value = lower_in->v[j];
+      const float upper_value = upper_in->v[j];
+      lower_sum += wp * lower_value + wn * upper_value;
+      upper_sum += wp * upper_value + wn * lower_value;
+    }
+    lower_out->v[tid] = lower_sum;
+    upper_out->v[tid] = upper_sum;
+  }
+}
+
 __global__ void elemwise_affine_fused_gpu(const Vector *alpha,
                                            const Vector *value,
                                            const Vector *beta, Vector *out) {
@@ -974,6 +1031,41 @@ __global__ void rowwise_scale_pair_gpu(
   }
 }
 
+// row scaling과 affine update 통합
+__global__ void rowwise_scale_and_affine_pair_gpu(
+    const Matrix *lower_in, const Vector *lower_scale,
+    const Vector *lower_value, const Vector *lower_beta,
+    const Matrix *upper_in, const Vector *upper_scale,
+    const Vector *upper_value, const Vector *upper_beta,
+    Matrix *lower_out, Matrix *upper_out,
+    Vector *lower_out_value, Vector *upper_out_value) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int matrix_total = lower_in->rows * lower_in->cols;
+
+  if (tid == 0) {
+    lower_out->rows = lower_in->rows;
+    lower_out->cols = lower_in->cols;
+    upper_out->rows = upper_in->rows;
+    upper_out->cols = upper_in->cols;
+    lower_out_value->n = lower_scale->n;
+    upper_out_value->n = upper_scale->n;
+  }
+
+  if (tid < matrix_total) {
+    const int r = tid / lower_in->cols;
+    const int c = tid % lower_in->cols;
+    lower_out->a[r][c] = lower_in->a[r][c] * lower_scale->v[r];
+    upper_out->a[r][c] = upper_in->a[r][c] * upper_scale->v[r];
+  }
+
+  if (tid < lower_scale->n) {
+    lower_out_value->v[tid] = lower_scale->v[tid] * lower_value->v[tid]
+                             + lower_beta->v[tid];
+    upper_out_value->v[tid] = upper_scale->v[tid] * upper_value->v[tid]
+                             + upper_beta->v[tid];
+  }
+}
+
 __global__ void affine_minmax_pair_gpu(
     const Matrix *lower_A, const Vector *lower_c,
     const Matrix *upper_A, const Vector *upper_c,
@@ -1017,6 +1109,81 @@ __global__ void cache_relaxation_layer_gpu(
     cached_beta_l->v[tid] = beta_l->v[tid];
     cached_alpha_u->v[tid] = alpha_u->v[tid];
     cached_beta_u->v[tid] = beta_u->v[tid];
+  }
+}
+
+// Relaxation 계산과 cache 저장 통합
+__global__ void relu_relax_and_cache_gpu(
+    const Vector *lower, const Vector *upper,
+    Vector *alpha_l, Vector *beta_l,
+    Vector *alpha_u, Vector *beta_u,
+    Vector *cached_alpha_l, Vector *cached_beta_l,
+    Vector *cached_alpha_u, Vector *cached_beta_u) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid == 0) {
+    alpha_l->n = lower->n;
+    beta_l->n = lower->n;
+    alpha_u->n = lower->n;
+    beta_u->n = lower->n;
+    cached_alpha_l->n = lower->n;
+    cached_beta_l->n = lower->n;
+    cached_alpha_u->n = lower->n;
+    cached_beta_u->n = lower->n;
+  }
+  if (tid >= lower->n) return;
+
+  const float l = lower->v[tid];
+  const float u = upper->v[tid];
+  float al, bl, au, bu;
+  if (l >= 0.0f) {
+    al = 1.0f; bl = 0.0f;
+    au = 1.0f; bu = 0.0f;
+  } else if (u <= 0.0f) {
+    al = 0.0f; bl = 0.0f;
+    au = 0.0f; bu = 0.0f;
+  } else {
+    const float slope = u / (u - l);
+    al = fabsf(l) < fabsf(u) ? 1.0f : 0.0f;
+    bl = 0.0f;
+    au = slope;
+    bu = -u * l / (u - l);
+  }
+
+  alpha_l->v[tid] = al;
+  beta_l->v[tid] = bl;
+  alpha_u->v[tid] = au;
+  beta_u->v[tid] = bu;
+  cached_alpha_l->v[tid] = al;
+  cached_beta_l->v[tid] = bl;
+  cached_alpha_u->v[tid] = au;
+  cached_beta_u->v[tid] = bu;
+}
+
+__global__ void linear_relax_and_cache_gpu(
+    Vector *alpha_l, Vector *beta_l,
+    Vector *alpha_u, Vector *beta_u, int n,
+    Vector *cached_alpha_l, Vector *cached_beta_l,
+    Vector *cached_alpha_u, Vector *cached_beta_u) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid == 0) {
+    alpha_l->n = n;
+    beta_l->n = n;
+    alpha_u->n = n;
+    beta_u->n = n;
+    cached_alpha_l->n = n;
+    cached_beta_l->n = n;
+    cached_alpha_u->n = n;
+    cached_beta_u->n = n;
+  }
+  if (tid < n) {
+    alpha_l->v[tid] = 1.0f;
+    beta_l->v[tid] = 0.0f;
+    alpha_u->v[tid] = 1.0f;
+    beta_u->v[tid] = 0.0f;
+    cached_alpha_l->v[tid] = 1.0f;
+    cached_beta_l->v[tid] = 0.0f;
+    cached_alpha_u->v[tid] = 1.0f;
+    cached_beta_u->v[tid] = 0.0f;
   }
 }
 
@@ -1438,25 +1605,17 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
     const int matrix_elements = weight_rows * in_dim;
     const int matrix_blocks = (matrix_elements + 255) / 256;
 
-    // Pre-activation 계산 원본: pre.lower_A = W_pos*lower_A + W_neg*upper_A
-    matmul_pair_add_gpu<<<matrix_blocks, 256>>>(
-        d_W_pos, lower_A, d_W_neg, upper_A, pre_lower_A);
-    
-    // 원본: pre.upper_A = W_pos*upper_A + W_neg*lower_A
-    matmul_pair_add_gpu<<<matrix_blocks, 256>>>(
-        d_W_pos, upper_A, d_W_neg, lower_A, pre_upper_A);
+    // 기존 : matmul_pair_add_gpu<<<matrix_blocks, 256>>>를 2번 호출해서 upper_A, lower_A를 각각 계산
+    matmul_bound_pair_gpu<<<matrix_blocks, 256>>>(
+        d_W_pos, lower_A, d_W_neg, upper_A, pre_lower_A, pre_upper_A);
 
 
     // 편향(Bias) 계산 원본: pre.lower_c = W_pos*lower_c + W_neg*upper_c + b
     const int vector_blocks = (weight_rows + 255) / 256;
     const Vector *d_bias = g_pool.d_bias[l];
-    matvec_pair_bias_gpu<<<vector_blocks, 256>>>(
-        d_W_pos, lower_c, d_W_neg, upper_c, d_bias, pre_lower_c);
-    
-    
-    // 원본: pre.upper_c = W_pos*upper_c + W_neg*lower_c + b
-    matvec_pair_bias_gpu<<<vector_blocks, 256>>>(
-        d_W_pos, upper_c, d_W_neg, lower_c, d_bias, pre_upper_c);
+    // 기존 : matvec_pair_add_gpu<<<vector_blocks, 256>>>를 2번 호출해서 upper_c, lower_c를 각각 계산
+    matvec_bound_pair_bias_gpu<<<vector_blocks, 256>>>(
+        d_W_pos, lower_c, d_W_neg, upper_c, d_bias, pre_lower_c, pre_upper_c);
 
     // 구체적 수치로 변환, 원본: pre_lower = affine_min(pre.lower_A, ...)
     affine_minmax_pair_gpu<<<vector_blocks, 256>>>(
@@ -1465,9 +1624,15 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
     
     // Relaxation, 원본: relu_relax(pre_lower, ...)
     if (net.act[l] == ActivationType::Relu) {
-      relu_relax_full_gpu<<<vector_blocks, 256>>>(pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u);
+      relu_relax_and_cache_gpu<<<vector_blocks, 256>>>(
+          pre_lower, pre_upper, alpha_l, beta_l, alpha_u, beta_u,
+          g_pool.d_fwd_alpha_lower[l], g_pool.d_fwd_beta_lower[l],
+          g_pool.d_fwd_alpha_upper[l], g_pool.d_fwd_beta_upper[l]);
     } else if (net.act[l] == ActivationType::Linear) {
-      linear_relax_full_gpu<<<vector_blocks, 256>>>(alpha_l, beta_l, alpha_u, beta_u, weight_rows);
+      linear_relax_and_cache_gpu<<<vector_blocks, 256>>>(
+          alpha_l, beta_l, alpha_u, beta_u, weight_rows,
+          g_pool.d_fwd_alpha_lower[l], g_pool.d_fwd_beta_lower[l],
+          g_pool.d_fwd_alpha_upper[l], g_pool.d_fwd_beta_upper[l]);
     } else {
       // Sigmoid는 수학이 너무 복잡해서 어쩔 수 없이 CPU로 내려서 풀고 다시 올림 (예외 상황)
       Vector h_lower, h_upper, h_alpha_l, h_beta_l, h_alpha_u, h_beta_u;
@@ -1479,25 +1644,24 @@ ForwardBoundResult lirpa_forward_bound_impl(const FullyConnectedNetwork &net,
       cudaMemcpy(beta_l, &h_beta_l, sizeof(Vector), cudaMemcpyHostToDevice);
       cudaMemcpy(alpha_u, &h_alpha_u, sizeof(Vector), cudaMemcpyHostToDevice);
       cudaMemcpy(beta_u, &h_beta_u, sizeof(Vector), cudaMemcpyHostToDevice);
+
+      // 원래 여기서 분기문이 끝나면 마지막에 cache를 호출했는데 이걸 linear_relax_and_cache_gpu 에 통합해서 else에서만 호출하게
+      cache_relaxation_layer_gpu<<<vector_blocks, 256>>>(
+          alpha_l, beta_l, alpha_u, beta_u,
+          g_pool.d_fwd_alpha_lower[l], g_pool.d_fwd_beta_lower[l],
+          g_pool.d_fwd_alpha_upper[l], g_pool.d_fwd_beta_upper[l]);
     }
-
-    // GPU 메모리에 계산결과 저장
-    cache_relaxation_layer_gpu<<<vector_blocks, 256>>>(
-        alpha_l, beta_l, alpha_u, beta_u,
-        g_pool.d_fwd_alpha_lower[l], g_pool.d_fwd_beta_lower[l],
-        g_pool.d_fwd_alpha_upper[l], g_pool.d_fwd_beta_upper[l]);
-
 
     // Post-activation 갱신 원본: post.lower_A = pre.lower_A * alpha_l
     // 여기서 생성된 post.lower_A를 다음 루프를 위해 current.lower_A(lower_A) 자리에 덮어쓰기
-    rowwise_scale_pair_gpu<<<matrix_blocks, 256>>>(
-        pre_lower_A, alpha_l, pre_upper_A, alpha_u, lower_A, upper_A);
-    
-    // 원본: post.lower_c = (pre.lower_c * alpha_l) + beta_l
-    elemwise_affine_pair_gpu<<<vector_blocks, 256>>>(
-        alpha_l, pre_lower_c, beta_l,
-        alpha_u, pre_upper_c, beta_u,
-        lower_c, upper_c);
+    const int affine_elements = max(matrix_elements, weight_rows);
+    const int affine_blocks = (affine_elements + 255) / 256;
+
+    // 커널을 하나로 통합 rowwise_scale_pair_gpu<<<matrix_blocks, 256>>>랑 elemwise_affine_pair_gpu<<<vector_blocks, 256>>>
+    rowwise_scale_and_affine_pair_gpu<<<affine_blocks, 256>>>(
+        pre_lower_A, alpha_l, pre_lower_c, beta_l,
+        pre_upper_A, alpha_u, pre_upper_c, beta_u,
+        lower_A, upper_A, lower_c, upper_c);
     // 여기까지가 다음 루프를 위한 업데이트 
     //==========================================================================
 
@@ -1718,6 +1882,36 @@ __global__ void backward_bias_pair_fused_gpu(
   }
 }
 
+// 행렬 부호 분리 (split_pos_neg)와 편향 내적 누적 (backward_bias)을 하나로 합친 커널
+__global__ void backward_bias_pair_direct_gpu(
+    const Matrix *lower, const Matrix *upper,
+    const Vector *lower_positive_term, const Vector *lower_negative_term,
+    const Vector *upper_positive_term, const Vector *upper_negative_term,
+    const Vector *lower_old_p, const Vector *upper_old_p,
+    Vector *lower_out, Vector *upper_out) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid == 0) {
+    lower_out->n = lower->rows;
+    upper_out->n = upper->rows;
+  }
+  if (tid < lower->rows) {
+    float lower_sum = lower_old_p->v[tid];
+    float upper_sum = upper_old_p->v[tid];
+    for (int j = 0; j < lower->cols; ++j) {
+      const float lower_value = lower->a[tid][j];
+      const float upper_value = upper->a[tid][j];
+      lower_sum += (lower_value > 0.0f)
+          ? lower_value * lower_positive_term->v[j]
+          : lower_value * lower_negative_term->v[j];
+      upper_sum += (upper_value > 0.0f)
+          ? upper_value * upper_positive_term->v[j]
+          : upper_value * upper_negative_term->v[j];
+    }
+    lower_out->v[tid] = lower_sum;
+    upper_out->v[tid] = upper_sum;
+  }
+}
+
 __global__ void backward_matmul_pair_gpu(
     const Matrix *lower_in, const Matrix *upper_in, const Matrix *weight,
     Matrix *lower_out, Matrix *upper_out) {
@@ -1762,10 +1956,6 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
                         bool default_upper_M, bool default_upper_p) {
   Matrix *lower_M = g_pool.d_bwd_mat[0];
   Matrix *upper_M = g_pool.d_bwd_mat[1];
-  Matrix *lower_pos = g_pool.d_bwd_mat[2];
-  Matrix *lower_neg = g_pool.d_bwd_mat[3];
-  Matrix *upper_pos = g_pool.d_bwd_mat[4];
-  Matrix *upper_neg = g_pool.d_bwd_mat[5];
   Matrix *lower_coeff = g_pool.d_bwd_mat[6];
   Matrix *upper_coeff = g_pool.d_bwd_mat[7];
   Matrix *new_lower_M = g_pool.d_bwd_mat[8];
@@ -1819,32 +2009,28 @@ void backward_bound_gpu(const FullyConnectedNetwork &net,
     const Vector *alpha_u = g_pool.d_fwd_alpha_upper[l];
     const Vector *beta_u = g_pool.d_fwd_beta_upper[l];
 
-    // 1. 하한(lower_M)/상한(upper_M) 행렬을 양수/음수 행렬로 분리 
-    // (CPU의 positive_part, negative_part 함수 역할을 한 번에 융합 처리)
-    split_pos_neg_pair_gpu<<<matrix_blocks, 256>>>(
-        lower_M, upper_M, lower_pos, lower_neg, upper_pos, upper_neg);
-
-    // 2. 분리된 행렬과 Forward에서 구한 alpha, beta를 곱해 CROWN 계수 생성
+    // 기존 : split_pos_neg_pair_gpu<<<matrix_blocks, 256>>> 가 있었는데 사라짐
+    // 1. 원본 행렬과 Forward에서 구한 alpha, beta를 곱해 CROWN 계수 생성
     // (CPU의 lower_s_coeff + upper_s_coeff 연산)
     build_coeff_pair_fused_gpu<<<matrix_blocks, 256>>>(
         lower_M, upper_M, alpha_l, alpha_u, lower_coeff, upper_coeff);
 
-    // 3. 계수 행렬과 가중치(Weight)를 행렬곱 연산하여 이전 레이어로 넘길 새로운 M 생성
+    // 2. 계수 행렬과 가중치(Weight)를 행렬곱 연산하여 이전 레이어로 넘길 새로운 M 생성
     // (CPU의 matmul(lower_s_coeff, W)와 동일. 현재 연산 시간의 90%를 차지하는 병목 구간)
     backward_matmul_pair_gpu<<<(m_rows * w_cols + 255) / 256, 256>>>(
         lower_coeff, upper_coeff, g_pool.d_weight[l], new_lower_M,
         new_upper_M);
 
-    // 4. 편향(bias)과 이완(relaxation) 오차(beta)를 반영하기 위한 상수항(term) 계산
+    // 3. 편향(bias)과 이완(relaxation) 오차(beta)를 반영하기 위한 상수항(term) 계산
     // (CPU의 vec_add(elemwise_mul(alpha, b), beta) 와 동일)
     const Vector *bias = g_pool.d_bias[l];
     affine_term_pair_fused_gpu<<<(w_rows + 255) / 256, 256>>>(
         alpha_l, beta_l, alpha_u, beta_u, bias, term_lp, term_ln);
 
-    // 5. 앞에서 구한 행렬과 상수항을 내적(matvec)하고 누적 더하기(vec_add)를 한 번에 융합
-    // (CPU의 matvec 후 vec_add 하는 복잡한 로직을 단일 커널로 압축)
-    backward_bias_pair_fused_gpu<<<vector_blocks, 256>>>(
-        lower_pos, lower_neg, upper_pos, upper_neg,
+    // 대신 여기서 split_pos_neg_pair_gpu<<<matrix_blocks, 256>>>를 한번에 처리
+    // 4. 부호 분리와 행렬-벡터 누적을 한 커널에서 처리
+    backward_bias_pair_direct_gpu<<<vector_blocks, 256>>>(
+        lower_M, upper_M,
         term_lp, term_ln, term_ln, term_lp,
         lower_p, upper_p, new_lower_p, new_upper_p);
 
@@ -2082,25 +2268,22 @@ inline void backward_one_layer_step_gpu(
   const int matrix_blocks = (matrix_elems + 255) / 256;
   const int vector_blocks = (m_rows + 255) / 256;
 
-  // 1. 하한/상한 행렬 분리 (positive / negative)
-  split_pos_neg_pair_gpu<<<matrix_blocks, 256>>>(
-      lower_M, upper_M, lower_pos, lower_neg, upper_pos, upper_neg);
-
-  // 2. 이완 계수 결합 (CROWN 계수 생성)
+  // 1. 이완 계수 결합 (CROWN 계수 생성)
   build_coeff_pair_fused_gpu<<<matrix_blocks, 256>>>(
       lower_M, upper_M, alpha_l, alpha_u, lower_coeff, upper_coeff);
 
-  // 3. 가중치 행렬곱
+  // 2. 가중치 행렬곱
   backward_matmul_pair_gpu<<<(m_rows * w_cols + 255) / 256, 256>>>(
       lower_coeff, upper_coeff, weight, new_lower_M, new_upper_M);
 
-  // 4. 이완 오차 및 편향 항 계산
+  // 3. 이완 오차 및 편향 항 계산
   affine_term_pair_fused_gpu<<<(w_rows + 255) / 256, 256>>>(
       alpha_l, beta_l, alpha_u, beta_u, bias, term_lp, term_ln);
 
-  // 5. 편향 누적합
-  backward_bias_pair_fused_gpu<<<vector_blocks, 256>>>(
-      lower_pos, lower_neg, upper_pos, upper_neg,
+  // 4. 부호 분리와 편향 누적합을 한 커널에서 처리
+  // 여기도 부호 분리까지 한번에 처리
+  backward_bias_pair_direct_gpu<<<vector_blocks, 256>>>(
+      lower_M, upper_M,
       term_lp, term_ln, term_ln, term_lp,
       lower_p, upper_p, new_lower_p, new_upper_p);
 }
@@ -2746,16 +2929,13 @@ private:
       const int vector_blocks = (weight_rows + 255) / 256;
       const Vector *d_bias = g_pool.d_bias[l];
 
-      // 양수 가중치와 음수 가중치를 나눠서 곱하기
-      matmul_pair_add_gpu<<<matrix_blocks, 256, 0, stream>>>(
-          d_W_pos, d_lower_A, d_W_neg, d_upper_A, d_pre_lower_A);
-      matmul_pair_add_gpu<<<matrix_blocks, 256, 0, stream>>>(
-          d_W_pos, d_upper_A, d_W_neg, d_lower_A, d_pre_upper_A);
-
-      matvec_pair_bias_gpu<<<vector_blocks, 256, 0, stream>>>(
-          d_W_pos, d_lower_c, d_W_neg, d_upper_c, d_bias, d_pre_lower_c);
-      matvec_pair_bias_gpu<<<vector_blocks, 256, 0, stream>>>(
-          d_W_pos, d_upper_c, d_W_neg, d_lower_c, d_bias, d_pre_upper_c);
+      // 기존 : matmul_pair_add_gpu<<<matrix_blocks, 256, 0, stream>>>랑 matvec_pair_bias_gpu<<<vector_blocks, 256, 0, stream>>>를 통합
+      matmul_bound_pair_gpu<<<matrix_blocks, 256, 0, stream>>>(
+          d_W_pos, d_lower_A, d_W_neg, d_upper_A,
+          d_pre_lower_A, d_pre_upper_A);
+      matvec_bound_pair_bias_gpu<<<vector_blocks, 256, 0, stream>>>(
+          d_W_pos, d_lower_c, d_W_neg, d_upper_c, d_bias,
+          d_pre_lower_c, d_pre_upper_c);
 
       // 이번 층의 활성화 전 최소/최대 범위 구하기
       affine_minmax_pair_gpu<<<vector_blocks, 256, 0, stream>>>(
@@ -2763,31 +2943,36 @@ private:
           d_xl, d_xu, d_pre_lower, d_pre_upper);
 
       // 꺾인 ReLU 함수를 (선형 완화: Relaxation)으로 감싸기
+      // 캐시처리도 통합 (다만 pure_forward일때만 통합된 커널 쓰고 아니면 기존 커널 그대로 쓰기)
       if (net.act[l] == ActivationType::Relu) {
-        relu_relax_full_gpu<<<vector_blocks, 256, 0, stream>>>(
-            d_pre_lower, d_pre_upper, d_alpha_l, d_beta_l, d_alpha_u, d_beta_u);
+        if (!is_pure_forward) {
+          relu_relax_and_cache_gpu<<<vector_blocks, 256, 0, stream>>>(
+              d_pre_lower, d_pre_upper, d_alpha_l, d_beta_l, d_alpha_u, d_beta_u,
+              d_cached_alpha_l[l], d_cached_beta_l[l],
+              d_cached_alpha_u[l], d_cached_beta_u[l]);
+        } else {
+          relu_relax_full_gpu<<<vector_blocks, 256, 0, stream>>>(
+              d_pre_lower, d_pre_upper, d_alpha_l, d_beta_l, d_alpha_u, d_beta_u);
+        }
       } else if (net.act[l] == ActivationType::Linear) {
-        linear_relax_full_gpu<<<vector_blocks, 256, 0, stream>>>(
-            d_alpha_l, d_beta_l, d_alpha_u, d_beta_u, weight_rows);
+        if (!is_pure_forward) {
+          linear_relax_and_cache_gpu<<<vector_blocks, 256, 0, stream>>>(
+              d_alpha_l, d_beta_l, d_alpha_u, d_beta_u, weight_rows,
+              d_cached_alpha_l[l], d_cached_beta_l[l],
+              d_cached_alpha_u[l], d_cached_beta_u[l]);
+        } else {
+          linear_relax_full_gpu<<<vector_blocks, 256, 0, stream>>>(
+              d_alpha_l, d_beta_l, d_alpha_u, d_beta_u, weight_rows);
+        }
       }
 
-      // backward 하기 위한 완화 기울기(alpha, beta) 보관
-      // 이건 backward 안할때는 쓸 필요없으니까 최소화 한거고
-      if (!is_pure_forward) {
-        cache_relaxation_layer_gpu<<<vector_blocks, 256, 0, stream>>>(
-            d_alpha_l, d_beta_l, d_alpha_u, d_beta_u,
-            d_cached_alpha_l[l], d_cached_beta_l[l],
-            d_cached_alpha_u[l], d_cached_beta_u[l]);
-      }
-
-      // 다음 층을 위해 행렬 크기 조절
-      rowwise_scale_pair_gpu<<<matrix_blocks, 256, 0, stream>>>(
-          d_pre_lower_A, d_alpha_l, d_pre_upper_A, d_alpha_u, d_lower_A, d_upper_A);
-
-      elemwise_affine_pair_gpu<<<vector_blocks, 256, 0, stream>>>(
-          d_alpha_l, d_pre_lower_c, d_beta_l,
-          d_alpha_u, d_pre_upper_c, d_beta_u,
-          d_lower_c, d_upper_c);
+      // 다음 층을 위한 행렬/상수항 갱신을 한 커널에서 처리
+      const int affine_elements = max(matrix_elements, weight_rows);
+      const int affine_blocks = (affine_elements + 255) / 256;
+      rowwise_scale_and_affine_pair_gpu<<<affine_blocks, 256, 0, stream>>>(
+          d_pre_lower_A, d_alpha_l, d_pre_lower_c, d_beta_l,
+          d_pre_upper_A, d_alpha_u, d_pre_upper_c, d_beta_u,
+          d_lower_A, d_upper_A, d_lower_c, d_upper_c);
     }
 
     // 순수 forward 모드일 때는 여기서 바로 최종 하한선/상한선을 계산
@@ -2839,11 +3024,6 @@ private:
       const Vector *alpha_u = d_cached_alpha_u[l];
       const Vector *beta_u = d_cached_beta_u[l];
 
-      // 행렬의 양수/음수 분리
-      split_pos_neg_pair_gpu<<<matrix_blocks, 256, 0, stream>>>(
-          lower_M, upper_M, d_bwd_lower_pos, d_bwd_lower_neg,
-          d_bwd_upper_pos, d_bwd_upper_neg);
-
       // 계수 행렬 만들기
       build_coeff_pair_fused_gpu<<<matrix_blocks, 256, 0, stream>>>(
           lower_M, upper_M, alpha_l, alpha_u, d_bwd_lower_coeff, d_bwd_upper_coeff);
@@ -2852,13 +3032,14 @@ private:
       backward_matmul_pair_gpu<<<(m_rows * w_cols + 255) / 256, 256, 0, stream>>>(
           d_bwd_lower_coeff, d_bwd_upper_coeff, g_pool.d_weight[l], new_lower_M, new_upper_M);
 
-      // 편향(bias) 누적 계산
+      // 부호 분리와 편향(bias) 누적을 한 커널에서 처리
       const Vector *bias = g_pool.d_bias[l];
       affine_term_pair_fused_gpu<<<(net.layer_out_dim[l] + 255) / 256, 256, 0, stream>>>(
           alpha_l, beta_l, alpha_u, beta_u, bias, d_bwd_term_lp, d_bwd_term_ln);
 
-      backward_bias_pair_fused_gpu<<<vector_blocks, 256, 0, stream>>>(
-          d_bwd_lower_pos, d_bwd_lower_neg, d_bwd_upper_pos, d_bwd_upper_neg,
+      // 부호 분리 + 편향 누적이 이거
+      backward_bias_pair_direct_gpu<<<vector_blocks, 256, 0, stream>>>(
+          lower_M, upper_M,
           d_bwd_term_lp, d_bwd_term_ln, d_bwd_term_ln, d_bwd_term_lp,
           lower_p, upper_p, new_lower_p, new_upper_p);
 
@@ -2885,22 +3066,18 @@ private:
 
     // [2] 모든 레이어의 이완 계수(alpha, beta)를 Backward-Only Iteration으로 계산
     for (int k = 0; k < net.num_layers; ++k) {
-      Matrix *lower_M     = d_bwd_lower_M;
-      Matrix *upper_M     = d_bwd_upper_M;
-      Matrix *new_lower_M = d_bwd_new_lower_M;
-      Matrix *new_upper_M = d_bwd_new_upper_M;
+      // 카피 커널 쓸 필요 없이 이미 VRAM에 올라간 가중치를 그대로 사용
+      Matrix *lower_M     = g_pool.d_weight[k];
+      Matrix *upper_M     = g_pool.d_weight[k];
+      Matrix *new_lower_M = d_bwd_lower_M;
+      Matrix *new_upper_M = d_bwd_upper_M;
 
-      Vector *lower_p     = d_bwd_lower_p;
-      Vector *upper_p     = d_bwd_upper_p;
-      Vector *new_lower_p = d_bwd_new_lower_p;
-      Vector *new_upper_p = d_bwd_new_upper_p;
-
-      // 레이어 k의 가중치/편향 초기 복사
-      const int w_k_elems = net.W[k].rows * net.W[k].cols;
-      copy_matrix_pair_gpu<<<(w_k_elems + 255) / 256, 256, 0, stream>>>(
-          g_pool.d_weight[k], lower_M, upper_M);
-      copy_vector_pair_gpu<<<(net.b[k].n + 255) / 256, 256, 0, stream>>>(
-          g_pool.d_bias[k], lower_p, upper_p);
+      // 얘도 동일하게 bias 올라간거 사용
+      Vector *lower_p     = g_pool.d_bias[k];
+      Vector *upper_p     = g_pool.d_bias[k];
+      Vector *new_lower_p = d_bwd_lower_p;
+      Vector *new_upper_p = d_bwd_upper_p;
+      bool first_step = true;
 
       // r = k - 1 down to 0 (입력층까지 역전파)
       for (int r = k - 1; r >= 0; --r) {
@@ -2916,10 +3093,6 @@ private:
         const Vector *alpha_u = d_cached_alpha_u[r];
         const Vector *beta_u  = d_cached_beta_u[r];
 
-        split_pos_neg_pair_gpu<<<matrix_blocks, 256, 0, stream>>>(
-            lower_M, upper_M, d_bwd_lower_pos, d_bwd_lower_neg,
-            d_bwd_upper_pos, d_bwd_upper_neg);
-
         build_coeff_pair_fused_gpu<<<matrix_blocks, 256, 0, stream>>>(
             lower_M, upper_M, alpha_l, alpha_u, d_bwd_lower_coeff, d_bwd_upper_coeff);
 
@@ -2930,15 +3103,29 @@ private:
         affine_term_pair_fused_gpu<<<(net.layer_out_dim[r] + 255) / 256, 256, 0, stream>>>(
             alpha_l, beta_l, alpha_u, beta_u, bias, d_bwd_term_lp, d_bwd_term_ln);
 
-        backward_bias_pair_fused_gpu<<<vector_blocks, 256, 0, stream>>>(
-            d_bwd_lower_pos, d_bwd_lower_neg, d_bwd_upper_pos, d_bwd_upper_neg,
+        // 부호 분리 + 편향 누적 커널 통합
+        backward_bias_pair_direct_gpu<<<vector_blocks, 256, 0, stream>>>(
+            lower_M, upper_M,
             d_bwd_term_lp, d_bwd_term_ln, d_bwd_term_ln, d_bwd_term_lp,
             lower_p, upper_p, new_lower_p, new_upper_p);
 
-        std::swap(lower_M, new_lower_M);
-        std::swap(upper_M, new_upper_M);
-        std::swap(lower_p, new_lower_p);
-        std::swap(upper_p, new_upper_p);
+        if (first_step) {
+          // 처음에만 넣어주고 그 이후부터는 ping pong
+          lower_M = new_lower_M;
+          upper_M = new_upper_M;
+          lower_p = new_lower_p;
+          upper_p = new_upper_p;
+          new_lower_M = d_bwd_new_lower_M;
+          new_upper_M = d_bwd_new_upper_M;
+          new_lower_p = d_bwd_new_lower_p;
+          new_upper_p = d_bwd_new_upper_p;
+          first_step = false;
+        } else {
+          std::swap(lower_M, new_lower_M);
+          std::swap(upper_M, new_upper_M);
+          std::swap(lower_p, new_lower_p);
+          std::swap(upper_p, new_upper_p);
+        }
       }
 
       // 레이어 k의 pre-activation bound 계산
@@ -2994,10 +3181,6 @@ private:
       const Vector *alpha_u = d_cached_alpha_u[l];
       const Vector *beta_u  = d_cached_beta_u[l];
 
-      split_pos_neg_pair_gpu<<<matrix_blocks, 256, 0, stream>>>(
-          lower_M, upper_M, d_bwd_lower_pos, d_bwd_lower_neg,
-          d_bwd_upper_pos, d_bwd_upper_neg);
-
       build_coeff_pair_fused_gpu<<<matrix_blocks, 256, 0, stream>>>(
           lower_M, upper_M, alpha_l, alpha_u, d_bwd_lower_coeff, d_bwd_upper_coeff);
 
@@ -3008,8 +3191,9 @@ private:
       affine_term_pair_fused_gpu<<<(net.layer_out_dim[l] + 255) / 256, 256, 0, stream>>>(
           alpha_l, beta_l, alpha_u, beta_u, bias, d_bwd_term_lp, d_bwd_term_ln);
 
-      backward_bias_pair_fused_gpu<<<vector_blocks, 256, 0, stream>>>(
-          d_bwd_lower_pos, d_bwd_lower_neg, d_bwd_upper_pos, d_bwd_upper_neg,
+      // 부호 분리 + 편향 누적 커널 통합
+      backward_bias_pair_direct_gpu<<<vector_blocks, 256, 0, stream>>>(
+          lower_M, upper_M,
           d_bwd_term_lp, d_bwd_term_ln, d_bwd_term_ln, d_bwd_term_lp,
           lower_p, upper_p, new_lower_p, new_upper_p);
 
@@ -3085,7 +3269,7 @@ private:
     } else if(method == 1) {
       record_backward_bound_kernels(net);       // Backward
     } else {
-      //record_backward_only_bound_kernels(net); // backward_only
+      record_backward_only_bound_kernels(net); // backward_only
     }
     err = cudaStreamEndCapture(stream, &graph_combined);
     if (err != cudaSuccess) {
