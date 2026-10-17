@@ -284,7 +284,7 @@ int main(int argc, char** argv) {
 
     // 실시간 PCIe H2D 전송 최적화: Host Memory Pinning (cudaHostRegister)
     // pinned memory 를 써서 GPU가 CPU 메모리에 직접 접근할 수 있도록 하여 데이터셋 전송 속도 향상 
-    // 왜 이걸 했냐 하면 실제 상황 최대한 재현을 위한 것 (5 , 6G 환경에서의 실시간 입력 속도를 최대한 재현하기 위함)
+    // 왜 이걸 했냐 하면 실제 상황 최대한 재현을 위한 것 (5 , 6G 환경에서의 실시간 입력 속도를 최대한 VRAM으로 빨리 복사하기 위한.. 전략)
     bool dataset_pinned = false;
     if (N > 0) {
         // cudaHostRegister : 일반 메모리로 만들어진 메모리 영역을 복사 없이 pinned Memory 로 승격시켜줌
@@ -331,6 +331,13 @@ int main(int argc, char** argv) {
     std::cout << "  data points   : " << N                  << std::endl;
     std::cout << "  k (top-k)     : " << k                  << std::endl;
     std::cout << "  eps values    : " << eps_list.size()    << std::endl;
+    if (graph_mode > 0 && dataset_pinned) {
+        std::cout << "  Memory Mode   : cudaHostRegister Dataset (direct H2D source)" << std::endl;
+    } else if (graph_mode > 0) {
+        std::cout << "  Memory Mode   : Pageable Dataset (cudaHostRegister unavailable)" << std::endl;
+    } else {
+        std::cout << "  Memory Mode   : Pageable Dataset (graph disabled)" << std::endl;
+    }
     std::cout << "  cudaEvent Profiling: " << (measure_gpu == 0 ? "Disabled (0)" : (measure_gpu == 1 ? "Last Sample Only (1)" : "All Samples (2)")) << std::endl;
     std::cout << "========================================\n" << std::endl;
 
@@ -562,7 +569,8 @@ int main(int argc, char** argv) {
     }
 
     // 8. CSV 저장 (sparse.py와 동일 컬럼: method, eps, T, F, ratio)
-    std::ofstream csv_file(output_csv);
+    std::string str_result_csv = std::string(method_str) + "_" + output_csv;
+    std::ofstream csv_file(str_result_csv);
     if (csv_file.is_open()) {
         csv_file << "method,eps,T,F,ratio" << std::endl;
         for (int i = 0; i < (int)eps_list.size(); ++i) {
@@ -573,9 +581,9 @@ int main(int argc, char** argv) {
                      << std::fixed << std::setprecision(6) << all_results[i].ratio << std::endl;
         }
         csv_file.close();
-        std::cout << "results saved to " << output_csv << std::endl;
+        std::cout << "results saved to " << str_result_csv << std::endl;
     } else {
-        std::cerr << "Error: could not write to " << output_csv << std::endl;
+        std::cerr << "Error: could not write to " << str_result_csv << std::endl;
     }
 
     // 9. 타이밍 로그 CSV에 누적 기록 (실행할 때마다 append)
