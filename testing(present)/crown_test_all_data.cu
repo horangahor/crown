@@ -331,13 +331,6 @@ int main(int argc, char** argv) {
     std::cout << "  data points   : " << N                  << std::endl;
     std::cout << "  k (top-k)     : " << k                  << std::endl;
     std::cout << "  eps values    : " << eps_list.size()    << std::endl;
-    if (graph_mode > 0 && dataset_pinned) {
-        std::cout << "  Memory Mode   : cudaHostRegister Dataset (direct H2D source)" << std::endl;
-    } else if (graph_mode > 0) {
-        std::cout << "  Memory Mode   : Pageable Dataset (cudaHostRegister unavailable)" << std::endl;
-    } else {
-        std::cout << "  Memory Mode   : Pageable Dataset (graph disabled)" << std::endl;
-    }
     std::cout << "  cudaEvent Profiling: " << (measure_gpu == 0 ? "Disabled (0)" : (measure_gpu == 1 ? "Last Sample Only (1)" : "All Samples (2)")) << std::endl;
     std::cout << "========================================\n" << std::endl;
 
