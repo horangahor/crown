@@ -282,23 +282,8 @@ int main(int argc, char** argv) {
     }
     std::cout << "loaded " << N << " points (dim=" << net->layer_in_dim[0] << ")" << std::endl;
 
-    // 실시간 PCIe H2D 전송 최적화: Host Memory Pinning (cudaHostRegister)
-    // pinned memory 를 써서 GPU가 CPU 메모리에 직접 접근할 수 있도록 하여 데이터셋 전송 속도 향상 
-    // 왜 이걸 했냐 하면 실제 상황 최대한 재현을 위한 것 (5 , 6G 환경에서의 실시간 입력 속도를 최대한 VRAM으로 빨리 복사하기 위한.. 전략)
-    bool dataset_pinned = false;
-    if (N > 0) {
-        // cudaHostRegister : 일반 메모리로 만들어진 메모리 영역을 복사 없이 pinned Memory 로 승격시켜줌
-        // 인자로 시작 포인터 dataset.data() / 등록할 메모리 크기 (N * sizeof(Vector))
-        // 플래그 cudaHostRegisterDefault (가장 일반적인 pinning 옵션)
-        cudaError_t reg_err = cudaHostRegister(dataset.data(), (size_t)N * sizeof(Vector), cudaHostRegisterDefault);
-        if (reg_err == cudaSuccess) { // 여기서 cudaSuccess는 cuda에서 쓰는 성공 고유 상태코드
-            dataset_pinned = true;
-            std::cout << "Dataset host memory pinned via cudaHostRegister ("
-                      << ((size_t)N * sizeof(Vector)) / (1024 * 1024) << " MB, zero CPU blocking DMA enabled)." << std::endl;
-        } else {
-            std::cout << "Notice: cudaHostRegister skipped (" << cudaGetErrorString(reg_err) << ")." << std::endl;
-        }
-    }
+    // 입력은 일반 호스트 메모리에서 직접 전달한다. 출력 pinned 버퍼는 유지한다.
+    std::cout << "Input memory: pageable (dataset pinning disabled)." << std::endl;
 
     // 4. eps 리스트 (sparse.py와 동일)
     const std::vector<double> eps_list = {
@@ -633,9 +618,6 @@ int main(int argc, char** argv) {
     }
 
     // 10. 메모리 해제
-    if (dataset_pinned) {
-        cudaHostUnregister(dataset.data());
-    }
     if (graph_mode > 0) {
         cleanup_crown_cuda_graph();
     }

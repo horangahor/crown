@@ -12,6 +12,7 @@
 #include <cctype>
 #include <cmath>
 #include <cuda_runtime.h>
+#include <cstring>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -2538,9 +2539,8 @@ public:
   Vector* d_final_lower = nullptr; // CROWN 계산 결과인 최솟값(하한선)
   Vector* d_final_upper = nullptr; // CROWN 계산 결과인 최댓값(상한선)
 
-  // CPU와 GPU 사이 병목 완화용 메모리 (Pinned Host Buffers)]
-  // 일반 메모리보다 복사 속도가 2~3배 빠르고, GPU가 일하는 동안 CPU는 고정된 메모리 공간을 간섭하지 못함
-  Vector* h_x0 = nullptr;          // 입력 전용 Pinned Host 메모리 (Direct DMA) // 데이터셋 입력용 pinned Memory
+  // 출력 pinned 버퍼와 명시적으로 요청할 때만 할당하는 선택적 입력 버퍼.
+  Vector* h_x0 = nullptr;
   Vector* h_y0 = nullptr;
   Vector* h_final_lower = nullptr;
   Vector* h_final_upper = nullptr;
@@ -2636,12 +2636,7 @@ public:
     cudaMalloc(&d_final_lower, sizeof(Vector));
     cudaMalloc(&d_final_upper, sizeof(Vector));
 
-    // 고정 메모리(Pinned Host) 자리 만들기 (CPU의 DRAM에 고정된 메모리 공간을 만듦, GPU와 통신을 위한.)
-    // 현재 crown_test_all에서 사용하고 있지는 않다 (나중에 실시간을 재연할 때 여기 주소로 보내면 됨, 이미 결과는 저기로 보내고 있고)
-    cudaHostAlloc(&h_x0, sizeof(Vector), cudaHostAllocDefault); 
-    // 아 여기서 pinned Memory로 승격시켰는데 왜 또 alloc 해야하지 생각했는데 생각해보니까 얘는 독립적인 모듈(crown_test_all.cu와)이고 
-    // 다른 테스트에서는 40000개의 데이터를 안쓸수도 있는거임
-    // 확실한 건 입력이 하나 들어갈만한 pinned_memory가 필요하니까 넣었다.
+    // 출력 전송용 pinned 버퍼. 입력 h_x0는 접근 함수에서 필요할 때 할당한다.
     cudaHostAlloc(&h_y0, sizeof(Vector), cudaHostAllocDefault);
     cudaHostAlloc(&h_final_lower, sizeof(Vector), cudaHostAllocDefault);
     cudaHostAlloc(&h_final_upper, sizeof(Vector), cudaHostAllocDefault);
@@ -3322,9 +3317,29 @@ float get_crown_cuda_graph_last_gpu_time_ms() {
   return g_crown_graph.last_gpu_time_ms;
 }
 
-// Pinned 호스트 입력 버퍼 주소 반환 (Direct DMA용)
+// Pinned 입력을 명시적으로 요청한 호출자만 입력 버퍼를 할당한다.
 Vector* get_crown_cuda_graph_pinned_input() {
+  if (!g_crown_graph.initialized) return nullptr;
+  if (!g_crown_graph.h_x0) {
+    const cudaError_t err = cudaHostAlloc(&g_crown_graph.h_x0, sizeof(Vector), cudaHostAllocDefault);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("Pinned input allocation failed: ") + cudaGetErrorString(err));
+    }
+  }
   return g_crown_graph.h_x0;
+}
+
+// 데이터셋 뭉치를 하나의 단일 샘플인 것처럼 나누기 위한 용도
+// (실제 환경에서는 입력이 하나씩 도착함)
+// 오프라인 환경에서는 데이터셋이니까 VRAM으로 올릴 데이터를 데이터셋에서 뗀 다음 dst->v에 복사하고 올리는 방식을 사용했다
+// 그때 사용한 함수
+void stage_crown_cuda_graph_input(const Vector& src) {
+  Vector* dst = get_crown_cuda_graph_pinned_input();
+  if (!dst) return;
+
+  const int active_dim = g_crown_graph.in_dim;
+  dst->n = active_dim;
+  std::memcpy(dst->v, src.v, static_cast<size_t>(active_dim) * sizeof(float));
 }
 
 
